@@ -1,0 +1,1543 @@
+import { PromptResult } from "../src/PromptResult";
+import type { EvalTraceSpanInput } from "../src/eval-reporting-types";
+import type { IterationResult, EvalRunResult } from "../src/EvalTest";
+import {
+  iterationToEvalResult,
+  runToEvalResults,
+  suiteRunToEvalResults,
+  iterationsToEvalResultInputs,
+  suiteTestResultsToEvalResultInputs,
+  promptsToEvalResult,
+  variantFromExecutor,
+  legacyIterationStatusFromExecutionError,
+  resolveIterationLifecycleStatus,
+} from "../src/eval-result-mapping";
+import {
+  STAGE_ANALYZER_VERSION,
+  USER_VALUE_STAGES,
+  type StageResultRow,
+} from "../src/contract/index.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makePrompt(overrides: {
+  prompt?: string;
+  text?: string;
+  toolCalls?: { toolName: string; arguments: Record<string, unknown> }[];
+  messages?: { role: string; content: unknown }[];
+  usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+  latency?: { e2eMs: number; llmMs: number; mcpMs: number };
+  provider?: string;
+  model?: string;
+  error?: string;
+  spans?: EvalTraceSpanInput[];
+}): PromptResult {
+  if (overrides.error) {
+    return PromptResult.error(
+      overrides.error,
+      overrides.latency ?? 0,
+      overrides.prompt ?? "",
+      {
+        provider: overrides.provider,
+        model: overrides.model,
+      }
+    );
+  }
+  return PromptResult.from({
+    prompt: overrides.prompt ?? "test prompt",
+    messages: (overrides.messages as any) ?? [
+      { role: "user", content: overrides.prompt ?? "test prompt" },
+    ],
+    text: overrides.text ?? "response",
+    toolCalls: overrides.toolCalls ?? [],
+    usage: overrides.usage ?? {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    },
+    latency: overrides.latency ?? { e2eMs: 100, llmMs: 80, mcpMs: 20 },
+    provider: overrides.provider,
+    model: overrides.model,
+    spans: overrides.spans,
+  });
+}
+
+function makeIteration(
+  overrides: Partial<IterationResult> = {}
+): IterationResult {
+  return {
+    passed: true,
+    latencies: [{ e2eMs: 100, llmMs: 80, mcpMs: 20 }],
+    tokens: { total: 15, input: 10, output: 5 },
+    ...overrides,
+  };
+}
+
+function makeRunResult(iterations: IterationResult[]): EvalRunResult {
+  return {
+    iterations: iterations.length,
+    successes: iterations.filter((i) => i.passed).length,
+    failures: iterations.filter((i) => !i.passed).length,
+    results: iterations.map((i) => i.passed),
+    iterationDetails: iterations,
+    tokenUsage: {
+      total: iterations.reduce((s, i) => s + i.tokens.total, 0),
+      input: iterations.reduce((s, i) => s + i.tokens.input, 0),
+      output: iterations.reduce((s, i) => s + i.tokens.output, 0),
+      perIteration: iterations.map((i) => i.tokens),
+    },
+    latency: {
+      e2e: { p50: 0, p90: 0, p95: 0, p99: 0, avg: 0, min: 0, max: 0 },
+      llm: { p50: 0, p90: 0, p95: 0, p99: 0, avg: 0, min: 0, max: 0 },
+      mcp: { p50: 0, p90: 0, p95: 0, p99: 0, avg: 0, min: 0, max: 0 },
+      perIteration: iterations.flatMap((i) => i.latencies),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// iterationToEvalResult
+// ---------------------------------------------------------------------------
+
+describe("iterationToEvalResult", () => {
+  it("converts a single-prompt iteration", () => {
+    const prompt = makePrompt({
+      prompt: "hello",
+      toolCalls: [{ toolName: "tool_a", arguments: { x: 1 } }],
+      provider: "openai",
+      model: "gpt-4o",
+    });
+    const iteration = makeIteration({ prompts: [prompt] });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "case-1" });
+
+    expect(result.caseTitle).toBe("case-1");
+    expect(result.passed).toBe(true);
+    expect(result.query).toBe("hello");
+    expect(result.provider).toBe("openai");
+    expect(result.model).toBe("gpt-4o");
+    expect(result.actualToolCalls).toEqual([
+      { toolName: "tool_a", arguments: { x: 1 } },
+    ]);
+    expect(result.tokens).toEqual({ input: 10, output: 5, total: 15 });
+    expect(result.durationMs).toBe(100);
+    expect(result.metadata).toEqual({ iterationNumber: 1, retryCount: 0 });
+  });
+
+  it("aggregates tool calls from all prompts in multi-turn", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      toolCalls: [{ toolName: "tool_a", arguments: {} }],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      toolCalls: [
+        { toolName: "tool_b", arguments: { y: 2 } },
+        { toolName: "tool_c", arguments: {} },
+      ],
+    });
+    const iteration = makeIteration({
+      prompts: [p1, p2],
+      latencies: [
+        { e2eMs: 100, llmMs: 80, mcpMs: 20 },
+        { e2eMs: 200, llmMs: 150, mcpMs: 50 },
+      ],
+      tokens: { total: 30, input: 20, output: 10 },
+    });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "multi" });
+
+    expect(result.actualToolCalls).toEqual([
+      { toolName: "tool_a", arguments: {} },
+      { toolName: "tool_b", arguments: { y: 2 } },
+      { toolName: "tool_c", arguments: {} },
+    ]);
+    // Tokens come from iteration-level (pre-aggregated)
+    expect(result.tokens).toEqual({ input: 20, output: 10, total: 30 });
+    // Duration is sum of latencies
+    expect(result.durationMs).toBe(300);
+  });
+
+  it("aggregates trace messages from all prompts", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      messages: [
+        { role: "user", content: "turn 1" },
+        { role: "assistant", content: "reply 1" },
+      ],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      messages: [
+        { role: "user", content: "turn 2" },
+        { role: "assistant", content: "reply 2" },
+      ],
+    });
+    const iteration = makeIteration({ prompts: [p1, p2] });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "trace" });
+
+    expect(result.trace).toBeDefined();
+    const messages = (result.trace as any).messages;
+    expect(messages).toHaveLength(4);
+    expect(messages[0]).toEqual({ role: "user", content: "turn 1" });
+    expect(messages[3]).toEqual({ role: "assistant", content: "reply 2" });
+  });
+
+  it("includes per-prompt trace summaries when advancedConfig.steps is provided", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      toolCalls: [{ toolName: "tool_a", arguments: { x: 1 } }],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      toolCalls: [{ toolName: "tool_b", arguments: { y: 2 } }],
+    });
+
+    const result = promptsToEvalResult([p1, p2], {
+      caseTitle: "multi-turn",
+      passed: true,
+      advancedConfig: {
+        // The unified test-step model: a `prompt` step opens a turn; the
+        // `toolCalledWith` assert that follows it supplies the expected call.
+        steps: [
+          { id: "s1", kind: "prompt", prompt: "turn 1" },
+          {
+            id: "s2",
+            kind: "assert",
+            assertion: {
+              type: "toolCalledWith",
+              toolName: "tool_a",
+              args: { args: { x: 1 } },
+            },
+          },
+          { id: "s3", kind: "prompt", prompt: "turn 2" },
+          {
+            id: "s4",
+            kind: "assert",
+            assertion: {
+              type: "toolCalledWith",
+              toolName: "tool_b",
+              args: { args: { y: 2 } },
+            },
+          },
+        ],
+      },
+    });
+
+    expect((result.trace as any).prompts).toEqual([
+      expect.objectContaining({
+        promptIndex: 0,
+        prompt: "turn 1",
+        passed: true,
+        actualToolCalls: [{ toolName: "tool_a", arguments: { x: 1 } }],
+      }),
+      expect.objectContaining({
+        promptIndex: 1,
+        prompt: "turn 2",
+        passed: true,
+        actualToolCalls: [{ toolName: "tool_b", arguments: { y: 2 } }],
+      }),
+    ]);
+  });
+
+  it("merges spans from multi-prompt iteration with e2e offsets", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      latency: { e2eMs: 100, llmMs: 80, mcpMs: 20 },
+      spans: [
+        {
+          id: "a",
+          name: "Step",
+          category: "step",
+          startMs: 0,
+          endMs: 50,
+        },
+      ],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      latency: { e2eMs: 200, llmMs: 150, mcpMs: 50 },
+      spans: [
+        {
+          id: "b",
+          parentId: "a",
+          name: "LLM",
+          category: "llm",
+          startMs: 10,
+          endMs: 80,
+        },
+      ],
+    });
+    const iteration = makeIteration({
+      prompts: [p1, p2],
+      latencies: [
+        { e2eMs: 100, llmMs: 80, mcpMs: 20 },
+        { e2eMs: 200, llmMs: 150, mcpMs: 50 },
+      ],
+    });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "spans" });
+
+    expect((result.trace as any).spans).toEqual([
+      {
+        id: "prompt-0:a",
+        parentId: undefined,
+        name: "Step",
+        category: "step",
+        startMs: 0,
+        endMs: 50,
+        promptIndex: 0,
+        modelId: undefined,
+        messageStartIndex: undefined,
+        messageEndIndex: undefined,
+      },
+      {
+        id: "prompt-1:b",
+        parentId: "prompt-1:a",
+        name: "LLM",
+        category: "llm",
+        startMs: 110,
+        endMs: 180,
+        promptIndex: 1,
+        modelId: undefined,
+        messageStartIndex: undefined,
+        messageEndIndex: undefined,
+      },
+    ]);
+  });
+
+  it("marks passed false when merged trace has errored tool span", () => {
+    const p = makePrompt({
+      spans: [
+        {
+          id: "tool-1",
+          name: "create_view",
+          category: "tool",
+          startMs: 0,
+          endMs: 1,
+          status: "error",
+        },
+      ],
+    });
+    const iteration = makeIteration({ passed: true, prompts: [p] });
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "x" });
+    expect(result.passed).toBe(false);
+  });
+
+  it("keeps passed true for tool error span when failOnToolError is false", () => {
+    const p = makePrompt({
+      spans: [
+        {
+          id: "tool-1",
+          name: "create_view",
+          category: "tool",
+          startMs: 0,
+          endMs: 1,
+          status: "error",
+        },
+      ],
+    });
+    const iteration = makeIteration({ passed: true, prompts: [p] });
+    const result = iterationToEvalResult(iteration, 0, {
+      caseTitle: "x",
+      failOnToolError: false,
+    });
+    expect(result.passed).toBe(true);
+  });
+
+  it("preserves prompt grouping and offsets message ranges across prompts", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      messages: [
+        { role: "user", content: "turn 1" },
+        { role: "assistant", content: "reply 1" },
+      ],
+      model: "gpt-4o",
+      spans: [
+        {
+          id: "step",
+          name: "Step 1",
+          category: "step",
+          startMs: 0,
+          endMs: 60,
+          stepIndex: 0,
+          messageStartIndex: 1,
+          messageEndIndex: 1,
+        },
+      ],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      messages: [
+        { role: "user", content: "turn 2" },
+        { role: "assistant", content: "reply 2" },
+        { role: "tool", content: "tool result" },
+      ],
+      latency: { e2eMs: 200, llmMs: 150, mcpMs: 50 },
+      model: "gpt-4.1",
+      spans: [
+        {
+          id: "tool",
+          name: "search",
+          category: "tool",
+          startMs: 10,
+          endMs: 30,
+          stepIndex: 1,
+          toolCallId: "call-2",
+          toolName: "search",
+          messageStartIndex: 1,
+          messageEndIndex: 2,
+        },
+      ],
+    });
+
+    const result = iterationToEvalResult(
+      makeIteration({
+        prompts: [p1, p2],
+        latencies: [
+          { e2eMs: 100, llmMs: 80, mcpMs: 20 },
+          { e2eMs: 200, llmMs: 150, mcpMs: 50 },
+        ],
+      }),
+      0,
+      { caseTitle: "trace-groups" }
+    );
+
+    expect((result.trace as any).spans).toEqual([
+      expect.objectContaining({
+        id: "prompt-0:step",
+        promptIndex: 0,
+        stepIndex: 0,
+        modelId: "gpt-4o",
+        messageStartIndex: 1,
+        messageEndIndex: 1,
+      }),
+      expect.objectContaining({
+        id: "prompt-1:tool",
+        promptIndex: 1,
+        stepIndex: 1,
+        modelId: "gpt-4.1",
+        toolCallId: "call-2",
+        toolName: "search",
+        startMs: 110,
+        endMs: 130,
+        messageStartIndex: 3,
+        messageEndIndex: 4,
+      }),
+    ]);
+  });
+
+  it("uses promptSelector to pick query/provider/model from selected prompt", () => {
+    const p1 = makePrompt({
+      prompt: "first",
+      provider: "openai",
+      model: "gpt-4o",
+    });
+    const p2 = makePrompt({
+      prompt: "last",
+      provider: "anthropic",
+      model: "claude",
+    });
+    const iteration = makeIteration({ prompts: [p1, p2] });
+
+    const resultFirst = iterationToEvalResult(iteration, 0, {
+      caseTitle: "sel",
+      promptSelector: "first",
+    });
+    expect(resultFirst.query).toBe("first");
+    expect(resultFirst.provider).toBe("openai");
+
+    const resultLast = iterationToEvalResult(iteration, 0, {
+      caseTitle: "sel",
+      promptSelector: "last",
+    });
+    expect(resultLast.query).toBe("last");
+    expect(resultLast.provider).toBe("anthropic");
+  });
+
+  it("options override provider and model from prompt", () => {
+    const prompt = makePrompt({ provider: "openai", model: "gpt-4o" });
+    const iteration = makeIteration({ prompts: [prompt] });
+
+    const result = iterationToEvalResult(iteration, 0, {
+      caseTitle: "override",
+      provider: "custom-provider",
+      model: "custom-model",
+    });
+
+    expect(result.provider).toBe("custom-provider");
+    expect(result.model).toBe("custom-model");
+  });
+
+  it("passes expectedToolCalls through", () => {
+    const iteration = makeIteration({
+      prompts: [makePrompt({})],
+    });
+    const expected = [{ toolName: "expected_tool", arguments: { a: 1 } }];
+
+    const result = iterationToEvalResult(iteration, 0, {
+      caseTitle: "etc",
+      expectedToolCalls: expected,
+    });
+
+    expect(result.expectedToolCalls).toEqual(expected);
+  });
+
+  it("handles no-prompt fallback with empty arrays", () => {
+    const iteration = makeIteration({ prompts: [] });
+
+    const result = iterationToEvalResult(iteration, 2, { caseTitle: "empty" });
+
+    expect(result.caseTitle).toBe("empty");
+    expect(result.passed).toBe(true);
+    expect(result.query).toBeUndefined();
+    expect(result.provider).toBeUndefined();
+    expect(result.model).toBeUndefined();
+    expect(result.actualToolCalls).toEqual([]);
+    expect(result.trace).toBeUndefined();
+    expect(result.metadata).toEqual({ iterationNumber: 3, retryCount: 0 });
+  });
+
+  it("handles undefined prompts the same as empty", () => {
+    const iteration = makeIteration();
+    // prompts is undefined by default
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "undef" });
+
+    expect(result.actualToolCalls).toEqual([]);
+    expect(result.trace).toBeUndefined();
+  });
+
+  it("propagates error from iteration", () => {
+    const iteration = makeIteration({
+      passed: false,
+      error: "LLM timeout",
+      prompts: [makePrompt({})],
+    });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "err" });
+
+    expect(result.passed).toBe(false);
+    expect(result.error).toBe("LLM timeout");
+  });
+
+  it("sets retryCount from iteration", () => {
+    const iteration = makeIteration({
+      retryCount: 3,
+      prompts: [makePrompt({})],
+    });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "retry" });
+
+    expect(result.metadata?.retryCount).toBe(3);
+  });
+
+  it("omits durationMs when latencies sum to zero", () => {
+    const iteration = makeIteration({
+      latencies: [{ e2eMs: 0, llmMs: 0, mcpMs: 0 }],
+      prompts: [makePrompt({})],
+    });
+
+    const result = iterationToEvalResult(iteration, 0, { caseTitle: "zero" });
+
+    expect(result.durationMs).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runToEvalResults
+// ---------------------------------------------------------------------------
+
+describe("lifecycle status", () => {
+  it("reports the iteration's own status and never derives it from `passed`", () => {
+    // The whole point of the two axes: a graded failure that executed
+    // normally is `completed`, and a passing iteration that was still
+    // cancelled/timed out keeps its lifecycle status.
+    expect(
+      resolveIterationLifecycleStatus({ status: "completed", error: undefined })
+    ).toBe("completed");
+    expect(
+      resolveIterationLifecycleStatus({
+        status: "setup_failed",
+        error: "server never started",
+      })
+    ).toBe("setup_failed");
+    expect(
+      resolveIterationLifecycleStatus({ status: "skipped", error: undefined })
+    ).toBe("skipped");
+    // A declared status wins over the error the legacy rule would read.
+    expect(
+      resolveIterationLifecycleStatus({
+        status: "completed",
+        error: "assertion failed: goal not reached",
+      })
+    ).toBe("completed");
+  });
+
+  it("infers a status only for a struct that carries none", () => {
+    expect(legacyIterationStatusFromExecutionError(undefined)).toBe(
+      "completed"
+    );
+    expect(legacyIterationStatusFromExecutionError("   ")).toBe("completed");
+    expect(legacyIterationStatusFromExecutionError("connection reset")).toBe(
+      "failed"
+    );
+    expect(resolveIterationLifecycleStatus({ error: undefined })).toBe(
+      "completed"
+    );
+    expect(resolveIterationLifecycleStatus({ error: "boom" })).toBe("failed");
+  });
+
+  it("carries an explicit status onto every wire mapping", () => {
+    const prompt = makePrompt({ prompt: "hello" });
+    // A FAILED task verdict on an iteration that ran fine. If any mapper read
+    // `passed` the status below would come out `failed`.
+    const graded = makeIteration({
+      passed: false,
+      prompts: [prompt],
+      status: "completed",
+    });
+    expect(
+      iterationToEvalResult(graded, 0, { caseTitle: "case-1" }).status
+    ).toBe("completed");
+    expect(iterationsToEvalResultInputs("case-1", [graded])[0].status).toBe(
+      "completed"
+    );
+
+    const abandoned = makeIteration({
+      passed: false,
+      prompts: [prompt],
+      status: "setup_failed",
+      error: "server never started",
+    });
+    expect(iterationsToEvalResultInputs("case-1", [abandoned])[0].status).toBe(
+      "setup_failed"
+    );
+    expect(
+      runToEvalResults(makeRunResult([abandoned]), { caseTitle: "case-1" })[0]
+        .status
+    ).toBe("setup_failed");
+  });
+});
+
+describe("provider and model on reported iterations", () => {
+  const prompt = makePrompt({
+    provider: "mcpjam",
+    model: "anthropic/claude-haiku-4.5",
+  });
+
+  it("carries the prompt's provider and model through both mappers", () => {
+    const iteration = makeIteration({ prompts: [prompt] });
+
+    expect(
+      iterationsToEvalResultInputs("case-1", [iteration])[0]
+    ).toMatchObject({
+      provider: "mcpjam",
+      model: "anthropic/claude-haiku-4.5",
+    });
+
+    const suite = suiteTestResultsToEvalResultInputs(
+      new Map([["case-1", makeRunResult([iteration])]])
+    );
+    expect(suite[0]).toMatchObject({
+      provider: "mcpjam",
+      model: "anthropic/claude-haiku-4.5",
+    });
+  });
+
+  it("falls back to the executor when an iteration produced no prompt", () => {
+    // A case that failed in setup never reached the model, but the run still
+    // names what it was configured to run — a saved client's model, say.
+    const iteration = makeIteration({ prompts: [], status: "setup_failed" });
+    const variant = { provider: "mcpjam", model: "anthropic/claude-haiku-4.5" };
+
+    expect(
+      iterationsToEvalResultInputs(
+        "case-1",
+        [iteration],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        variant
+      )[0]
+    ).toMatchObject(variant);
+
+    expect(
+      suiteTestResultsToEvalResultInputs(
+        new Map([["case-1", makeRunResult([iteration])]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        variant
+      )[0]
+    ).toMatchObject(variant);
+  });
+
+  it("prefers the prompt over the executor fallback", () => {
+    const iteration = makeIteration({ prompts: [prompt] });
+    expect(
+      iterationsToEvalResultInputs(
+        "case-1",
+        [iteration],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { provider: "openai", model: "gpt-5" }
+      )[0]
+    ).toMatchObject({
+      provider: "mcpjam",
+      model: "anthropic/claude-haiku-4.5",
+    });
+  });
+
+  it("leaves both undefined with no prompt and no fallback", () => {
+    const iteration = makeIteration({ prompts: [] });
+    const result = iterationsToEvalResultInputs("case-1", [iteration])[0];
+    expect(result.provider).toBeUndefined();
+    expect(result.model).toBeUndefined();
+  });
+});
+
+describe("variantFromExecutor", () => {
+  it("reads the parsed provider and model off a HostRunner-shaped executor", () => {
+    expect(
+      variantFromExecutor({
+        getParsedProvider: () => "mcpjam",
+        getParsedModel: () => "anthropic/claude-haiku-4.5",
+      })
+    ).toEqual({ provider: "mcpjam", model: "anthropic/claude-haiku-4.5" });
+  });
+
+  it("returns nothing for an executor that does not parse a model string", () => {
+    // Only `HostRunner` has these; the `HostExecutor` interface does not.
+    expect(variantFromExecutor({ run: async () => ({}) })).toEqual({});
+    expect(variantFromExecutor(undefined)).toEqual({});
+  });
+});
+
+describe("stepResults on reported iterations", () => {
+  const EXPECTED = [{ toolName: "show-squad", arguments: { team: "PSG" } }];
+  const noMatch = {
+    missing: [],
+    extra: [],
+    outOfOrder: [],
+    argumentMismatches: [],
+  };
+  const stepsOf = (result: { metadata?: Record<string, unknown> }) =>
+    result.metadata?.stepResults;
+  const run = (overrides: Partial<IterationResult>, expected = EXPECTED) =>
+    iterationsToEvalResultInputs("case", [makeIteration(overrides)], expected);
+
+  it("passes the prompt and every expectation when the match passed", () => {
+    const results = run({
+      prompts: [makePrompt({ toolCalls: EXPECTED })],
+      toolMatch: { ...noMatch, passed: true },
+    });
+
+    expect(stepsOf(results[0])).toEqual([
+      { stepId: "step-1", stepIndex: 0, kind: "prompt", status: "ok" },
+      { stepId: "step-expect-0", stepIndex: 1, kind: "assert", status: "ok" },
+    ]);
+  });
+
+  it("spends each missing or mismatched call on one expectation only", () => {
+    const twice = [
+      { toolName: "show-squad", arguments: { team: "PSG" } },
+      { toolName: "show-squad", arguments: { team: "PSG" } },
+    ];
+    const results = run(
+      {
+        passed: false,
+        prompts: [makePrompt({ toolCalls: [twice[0]] })],
+        toolMatch: {
+          ...noMatch,
+          passed: false,
+          // One call was made; the matcher reports the second expectation missing.
+          missing: [twice[1]],
+        },
+      },
+      twice
+    );
+
+    // Only one row may cash in the single missing entry. The other is not
+    // individually implicated, so it takes the shared verdict instead.
+    const rows = stepsOf(results[0]) as { stepId: string; reason?: string }[];
+    expect(rows.filter((row) => row.reason === "not called")).toHaveLength(1);
+  });
+
+  it("matches an argument mismatch by expected arguments, not tool name alone", () => {
+    const expectations = [
+      { toolName: "show-squad", arguments: { team: "PSG" } },
+      { toolName: "show-squad", arguments: { team: "Inter" } },
+    ];
+    const results = run(
+      {
+        passed: false,
+        prompts: [makePrompt({})],
+        toolMatch: {
+          ...noMatch,
+          passed: false,
+          argumentMismatches: [
+            {
+              toolName: "show-squad",
+              expectedArgs: { team: "Inter" },
+              actualArgs: { team: "Milan" },
+            },
+          ],
+        },
+      },
+      expectations
+    );
+
+    const rows = stepsOf(results[0]) as { stepId: string; reason?: string }[];
+    const differed = rows.filter((row) =>
+      row.reason?.startsWith("arguments differed")
+    );
+    expect(differed.map((row) => row.stepId)).toEqual(["step-expect-1"]);
+  });
+
+  it("blames the expectation the matcher reported missing", () => {
+    const results = run({
+      passed: false,
+      prompts: [makePrompt({})],
+      toolMatch: { ...noMatch, missing: [...EXPECTED], passed: false },
+    });
+
+    expect(stepsOf(results[0])).toContainEqual({
+      stepId: "step-expect-0",
+      stepIndex: 1,
+      kind: "assert",
+      status: "fail",
+      reason: "not called",
+    });
+  });
+
+  it("names both sides when only the arguments differed", () => {
+    const results = run({
+      passed: false,
+      prompts: [makePrompt({})],
+      toolMatch: {
+        ...noMatch,
+        argumentMismatches: [
+          {
+            toolName: "show-squad",
+            expectedArgs: { team: "PSG" },
+            actualArgs: { team: "Paris Saint-Germain" },
+          },
+        ],
+        passed: false,
+      },
+    });
+
+    const [, assertion] = stepsOf(results[0]) as Record<string, unknown>[];
+    expect(assertion.status).toBe("fail");
+    expect(assertion.reason).toContain("arguments differed");
+    expect(assertion.reason).toContain("Paris Saint-Germain");
+  });
+
+  it("fails every expectation when the failure implicates none of them", () => {
+    // An extra call means the iteration did not match, but no single
+    // expectation is at fault — the header must not read "1 of 1 passed".
+    const results = run({
+      passed: false,
+      prompts: [makePrompt({})],
+      toolMatch: {
+        ...noMatch,
+        extra: [{ toolName: "list-players", arguments: {} }],
+        passed: false,
+      },
+    });
+
+    const [, assertion] = stepsOf(results[0]) as Record<string, unknown>[];
+    expect(assertion.status).toBe("fail");
+    expect(assertion.reason).toBe("unexpected tool call: list-players");
+  });
+
+  it("fails a negative case whose tool was called after all", () => {
+    const results = iterationsToEvalResultInputs(
+      "case",
+      [
+        makeIteration({
+          passed: false,
+          prompts: [makePrompt({})],
+          toolMatch: {
+            ...noMatch,
+            extra: [{ toolName: "show-squad", arguments: {} }],
+            passed: false,
+          },
+        }),
+      ],
+      EXPECTED,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { isNegativeTest: true }
+    );
+
+    expect(stepsOf(results[0])).toContainEqual({
+      stepId: "step-expect-0",
+      stepIndex: 1,
+      kind: "assert",
+      status: "fail",
+      reason: "tool was called: show-squad",
+    });
+  });
+
+  it("reports pending, not passed, when the matcher never ran", () => {
+    const results = run({ prompts: [makePrompt({})] });
+
+    expect(stepsOf(results[0])).toContainEqual({
+      stepId: "step-expect-0",
+      stepIndex: 1,
+      kind: "assert",
+      status: "pending",
+    });
+  });
+
+  it("uses the SDK's own step ids when the case has predicates", () => {
+    const predicates = [
+      { type: "containsText", text: "psg" },
+      { type: "containsText", text: "squad" },
+    ] as unknown as Parameters<typeof iterationsToEvalResultInputs>[5];
+
+    const results = iterationsToEvalResultInputs(
+      "case",
+      [
+        makeIteration({
+          passed: false,
+          prompts: [makePrompt({})],
+          // Only the first predicate was reached; the second never evaluated.
+          predicateResults: [
+            { passed: false, reason: "no psg in the answer" },
+          ] as unknown as IterationResult["predicateResults"],
+        }),
+      ],
+      EXPECTED,
+      undefined,
+      undefined,
+      predicates
+    );
+
+    expect(stepsOf(results[0])).toEqual([
+      { stepId: "sdk-prompt-0", stepIndex: 0, kind: "prompt", status: "ok" },
+      {
+        stepId: "sdk-assert-0",
+        stepIndex: 1,
+        kind: "assert",
+        status: "fail",
+        reason: "no psg in the answer",
+      },
+      {
+        stepId: "sdk-assert-1",
+        stepIndex: 2,
+        kind: "assert",
+        status: "pending",
+      },
+    ]);
+  });
+
+  it("omits the key entirely when there is nothing to report", () => {
+    const results = iterationsToEvalResultInputs("case", [makeIteration({})]);
+
+    expect(results[0].metadata).not.toHaveProperty("stepResults");
+  });
+
+  it("reports the same rows through the suite mapper", () => {
+    const iteration = makeIteration({
+      prompts: [makePrompt({ toolCalls: EXPECTED })],
+      toolMatch: { ...noMatch, passed: true },
+    });
+
+    const viaSuite = suiteTestResultsToEvalResultInputs(
+      new Map([["case", makeRunResult([iteration])]]),
+      { case: EXPECTED }
+    );
+
+    expect(stepsOf(viaSuite[0])).toEqual(
+      stepsOf(iterationsToEvalResultInputs("case", [iteration], EXPECTED)[0])
+    );
+  });
+});
+
+describe("runToEvalResults", () => {
+  it("maps N iterations with correct case titles", () => {
+    const run = makeRunResult([
+      makeIteration({ prompts: [makePrompt({ prompt: "q1" })] }),
+      makeIteration({ prompts: [makePrompt({ prompt: "q2" })] }),
+      makeIteration({ prompts: [makePrompt({ prompt: "q3" })] }),
+    ]);
+
+    const results = runToEvalResults(run, { casePrefix: "test" });
+
+    expect(results).toHaveLength(3);
+    expect(results[0].caseTitle).toBe("test-iter-1");
+    expect(results[1].caseTitle).toBe("test-iter-2");
+    expect(results[2].caseTitle).toBe("test-iter-3");
+  });
+
+  it("passes options through to iterationToEvalResult", () => {
+    const run = makeRunResult([
+      makeIteration({ prompts: [makePrompt({ provider: "openai" })] }),
+    ]);
+
+    const results = runToEvalResults(run, {
+      casePrefix: "pfx",
+      provider: "custom",
+      model: "m1",
+      expectedToolCalls: [{ toolName: "t" }],
+      promptSelector: "last",
+      intent: "refund",
+    });
+
+    expect(results[0].provider).toBe("custom");
+    expect(results[0].model).toBe("m1");
+    expect(results[0].expectedToolCalls).toEqual([{ toolName: "t" }]);
+    expect(results[0].intent).toBe("refund");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// suiteRunToEvalResults
+// ---------------------------------------------------------------------------
+
+describe("suiteRunToEvalResults", () => {
+  it("maps multiple tests with correct case titles", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "login",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+    testResults.set(
+      "logout",
+      makeRunResult([
+        makeIteration({ prompts: [makePrompt({})] }),
+        makeIteration({ prompts: [makePrompt({})] }),
+      ])
+    );
+
+    const results = suiteRunToEvalResults(testResults, { casePrefix: "suite" });
+
+    expect(results).toHaveLength(3);
+    expect(results[0].caseTitle).toBe("suite-login-iter-1");
+    expect(results[1].caseTitle).toBe("suite-logout-iter-1");
+    expect(results[2].caseTitle).toBe("suite-logout-iter-2");
+  });
+
+  it("routes expectedToolCallsByTest correctly", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "test-a",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+    testResults.set(
+      "test-b",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+
+    const expectedByTest = {
+      "test-a": [{ toolName: "tool_x" }],
+      "test-b": [{ toolName: "tool_y", arguments: { z: 1 } }],
+    };
+
+    const results = suiteRunToEvalResults(testResults, {
+      casePrefix: "s",
+      expectedToolCallsByTest: expectedByTest,
+      intentByTest: { "test-a": "refund", "test-b": null },
+    });
+
+    const testA = results.find((r) => r.caseTitle.includes("test-a"));
+    const testB = results.find((r) => r.caseTitle.includes("test-b"));
+
+    expect(testA?.expectedToolCalls).toEqual([{ toolName: "tool_x" }]);
+    expect(testB?.expectedToolCalls).toEqual([
+      { toolName: "tool_y", arguments: { z: 1 } },
+    ]);
+    expect(testA?.intent).toBe("refund");
+    expect(testB?.intent).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// iterationsToEvalResultInputs
+// ---------------------------------------------------------------------------
+
+describe("iterationsToEvalResultInputs", () => {
+  it("aggregates tool calls and trace from all prompts", () => {
+    const p1 = makePrompt({
+      prompt: "turn 1",
+      toolCalls: [{ toolName: "a", arguments: {} }],
+      messages: [{ role: "user", content: "turn 1" }],
+    });
+    const p2 = makePrompt({
+      prompt: "turn 2",
+      toolCalls: [{ toolName: "b", arguments: { x: 1 } }],
+      messages: [{ role: "user", content: "turn 2" }],
+    });
+    const iteration = makeIteration({
+      prompts: [p1, p2],
+      tokens: { total: 30, input: 20, output: 10 },
+    });
+
+    const results = iterationsToEvalResultInputs("my-test", [iteration]);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].actualToolCalls).toEqual([
+      { toolName: "a", arguments: {} },
+      { toolName: "b", arguments: { x: 1 } },
+    ]);
+    expect(results[0].trace).toBeDefined();
+    const messages = (results[0].trace as any).messages;
+    expect(messages).toHaveLength(2);
+  });
+
+  it("uses query from first prompt", () => {
+    const p1 = makePrompt({ prompt: "first query" });
+    const p2 = makePrompt({ prompt: "second query" });
+    const iteration = makeIteration({ prompts: [p1, p2] });
+
+    const results = iterationsToEvalResultInputs("test", [iteration]);
+
+    expect(results[0].query).toBe("first query");
+  });
+
+  it("emits ONE steps array for the whole case even when prompts vary per iteration", () => {
+    // The backend hashes `steps` into the case identity, so per-iteration steps
+    // would split a test whose prompt interpolates a timestamp or a computed
+    // value into one case per distinct string — forking its own history inside
+    // a single run. Every iteration must report the same steps.
+    const predicates = [
+      { type: "toolCalledAtLeastOnce", toolName: "finish" },
+    ] as any;
+    const iterationOne = makeIteration({
+      prompts: [makePrompt({ prompt: "Run at 10:00:01" })],
+    });
+    const iterationTwo = makeIteration({
+      prompts: [makePrompt({ prompt: "Run at 10:00:02" })],
+    });
+
+    const results = iterationsToEvalResultInputs(
+      "drifting-prompt",
+      [iterationOne, iterationTwo],
+      undefined,
+      undefined,
+      undefined,
+      predicates
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0].advancedConfig).toBeDefined();
+    expect(results[0].advancedConfig).toEqual(results[1].advancedConfig);
+    const steps = (results[0].advancedConfig as any).steps;
+    expect(steps.map((s: any) => s.kind)).toEqual(["prompt", "assert"]);
+    // Taken from the first iteration that had prompts.
+    expect(steps[0].prompt).toBe("Run at 10:00:01");
+  });
+
+  it("omits synthesized steps entirely when no predicates are configured", () => {
+    const iteration = makeIteration({ prompts: [makePrompt({})] });
+    const results = iterationsToEvalResultInputs("no-predicates", [iteration]);
+    expect(results[0].advancedConfig).toBeUndefined();
+  });
+
+  it("falls back to testName when no prompts", () => {
+    const iteration = makeIteration({ prompts: [] });
+
+    const results = iterationsToEvalResultInputs("fallback-name", [iteration]);
+
+    expect(results[0].query).toBe("fallback-name");
+    expect(results[0].caseTitle).toBe("fallback-name");
+  });
+
+  it("includes metadata with iterationNumber and retryCount", () => {
+    const iterations = [
+      makeIteration({ prompts: [makePrompt({})] }),
+      makeIteration({ prompts: [makePrompt({})], retryCount: 2 }),
+    ];
+
+    const results = iterationsToEvalResultInputs("t", iterations);
+
+    // Every SDK iteration now also carries the derived user-value chain. Split
+    // those keys off rather than loosening this to `toMatchObject`: the exact
+    // shape of the rest of the metadata is what this test exists to pin.
+    const split = (index: number) => {
+      const {
+        stageResults,
+        stageAnalyzerVersion,
+        stageMeasurements,
+        stepResults,
+        ...rest
+      } = results[index].metadata as Record<string, unknown>;
+      return {
+        stageResults,
+        stageAnalyzerVersion,
+        stageMeasurements,
+        stepResults,
+        rest,
+      };
+    };
+
+    expect(split(0).rest).toEqual({ retryCount: 0, iterationNumber: 1 });
+    expect(split(1).rest).toEqual({ retryCount: 2, iterationNumber: 2 });
+
+    // One prompt, no expectations: the prompt step alone.
+    for (const index of [0, 1]) {
+      expect(split(index).stepResults).toEqual([
+        { stepId: "step-1", stepIndex: 0, kind: "prompt", status: "ok" },
+      ]);
+    }
+
+    for (const index of [0, 1]) {
+      const { stageResults, stageAnalyzerVersion, stageMeasurements } =
+        split(index);
+      expect(stageAnalyzerVersion).toBe(STAGE_ANALYZER_VERSION);
+      expect((stageResults as StageResultRow[]).map((r) => r.stage)).toEqual([
+        ...USER_VALUE_STAGES,
+      ]);
+      expect(stageMeasurements).toMatchObject({
+        schemaVersion: 1,
+        stageAnalyzerVersion: STAGE_ANALYZER_VERSION,
+      });
+    }
+  });
+
+  it("derives a stage chain that never passes a stage on missing evidence", () => {
+    // A retry-exhausted iteration with no prompt history at all: the mapper
+    // produces no trace, so there is nothing any stage could be decided from.
+    const iteration = makeIteration({
+      passed: false,
+      error: "connect ECONNREFUSED",
+      retryCount: 2,
+      prompts: [],
+    });
+
+    const [result] = iterationsToEvalResultInputs("no-evidence", [iteration]);
+
+    expect(result.trace).toBeUndefined();
+    const rows = (result.metadata as Record<string, unknown>)
+      .stageResults as StageResultRow[];
+    expect(rows.filter((r) => r.state === "passed")).toHaveLength(0);
+    // This fixture declares no expected tool calls and no predicates, so most
+    // stages genuinely do not apply to it. Every stage that DOES apply is
+    // unmeasured — none is quietly green.
+    const applicable = rows.filter((r) => r.state !== "notApplicable");
+    expect(applicable.length).toBeGreaterThan(0);
+    expect(applicable.every((r) => r.state === "notMeasured")).toBe(true);
+    // A failed iteration that captured nothing at all is a setup abort — the
+    // harness never got to the test — not a server verdict.
+    expect(applicable.every((r) => r.reason === "setupAborted")).toBe(true);
+    expect((result.metadata as Record<string, unknown>).failureCategory).toBe(
+      "setup"
+    );
+    // Nothing was measured, so nothing may be reported as having failed.
+    expect(
+      (result.metadata as Record<string, unknown>).firstFailedStage
+    ).toBeUndefined();
+  });
+
+  it("propagates error", () => {
+    const iteration = makeIteration({
+      passed: false,
+      error: "timeout",
+      prompts: [],
+    });
+
+    const results = iterationsToEvalResultInputs("t", [iteration]);
+
+    expect(results[0].error).toBe("timeout");
+    expect(results[0].passed).toBe(false);
+  });
+
+  it("fails passed when trace has tool error span despite iteration.passed", () => {
+    const iteration = makeIteration({
+      passed: true,
+      prompts: [
+        makePrompt({
+          spans: [
+            {
+              id: "s1",
+              name: "create_view",
+              category: "tool",
+              startMs: 0,
+              endMs: 1,
+              status: "error",
+            },
+          ],
+        }),
+      ],
+    });
+
+    const results = iterationsToEvalResultInputs("t", [iteration]);
+    expect(results[0].passed).toBe(false);
+  });
+
+  it("preserves passed when failOnToolError is false", () => {
+    const iteration = makeIteration({
+      passed: true,
+      prompts: [
+        makePrompt({
+          spans: [
+            {
+              id: "s1",
+              name: "create_view",
+              category: "tool",
+              startMs: 0,
+              endMs: 1,
+              status: "error",
+            },
+          ],
+        }),
+      ],
+    });
+
+    const results = iterationsToEvalResultInputs(
+      "t",
+      [iteration],
+      undefined,
+      false
+    );
+    expect(results[0].passed).toBe(true);
+  });
+
+  it("forwards expectedToolCalls when provided", () => {
+    const iteration = makeIteration({ prompts: [makePrompt({})] });
+    const expected = [
+      { toolName: "tool_a", arguments: { x: 1 } },
+      { toolName: "tool_b" },
+    ];
+
+    const results = iterationsToEvalResultInputs("t", [iteration], expected);
+
+    expect(results[0].expectedToolCalls).toEqual(expected);
+  });
+
+  it("leaves expectedToolCalls undefined when omitted", () => {
+    const iteration = makeIteration({ prompts: [makePrompt({})] });
+
+    const results = iterationsToEvalResultInputs("t", [iteration]);
+
+    expect(results[0].expectedToolCalls).toBeUndefined();
+  });
+
+  it("derives metadata host_style from each iteration's own hostSnapshot (not the global stamp)", () => {
+    // Regression: previously the mapper applied the same global
+    // hostExtras to every iteration, so a `HostRuntime` whose bound
+    // `Host` mutated between iterations would tag every iteration with
+    // the post-mutation state. Now: when an iteration carries its own
+    // `hostSnapshot`, it wins; the global fallback is only used when
+    // an iteration has no snapshot (legacy / non-host-backed executors).
+    const claudeIteration = makeIteration({
+      hostSnapshot: {
+        style: "claude",
+        model: "anthropic/claude-3",
+        systemPrompt: "",
+        temperature: 0.7,
+        requireToolApproval: false,
+        servers: ["a"],
+        optionalServers: [],
+        connectionDefaults: {} as any,
+        clientCapabilities: {},
+        hostContext: {},
+      } as any,
+    });
+    const mcpjamIteration = makeIteration({
+      hostSnapshot: {
+        style: "mcpjam",
+        model: "openai/gpt-4o",
+        systemPrompt: "",
+        temperature: 0.7,
+        requireToolApproval: false,
+        servers: ["b"],
+        optionalServers: [],
+        connectionDefaults: {} as any,
+        clientCapabilities: {},
+        hostContext: {},
+      } as any,
+    });
+
+    const results = iterationsToEvalResultInputs(
+      "t",
+      [claudeIteration, mcpjamIteration],
+      undefined,
+      undefined,
+      // Global fallback derived once from `executor.getHostSnapshot()` —
+      // this is what previously stamped every iteration.
+      { host_style: "should_be_ignored" }
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0].metadata?.host_style).toBe("claude");
+    expect(results[1].metadata?.host_style).toBe("mcpjam");
+  });
+
+  it("falls back to the global hostExtras when an iteration has no hostSnapshot", () => {
+    const iteration = makeIteration({ prompts: [makePrompt({})] });
+
+    const results = iterationsToEvalResultInputs(
+      "t",
+      [iteration],
+      undefined,
+      undefined,
+      { host_style: "mcpjam" }
+    );
+
+    expect(results[0].metadata?.host_style).toBe("mcpjam");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// suiteTestResultsToEvalResultInputs
+// ---------------------------------------------------------------------------
+
+describe("suiteTestResultsToEvalResultInputs", () => {
+  it("derives the same stage chain as the sibling mapper", () => {
+    // Both exported mappers build the same per-iteration shape. A chain that
+    // appeared from one entry point and not the other would leave a reader
+    // unable to tell "no derivation ran" from "the derivation found nothing".
+    const iteration = makeIteration({ prompts: [makePrompt({})] });
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set("suite-case", makeRunResult([iteration]));
+
+    const viaSuite = suiteTestResultsToEvalResultInputs(testResults);
+    const viaIterations = iterationsToEvalResultInputs("suite-case", [
+      iteration,
+    ]);
+
+    const suiteMeta = viaSuite[0].metadata as Record<string, unknown>;
+    const iterationMeta = viaIterations[0].metadata as Record<string, unknown>;
+
+    expect(suiteMeta.stageAnalyzerVersion).toBe(STAGE_ANALYZER_VERSION);
+    expect(
+      (suiteMeta.stageResults as StageResultRow[]).map((r) => r.stage)
+    ).toEqual([...USER_VALUE_STAGES]);
+    expect(suiteMeta.stageResults).toEqual(iterationMeta.stageResults);
+  });
+
+  it("includes testName in metadata", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "auth-test",
+      makeRunResult([
+        makeIteration({ prompts: [makePrompt({ prompt: "login" })] }),
+      ])
+    );
+
+    const results = suiteTestResultsToEvalResultInputs(testResults);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].caseTitle).toBe("auth-test");
+    expect(results[0].metadata?.testName).toBe("auth-test");
+    expect(results[0].query).toBe("login");
+  });
+
+  it("maps multiple tests with multiple iterations", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "test-1",
+      makeRunResult([
+        makeIteration({ prompts: [makePrompt({})] }),
+        makeIteration({ prompts: [makePrompt({})] }),
+      ])
+    );
+    testResults.set(
+      "test-2",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+
+    const results = suiteTestResultsToEvalResultInputs(testResults);
+
+    expect(results).toHaveLength(3);
+    expect(results[0].caseTitle).toBe("test-1");
+    expect(results[0].metadata?.iterationNumber).toBe(1);
+    expect(results[1].caseTitle).toBe("test-1");
+    expect(results[1].metadata?.iterationNumber).toBe(2);
+    expect(results[2].caseTitle).toBe("test-2");
+    expect(results[2].metadata?.testName).toBe("test-2");
+  });
+
+  it("aggregates tool calls from all prompts in each iteration", () => {
+    const p1 = makePrompt({ toolCalls: [{ toolName: "a", arguments: {} }] });
+    const p2 = makePrompt({ toolCalls: [{ toolName: "b", arguments: {} }] });
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "multi",
+      makeRunResult([makeIteration({ prompts: [p1, p2] })])
+    );
+
+    const results = suiteTestResultsToEvalResultInputs(testResults);
+
+    expect(results[0].actualToolCalls).toEqual([
+      { toolName: "a", arguments: {} },
+      { toolName: "b", arguments: {} },
+    ]);
+  });
+
+  it("forwards per-test expectedToolCalls when provided", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "test-a",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+    testResults.set(
+      "test-b",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+
+    const expectedByTest = {
+      "test-a": [{ toolName: "tool_x", arguments: { k: 1 } }],
+      "test-b": [{ toolName: "tool_y" }],
+    };
+
+    const results = suiteTestResultsToEvalResultInputs(
+      testResults,
+      expectedByTest
+    );
+
+    expect(results[0].expectedToolCalls).toEqual([
+      { toolName: "tool_x", arguments: { k: 1 } },
+    ]);
+    expect(results[1].expectedToolCalls).toEqual([{ toolName: "tool_y" }]);
+  });
+
+  it("leaves expectedToolCalls undefined for tests without them", () => {
+    const testResults = new Map<string, EvalRunResult>();
+    testResults.set(
+      "test-with",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+    testResults.set(
+      "test-without",
+      makeRunResult([makeIteration({ prompts: [makePrompt({})] })])
+    );
+
+    const expectedByTest = {
+      "test-with": [{ toolName: "tool_z" }],
+    };
+
+    const results = suiteTestResultsToEvalResultInputs(
+      testResults,
+      expectedByTest
+    );
+
+    const withResult = results.find((r) => r.caseTitle === "test-with");
+    const withoutResult = results.find((r) => r.caseTitle === "test-without");
+
+    expect(withResult?.expectedToolCalls).toEqual([{ toolName: "tool_z" }]);
+    expect(withoutResult?.expectedToolCalls).toBeUndefined();
+  });
+});

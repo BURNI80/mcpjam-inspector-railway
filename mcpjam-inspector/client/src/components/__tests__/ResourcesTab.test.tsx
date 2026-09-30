@@ -1,0 +1,568 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
+import { ResourcesTab } from "../ResourcesTab";
+import type { MCPServerConfig } from "@mcpjam/sdk/browser";
+
+const { mockJsonEditor } = vi.hoisted(() => ({
+  mockJsonEditor: vi.fn((props: any) => (
+    <div data-testid="json-editor">{JSON.stringify(props.value)}</div>
+  )),
+}));
+
+// Mock APIs
+const mockListResources = vi.fn();
+const mockReadResource = vi.fn();
+
+vi.mock("@/lib/apis/mcp-resources-api", () => ({
+  listResources: (...args: unknown[]) => mockListResources(...args),
+  readResource: (...args: unknown[]) => mockReadResource(...args),
+}));
+
+// Mock ResizablePanelGroup to simplify rendering
+vi.mock("../ui/resizable", () => ({
+  ResizablePanelGroup: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="resizable-panel-group">{children}</div>
+  ),
+  ResizablePanel: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="resizable-panel">{children}</div>
+  ),
+  ResizableHandle: () => <div data-testid="resizable-handle" />,
+}));
+
+// Mock LoggerView
+vi.mock("../logger-view", () => ({
+  LoggerView: () => <div data-testid="logger-view">Logger</div>,
+}));
+
+// Mock ScrollArea
+vi.mock("@mcpjam/design-system/scroll-area", () => ({
+  ScrollArea: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="scroll-area">{children}</div>
+  ),
+}));
+
+vi.mock("@/components/ui/json-editor", () => ({
+  JsonEditor: (props: any) => mockJsonEditor(props),
+}));
+
+describe("ResourcesTab", () => {
+  const createServerConfig = (): MCPServerConfig =>
+    ({
+      transportType: "stdio",
+      command: "node",
+      args: ["server.js"],
+    }) as MCPServerConfig;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockJsonEditor.mockClear();
+    mockListResources.mockResolvedValue({ resources: [] });
+    mockReadResource.mockResolvedValue({ content: null });
+  });
+
+  describe("empty state", () => {
+    it("shows empty state when no server config provided", () => {
+      render(<ResourcesTab />);
+
+      expect(screen.getByText("No Server Selected")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Connect to an MCP server to browse and explore its available resources.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("shows empty state when serverConfig is undefined", () => {
+      render(
+        <ResourcesTab serverConfig={undefined} serverName="test-server" />,
+      );
+
+      expect(screen.getByText("No Server Selected")).toBeInTheDocument();
+    });
+  });
+
+  describe("resource fetching", () => {
+    it("fetches resources when server is configured", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "test.txt", uri: "file:///test.txt" }],
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(mockListResources).toHaveBeenCalledWith(
+          "test-server",
+          undefined,
+          { refresh: false },
+        );
+      });
+    });
+
+    it("does not fetch resources when the server is disconnected", () => {
+      const serverConfig = createServerConfig();
+
+      render(
+        <ResourcesTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      expect(mockListResources).not.toHaveBeenCalled();
+      expect(
+        screen.getByText("Connect this server to load resources."),
+      ).toBeInTheDocument();
+    });
+
+    it("clears loaded resources when the selected server disconnects", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "test.txt", uri: "file:///test.txt" }],
+      });
+
+      const { rerender } = render(
+        <ResourcesTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="connected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("test.txt")).toBeInTheDocument();
+      });
+      expect(mockListResources).toHaveBeenCalledTimes(1);
+
+      rerender(
+        <ResourcesTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByText("test.txt")).not.toBeInTheDocument();
+      });
+      expect(
+        screen.getByText("Connect this server to load resources."),
+      ).toBeInTheDocument();
+      expect(mockListResources).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores a stale resources response after the selected server disconnects", async () => {
+      const serverConfig = createServerConfig();
+      let resolveResources!: (value: {
+        resources: Array<Record<string, unknown>>;
+      }) => void;
+      mockListResources.mockReturnValue(
+        new Promise((resolve) => {
+          resolveResources = resolve;
+        }),
+      );
+
+      const { rerender } = render(
+        <ResourcesTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="connected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockListResources).toHaveBeenCalledTimes(1);
+      });
+
+      rerender(
+        <ResourcesTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      await act(async () => {
+        resolveResources({
+          resources: [{ name: "late.txt", uri: "file:///late.txt" }],
+        });
+      });
+
+      expect(screen.queryByText("late.txt")).not.toBeInTheDocument();
+      expect(
+        screen.getByText("Connect this server to load resources."),
+      ).toBeInTheDocument();
+    });
+
+    it("displays resources after fetching", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [
+          {
+            name: "config.json",
+            uri: "file:///config.json",
+            description: "Configuration file",
+          },
+          {
+            name: "data.csv",
+            uri: "file:///data.csv",
+          },
+        ],
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("config.json")).toBeInTheDocument();
+        expect(screen.getByText("data.csv")).toBeInTheDocument();
+      });
+    });
+
+    it("displays resource count", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [
+          { name: "file1.txt", uri: "file:///file1.txt" },
+          { name: "file2.txt", uri: "file:///file2.txt" },
+        ],
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("2")).toBeInTheDocument();
+      });
+    });
+
+    it("shows no resources message when list is empty", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({ resources: [] });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("No resources available")).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("resource selection", () => {
+    it("shows select resource prompt when no resource selected", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "test.txt", uri: "file:///test.txt" }],
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("No selection")).toBeInTheDocument();
+      });
+    });
+
+    it("selects resource and auto-reads when clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [
+          {
+            name: "test.txt",
+            uri: "file:///test.txt",
+            description: "Test file",
+          },
+        ],
+      });
+
+      mockReadResource.mockResolvedValue({
+        content: {
+          contents: [{ type: "text", text: "File content" }],
+        },
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("test.txt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("test.txt"));
+
+      // Resource is auto-read when clicked
+      await waitFor(() => {
+        expect(mockReadResource).toHaveBeenCalledWith(
+          "test-server",
+          "file:///test.txt",
+        );
+      });
+    });
+  });
+
+  describe("reading resources", () => {
+    it("reads resource automatically when clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "test.txt", uri: "file:///test.txt" }],
+      });
+
+      mockReadResource.mockResolvedValue({
+        content: {
+          contents: [{ type: "text", text: "Hello World" }],
+        },
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("test.txt")).toBeInTheDocument();
+      });
+
+      // Clicking the resource auto-reads it
+      fireEvent.click(screen.getByText("test.txt"));
+
+      await waitFor(() => {
+        expect(mockReadResource).toHaveBeenCalledWith(
+          "test-server",
+          "file:///test.txt",
+        );
+      });
+    });
+
+    it("displays error when read fails", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "test.txt", uri: "file:///test.txt" }],
+      });
+
+      mockReadResource.mockRejectedValue(new Error("Resource not found"));
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("test.txt")).toBeInTheDocument();
+      });
+
+      // Clicking auto-reads, which will fail
+      fireEvent.click(screen.getByText("test.txt"));
+
+      await waitFor(() => {
+        expect(screen.getByText(/Error reading resource/i)).toBeInTheDocument();
+      });
+    });
+
+    it("renders JSON text resources with JsonEditor", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "users.json", uri: "file:///users.json" }],
+      });
+
+      mockReadResource.mockResolvedValue({
+        content: {
+          contents: [
+            {
+              type: "text",
+              text: '{"users":[{"id":"1"}],"hasNextPage":false}',
+            },
+          ],
+        },
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("users.json")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("users.json"));
+
+      await waitFor(() => {
+        expect(mockJsonEditor).toHaveBeenCalled();
+      });
+
+      expect(mockJsonEditor.mock.calls.at(-1)?.[0]).toMatchObject({
+        value: { users: [{ id: "1" }], hasNextPage: false },
+      });
+    });
+
+    it("keeps plain text resources as text", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "notes.txt", uri: "file:///notes.txt" }],
+      });
+
+      mockReadResource.mockResolvedValue({
+        content: {
+          contents: [{ type: "text", text: "Hello World" }],
+        },
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("notes.txt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("notes.txt"));
+
+      await waitFor(() => {
+        expect(screen.getByText("Hello World")).toBeInTheDocument();
+      });
+
+      expect(screen.queryByTestId("json-editor")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("refresh functionality", () => {
+    it("refreshes resources when refresh button is clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({ resources: [] });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(mockListResources).toHaveBeenCalledTimes(1);
+      });
+
+      // Find and click refresh button
+      const buttons = screen.getAllByRole("button");
+      const refreshButton = buttons.find((btn) =>
+        btn.querySelector(".lucide-refresh-cw"),
+      );
+
+      if (refreshButton) {
+        fireEvent.click(refreshButton);
+
+        await waitFor(() => {
+          expect(mockListResources).toHaveBeenCalledTimes(2);
+        });
+      }
+    });
+  });
+
+  describe("resource descriptions", () => {
+    it("displays resource description when available", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [
+          {
+            name: "config.json",
+            uri: "file:///config.json",
+            description: "Application configuration file",
+          },
+        ],
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Application configuration file"),
+        ).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("pagination", () => {
+    it("handles resources with cursor", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "file1.txt", uri: "file:///file1.txt" }],
+        nextCursor: "cursor123",
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("file1.txt")).toBeInTheDocument();
+      });
+    });
+
+    // MCP 2026-07-28 `server/utilities/pagination`: "an empty string is a
+    // valid cursor and thus MUST NOT be treated as the end of results". An
+    // empty-string cursor must therefore leave the list paginating rather than
+    // painting the end-of-list marker.
+    it("does not show the end-of-list marker on an empty-string cursor", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "file1.txt", uri: "file:///file1.txt" }],
+        nextCursor: "",
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("file1.txt")).toBeInTheDocument();
+      });
+      expect(screen.queryByText("No more resources")).not.toBeInTheDocument();
+    });
+
+    it("treats a non-string nextCursor as the end of the list", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListResources.mockResolvedValue({
+        resources: [{ name: "file1.txt", uri: "file:///file1.txt" }],
+        nextCursor: 42 as unknown as string,
+      });
+
+      render(
+        <ResourcesTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("file1.txt")).toBeInTheDocument();
+      });
+      // A number is not a cursor, so the walk is over and the marker shows.
+      await waitFor(() => {
+        expect(screen.getByText("No more resources")).toBeInTheDocument();
+      });
+    });
+  });
+});

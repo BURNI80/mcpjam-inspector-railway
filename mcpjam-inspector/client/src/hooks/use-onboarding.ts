@@ -1,0 +1,411 @@
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { useMutation } from "convex/react";
+import { track } from "@/lib/analytics";
+import { toast } from "@/lib/toast";
+import type {
+  OnboardingPersistedState,
+  OnboardingPhase,
+} from "@/lib/onboarding-state";
+import {
+  markOnboardingShown,
+  markOnboardingStarted,
+  readOnboardingState,
+  writeOnboardingState,
+} from "@/lib/onboarding-state";
+import {
+  EXCALIDRAW_SERVER_CONFIG,
+  EXCALIDRAW_SERVER_NAME,
+} from "@/lib/excalidraw-quick-connect";
+import type { ServerFormData } from "@/shared/types.js";
+import type { ServerWithName } from "@/hooks/use-app-state";
+
+interface UseOnboardingOptions {
+  servers: Record<string, ServerWithName>;
+  onConnect: (formData: ServerFormData) => void;
+  isSignedInWithWorkOs: boolean;
+  isWorkOsAuthLoading: boolean;
+  hasRemoteOnboardingState?: boolean;
+  hasSeenOnboarding?: boolean;
+  canPersistRemoteOnboarding?: boolean;
+  isProjectProvisioned?: boolean;
+  isClientConfigSyncPending?: boolean;
+  /** False while the Convex servers query is still in flight. */
+  areServersHydrated?: boolean;
+  /**
+   * The first-run overlay now owns the explicit server choice. This remains
+   * opt-in for legacy Playground consumers that still need the old guided
+   * Excalidraw experience.
+   */
+  autoConnectFirstRun?: boolean;
+}
+
+interface UseOnboardingReturn {
+  phase: OnboardingPhase;
+  isGuidedPostConnect: boolean;
+  /** The run is this device's to finish — see the derivation for why it is wider. */
+  isFirstRunUnfinished: boolean;
+  /** The phase is only retired because the servers map has not landed yet. */
+  isAwaitingFirstRunServers: boolean;
+  isResolvingRemoteCompletion: boolean;
+  /** True before the Excalidraw server row exists (auto-connect not yet dispatched). */
+  isBootstrappingFirstRunConnection: boolean;
+  connectExcalidraw: () => void;
+  markOnboardingShown: () => void;
+  completeOnboarding: () => void;
+  connectError: string | null;
+  retryConnect: () => void;
+}
+
+/** Phases that mean a first run is still on screen. */
+function isUnfinishedFirstRunPhase(phase: OnboardingPhase): boolean {
+  return phase !== "completed" && phase !== "dismissed";
+}
+
+/** A run that painted or started but never completed still owns this device. */
+function hasUnfinishedLocalFirstRun(
+  persisted: OnboardingPersistedState | null,
+): boolean {
+  return persisted?.status === "started" || persisted?.status === "seen";
+}
+
+function getInitialLocalPhase(
+  servers: Record<string, ServerWithName>,
+  {
+    isSignedInWithWorkOs,
+    isWorkOsAuthLoading,
+    hasRemoteOnboardingState = false,
+    hasSeenOnboarding = false,
+    areServersHydrated = true,
+    autoConnectFirstRun = true,
+  }: Pick<
+    UseOnboardingOptions,
+    | "isSignedInWithWorkOs"
+    | "isWorkOsAuthLoading"
+    | "hasRemoteOnboardingState"
+    | "hasSeenOnboarding"
+    | "areServersHydrated"
+    | "autoConnectFirstRun"
+  >,
+): OnboardingPhase {
+  if (isWorkOsAuthLoading) return "dismissed";
+  if (isSignedInWithWorkOs) return "completed";
+  if (!autoConnectFirstRun) return "dismissed";
+
+  const persisted = readOnboardingState();
+  if (persisted?.status === "completed") return "completed";
+  if (persisted?.status === "dismissed") return "dismissed";
+
+  // "seen" only records that the NUX painted, which is what stops App from
+  // redirecting. Retiring the guided copy needs a finished run (BB-112).
+  const isUnfinishedHere = hasUnfinishedLocalFirstRun(persisted);
+
+  if (hasRemoteOnboardingState && hasSeenOnboarding && !isUnfinishedHere) {
+    return "dismissed";
+  }
+
+  // Every branch below reads the servers map, and a map that is still loading
+  // is empty — "unknown", not "no servers". Deciding on it pins a phase the
+  // recompute effect below can no longer correct, so stay undecided (BB-112).
+  if (!areServersHydrated) return "dismissed";
+
+  const serverEntries = Object.entries(servers);
+  const hasAnyServers = serverEntries.length > 0;
+  const hasOnlyExcalidrawServer =
+    serverEntries.length === 1 &&
+    serverEntries[0]?.[0] === EXCALIDRAW_SERVER_NAME;
+  const shouldContinueFirstRun =
+    isUnfinishedHere || (hasRemoteOnboardingState && !hasSeenOnboarding);
+
+  if (!hasAnyServers) {
+    return "connecting_excalidraw";
+  }
+  const excalidrawServer = servers[EXCALIDRAW_SERVER_NAME];
+  if (shouldContinueFirstRun) {
+    if (excalidrawServer?.connectionStatus === "connected") {
+      return "connected_guided";
+    }
+    if (hasOnlyExcalidrawServer) {
+      return "connecting_excalidraw";
+    }
+  }
+
+  return "dismissed";
+}
+
+export function useOnboarding({
+  servers,
+  onConnect,
+  isSignedInWithWorkOs,
+  isWorkOsAuthLoading,
+  hasRemoteOnboardingState = false,
+  hasSeenOnboarding = false,
+  canPersistRemoteOnboarding = false,
+  isProjectProvisioned = true,
+  isClientConfigSyncPending = false,
+  areServersHydrated = true,
+  autoConnectFirstRun = true,
+}: UseOnboardingOptions): UseOnboardingReturn {
+  const markOnboardingAsShownMutation = useMutation(
+    "users:markOnboardingShown" as any,
+  );
+  // `environment`/`platform` are omitted here — track() treats both as
+  // authoritative and strips any caller-supplied value before merging in
+  // the real ones from standardEventProps(), so passing them here was inert.
+  const trackingProps = useMemo(() => ({}), []);
+
+  const [phase, setPhase] = useState<OnboardingPhase>(() =>
+    getInitialLocalPhase(servers, {
+      isSignedInWithWorkOs,
+      isWorkOsAuthLoading,
+      hasRemoteOnboardingState,
+      hasSeenOnboarding,
+      areServersHydrated,
+      autoConnectFirstRun,
+    }),
+  );
+
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const excalidrawServer = servers[EXCALIDRAW_SERVER_NAME];
+  const hasConnectedExcalidraw =
+    excalidrawServer?.connectionStatus === "connected";
+  const isResolvingRemoteCompletion = isWorkOsAuthLoading;
+
+  const didAutoConnectRef = useRef(false);
+  const didPersistRemoteShownRef = useRef(false);
+
+  // Track first-run eligible once when auto-connect begins.
+  const didTrackFirstRun = useRef(false);
+
+  const persistRemoteOnboardingShown = useCallback(() => {
+    if (
+      !canPersistRemoteOnboarding ||
+      hasSeenOnboarding ||
+      didPersistRemoteShownRef.current
+    ) {
+      return;
+    }
+    didPersistRemoteShownRef.current = true;
+    markOnboardingAsShownMutation().catch(() => {
+      didPersistRemoteShownRef.current = false;
+    });
+  }, [
+    canPersistRemoteOnboarding,
+    hasSeenOnboarding,
+    markOnboardingAsShownMutation,
+  ]);
+
+  const markFirstRunOnboardingShown = useCallback(() => {
+    markOnboardingShown();
+    persistRemoteOnboardingShown();
+  }, [persistRemoteOnboardingShown]);
+
+  const persistCompletedState = useCallback(() => {
+    writeOnboardingState({ status: "completed", completedAt: Date.now() });
+  }, []);
+
+  useEffect(() => {
+    if (isWorkOsAuthLoading) {
+      return;
+    }
+
+    if (isSignedInWithWorkOs) {
+      setPhase("completed");
+      return;
+    }
+
+    setPhase((currentPhase) => {
+      if (currentPhase !== "dismissed") {
+        return currentPhase;
+      }
+
+      return getInitialLocalPhase(servers, {
+        isSignedInWithWorkOs: false,
+        isWorkOsAuthLoading: false,
+        hasRemoteOnboardingState,
+        hasSeenOnboarding,
+        areServersHydrated,
+        autoConnectFirstRun,
+      });
+    });
+  }, [
+    servers,
+    areServersHydrated,
+    isWorkOsAuthLoading,
+    isSignedInWithWorkOs,
+    hasRemoteOnboardingState,
+    hasSeenOnboarding,
+    autoConnectFirstRun,
+  ]);
+
+  // First-run guests: auto-connect Excalidraw in the background (no welcome overlay).
+  useEffect(() => {
+    if (!autoConnectFirstRun) return;
+    if (isWorkOsAuthLoading || isSignedInWithWorkOs) return;
+    if (didAutoConnectRef.current) return;
+    // A fresh Playground creates its starter clients before onboarding runs.
+    // Their config sync uses the same connection preflight as MCP servers, so
+    // wait for that sync to settle before spending the one auto-connect attempt.
+    if (isClientConfigSyncPending) return;
+    // Both hosted and local connections now resolve through a Convex project
+    // and server id. A first-run guest reaches this render before that project
+    // exists, so wait here instead of spending the one auto-connect attempt.
+    if (!isProjectProvisioned) return;
+
+    const persisted = readOnboardingState();
+    if (persisted?.status === "completed" || persisted?.status === "dismissed") {
+      return;
+    }
+    // A resumed run still needs its server, so "seen" must not stop the
+    // reconnect the way a finished run does.
+    if (
+      hasRemoteOnboardingState &&
+      hasSeenOnboarding &&
+      !hasUnfinishedLocalFirstRun(persisted)
+    ) {
+      return;
+    }
+    const hasBlockingServer = Object.keys(servers).some(
+      (serverName) => serverName !== EXCALIDRAW_SERVER_NAME,
+    );
+    if (hasBlockingServer) return;
+    const excalidrawStatus = servers[EXCALIDRAW_SERVER_NAME]?.connectionStatus;
+    if (excalidrawStatus === "connected" || excalidrawStatus === "connecting") {
+      return;
+    }
+    if (phase !== "connecting_excalidraw") return;
+
+    didAutoConnectRef.current = true;
+    if (!didTrackFirstRun.current) {
+      didTrackFirstRun.current = true;
+      markOnboardingStarted();
+      track("onboarding_first_run_eligible", {
+        location: "onboarding",
+        ...trackingProps,
+      });
+    }
+    setConnectError(null);
+    onConnect(EXCALIDRAW_SERVER_CONFIG);
+    track("onboarding_connect_excalidraw_auto", {
+      location: "onboarding",
+      ...trackingProps,
+    });
+  }, [
+    phase,
+    servers,
+    isWorkOsAuthLoading,
+    isSignedInWithWorkOs,
+    isProjectProvisioned,
+    isClientConfigSyncPending,
+    hasRemoteOnboardingState,
+    hasSeenOnboarding,
+    onConnect,
+    trackingProps,
+    autoConnectFirstRun,
+  ]);
+
+  // Monitor server connection for Excalidraw after connect is requested
+  useEffect(() => {
+    if (phase !== "connecting_excalidraw") return;
+
+    if (excalidrawServer?.connectionStatus === "connected") {
+      setPhase("connected_guided");
+      setConnectError(null);
+      track("onboarding_connect_excalidraw_success", {
+        location: "onboarding",
+        ...trackingProps,
+      });
+    } else if (excalidrawServer?.lastError) {
+      setPhase("connect_error");
+      setConnectError(
+        excalidrawServer.lastError || "Failed to connect to Excalidraw",
+      );
+      track("onboarding_connect_excalidraw_error", {
+        location: "onboarding",
+        ...trackingProps,
+        error: excalidrawServer.lastError,
+      });
+    }
+  }, [excalidrawServer, phase]);
+
+  const connectExcalidraw = useCallback(() => {
+    setPhase("connecting_excalidraw");
+    setConnectError(null);
+    track("onboarding_connect_excalidraw_clicked", {
+      location: "onboarding",
+      ...trackingProps,
+    });
+    onConnect(EXCALIDRAW_SERVER_CONFIG);
+  }, [onConnect, trackingProps]);
+
+  const completeOnboarding = useCallback(() => {
+    persistCompletedState();
+    setPhase("completed");
+    track("onboarding_completed", { location: "onboarding", ...trackingProps });
+  }, [persistCompletedState, trackingProps]);
+
+  const retryConnect = useCallback(() => {
+    setPhase("connecting_excalidraw");
+    setConnectError(null);
+    onConnect(EXCALIDRAW_SERVER_CONFIG);
+  }, [onConnect]);
+
+  useEffect(() => {
+    if (phase !== "connect_error" || !connectError) {
+      toast.dismiss("excalidraw-connect-error");
+      return;
+    }
+    toast.error(connectError, {
+      id: "excalidraw-connect-error",
+      action: {
+        label: "Retry",
+        onClick: () => {
+          retryConnect();
+        },
+      },
+    });
+  }, [phase, connectError, retryConnect]);
+
+  const isTransitioningToGuided =
+    phase === "connecting_excalidraw" && hasConnectedExcalidraw;
+
+  const isGuidedPostConnect =
+    phase === "connected_guided" || isTransitioningToGuided;
+
+  // Wider than `isGuidedPostConnect` on purpose: a sent first message finishes
+  // the run from ANY unfinished phase. An unfinished run now resumes across
+  // reloads (BB-112), so one whose Excalidraw never connects has no other exit.
+  const isFirstRunUnfinished = isUnfinishedFirstRunPhase(phase);
+
+  // A retired run and one still waiting for its servers both read "dismissed".
+  // Deriving as if the map had landed tells them apart, so the caller can hold
+  // the first-run skeleton instead of flashing the empty state at it.
+  const isAwaitingFirstRunServers =
+    !areServersHydrated &&
+    isUnfinishedFirstRunPhase(
+      getInitialLocalPhase(servers, {
+        isSignedInWithWorkOs,
+        isWorkOsAuthLoading,
+        hasRemoteOnboardingState,
+        hasSeenOnboarding,
+        areServersHydrated: true,
+        autoConnectFirstRun,
+      }),
+    );
+
+  const isBootstrappingFirstRunConnection =
+    phase === "connecting_excalidraw" && !servers[EXCALIDRAW_SERVER_NAME];
+
+  return {
+    phase,
+    isGuidedPostConnect,
+    isFirstRunUnfinished,
+    isAwaitingFirstRunServers,
+    isResolvingRemoteCompletion,
+    isBootstrappingFirstRunConnection,
+    connectExcalidraw,
+    markOnboardingShown: markFirstRunOnboardingShown,
+    completeOnboarding,
+    connectError,
+    retryConnect,
+  };
+}

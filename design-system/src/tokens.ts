@@ -1,0 +1,297 @@
+export const tokensCss: string = `@theme {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+}
+
+@custom-variant dark (&:is(.dark *));
+
+.theme-preview-light,
+:root {
+  --background: oklch(0.9818 0.0054 95.0986);
+  --foreground: oklch(0.3438 0.0269 95.7226);
+  --card: oklch(0.9818 0.0054 95.0986);
+  --card-foreground: oklch(0.1908 0.002 106.5859);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2671 0.0196 98.939);
+  --primary: oklch(0.6832 0.1382 38.744);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.9245 0.0138 92.9892);
+  --secondary-foreground: oklch(0.4334 0.0177 98.6048);
+  --muted: oklch(0.9341 0.0153 90.239);
+  --muted-foreground: oklch(0.6059 0.0075 97.4233);
+  --accent: oklch(0.9245 0.0138 92.9892);
+  --accent-foreground: oklch(0.2671 0.0196 98.939);
+  /* Solid fills (buttons, badges): use destructive-foreground. Tinted surfaces (bg-destructive/5–/20): prefer text-destructive for body copy.
+     Figma fill/danger: #EB4041. */
+  --destructive: oklch(0.6261 0.2077 25.2698);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.8847 0.0069 97.3627);
+  /* Chrome controls. Sampled from the Production Redesign frame: the pieces
+     that sit ON the linen ground (--secondary / --sidebar, #E9E6DC) rather
+     than on the panel (--background, #FAF9F5). Those two grounds already had
+     tokens, which is why only the controls are new here.
+
+       --chrome-control         #E4DDD0  nav selector + filled nav buttons
+       --chrome-control-border  #D6CFC0  hairline on those controls only
+       --chrome-hover           #E2DCCF  idle tab / ghost hover (no fill at rest)
+       --divider                #DDD8CC  pane hairlines
+
+     --divider is a hair warmer and lighter than --border (#DAD9D4). It is kept
+     apart because --border also draws inputs and cards on the panel, where the
+     linen cast reads as a tint rather than a neutral line. */
+  --chrome-control: oklch(0.8995 0.0191 83.0632);
+  --chrome-control-border: oklch(0.856 0.0218 85.9495);
+  --chrome-hover: oklch(0.8957 0.0187 86.151);
+  /* The hover for a control that is ALREADY filled — the filled nav buttons
+     and the client selector. --chrome-hover above is for things with no fill
+     at rest (idle tabs, ghost buttons); on top of --chrome-control (#E4DDD0)
+     it is a 0.4% step and reads as nothing.
+     It must also clear --chrome-control-border (L 0.856): at the old 0.8515
+     the hover fill and the hairline were 0.0045 L apart, so hovering a
+     secondary button erased its own outline. */
+  --chrome-control-hover: oklch(0.83 0.0235 80.6762);
+  --divider: oklch(0.8829 0.0171 88.0071);
+  --input: oklch(0.7621 0.0156 98.3528);
+  --ring: oklch(0.6171 0.1375 39.0427);
+  /* Semantic status colors */
+  --success: oklch(0.696 0.17 152.5);
+  --success-foreground: oklch(1 0 0);
+  --warning: oklch(0.769 0.188 85.3);
+  --warning-foreground: oklch(0.239 0.06 60);
+  --info: oklch(0.623 0.214 259);
+  --info-foreground: oklch(1 0 0);
+  --pending: oklch(0.769 0.188 85.3);
+  --pending-foreground: oklch(0.239 0.06 60);
+  /* Diagram accent tokens — pastel hues for the client-diagram layers
+     (servers hub, sandbox proxy iframe, view iframe). Role-based, not
+     reused outside the architecture diagram. */
+  --diagram-server: oklch(0.62 0.1 155);
+  --diagram-server-foreground: oklch(0.99 0.01 155);
+  --diagram-sandbox: oklch(0.65 0.12 75);
+  --diagram-sandbox-foreground: oklch(0.99 0.01 75);
+  --diagram-view: oklch(0.6 0.1 290);
+  --diagram-view-foreground: oklch(0.99 0.01 290);
+  /* Run-origin accent tokens — the two launch origins the runs table has to
+     tell apart from the API rows they are stamped as: the mcpjam CLI and an
+     MCP client's agent (Slack and Discord included). Role-based; used only by
+     lib/evals/run-origin.ts.
+     Border and background are separate tokens carrying their own alpha, so the
+     badge reads them as plain border-[var(--...)] / bg-[var(--...)] utilities
+     and the tint tracks the theme without a dark: variant. Both stay behind
+     --foreground text, which is what keeps the contrast ratio.
+     No backticks in this file: tokens.ts embeds it verbatim in a template
+     literal, and the parity test compares the two byte for byte. */
+  --run-origin-cli-border: oklch(0.65 0.11 195 / 0.5);
+  --run-origin-cli-bg: oklch(0.65 0.11 195 / 0.1);
+  --run-origin-agent-border: oklch(0.62 0.21 330 / 0.5);
+  --run-origin-agent-bg: oklch(0.62 0.21 330 / 0.1);
+  /* Overlay color */
+  --overlay: oklch(0 0 0 / 0.5);
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --font-code:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  /* JSON syntax highlighting colors (light mode) - Asana-inspired */
+  --json-key: oklch(0.55 0.2 255); /* Blue for keys */
+  --json-string: oklch(0.5 0.1 55); /* Warm brown/tan */
+  --json-number: oklch(0.5 0.1 55); /* Same as strings */
+  --json-boolean: oklch(0.5 0.15 145); /* Green (for true) */
+  --json-boolean-false: oklch(0.55 0.18 25); /* Red/coral (for false) */
+  --json-null: oklch(0.55 0.02 270); /* Gray */
+  --json-punctuation: oklch(0.55 0.01 270); /* Muted gray */
+  /* General code-syntax palette (light) — consumed by surfaces that
+     render multi-language code: docs Mintlify code blocks, future
+     terminal/log viewers, in-app code editors. JSON-only viewer keeps
+     using the --json-* tokens above. Tuned for warm-paper backgrounds:
+     coral keyword + indigo class/key + muted forest string. */
+  --code-bg: oklch(0.9341 0.0153 90.239);              /* warm beige inset */
+  --code-text: oklch(0.1908 0.002 106.5859);           /* ink-strong */
+  --code-keyword: oklch(0.55 0.16 35);                 /* deep coral */
+  --code-function: oklch(0.1908 0.002 106.5859);       /* = text */
+  --code-class-name: oklch(0.48 0.13 250);             /* indigo */
+  --code-property: oklch(0.45 0.14 250);               /* indigo (JSON-key flavor) */
+  --code-variable: oklch(0.1908 0.002 106.5859);       /* = text */
+  --code-parameter: oklch(0.3438 0.0269 95.7226);      /* full ink */
+  --code-string: oklch(0.45 0.09 145);                 /* muted forest */
+  --code-number: oklch(0.52 0.08 60);                  /* warm sand */
+  --code-boolean: oklch(0.52 0.08 60);                 /* warm sand */
+  --code-comment: oklch(0.62 0.01 95);                 /* italic muted */
+  --code-punctuation: oklch(0.58 0.005 95);            /* dim ink */
+  --code-operator: oklch(0.55 0.16 35);                /* coral */
+  --code-link: oklch(0.6171 0.1375 39.0427);           /* brand orange */
+  --radius: 0.5rem;
+  --shadow-x: 0;
+  --shadow-y: 1px;
+  --shadow-blur: 3px;
+  --shadow-spread: 0px;
+  --shadow-opacity: 0.1;
+  --shadow-color: oklch(0 0 0);
+  --shadow-2xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-sm:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+  --shadow: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+  --shadow-md:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 2px 4px -1px hsl(0 0% 0% / 0.1);
+  --shadow-lg:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 4px 6px -1px hsl(0 0% 0% / 0.1);
+  --shadow-xl:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 8px 10px -1px hsl(0 0% 0% / 0.1);
+  --shadow-2xl: 0 1px 3px 0px hsl(0 0% 0% / 0.25);
+  /* The chrome panel's lift. Mostly hidden BEHIND the panel — only what the
+     blur pushes past the top edge is ever visible — so the depth is in the
+     blur, not the offset. Like every other shadow here it is one value for
+     both themes. */
+  --shadow-chrome-panel: 0 3px 10px hsl(0 0% 0% / 0.22);
+  /* The active server tab's cast. Points UP, away from the panel: the tab
+     hangs on the panel's top edge, so the only side with anywhere to throw a
+     shadow is its head. A tenth of the panel's weight — it separates a sheet
+     from the chrome behind it, it does not lift a pane off the app. */
+  --shadow-chrome-tab: 0 -2px 6px hsl(0 0% 0% / 0.07);
+  --tracking-normal: 0em;
+  --spacing: 0.25rem;
+}
+
+.dark {
+  --background: oklch(0.2679 0.0036 106.6427);
+  --foreground: oklch(0.8074 0.0142 93.0137);
+  /* JSON syntax highlighting colors (dark mode) - Asana-inspired */
+  --json-key: oklch(0.7 0.18 255); /* Blue for keys */
+  --json-string: oklch(0.7 0.1 55); /* Warm brown/tan */
+  --json-number: oklch(0.7 0.1 55); /* Same as strings */
+  --json-boolean: oklch(0.65 0.15 145); /* Green (for true) */
+  --json-boolean-false: oklch(0.68 0.16 25); /* Red/coral (for false) */
+  --json-null: oklch(0.6 0.02 270); /* Gray */
+  --json-punctuation: oklch(0.5 0.01 270); /* Muted gray */
+  /* General code-syntax palette (dark) — paired with the light values
+     above. Same hue family lifted in lightness/chroma for warm-dark
+     backgrounds. */
+  --code-bg: oklch(0.2213 0.0038 106.707);             /* warm-dark inset */
+  --code-text: oklch(0.92 0.01 95);                    /* near-white */
+  --code-keyword: oklch(0.75 0.13 35);                 /* lifted coral */
+  --code-function: oklch(0.92 0.01 95);                /* = text */
+  --code-class-name: oklch(0.70 0.13 250);             /* lifted indigo */
+  --code-property: oklch(0.72 0.14 250);               /* lifted indigo */
+  --code-variable: oklch(0.92 0.01 95);                /* = text */
+  --code-parameter: oklch(0.86 0.01 95);
+  --code-string: oklch(0.78 0.10 145);                 /* lifted forest */
+  --code-number: oklch(0.78 0.09 65);                  /* lifted sand */
+  --code-boolean: oklch(0.78 0.09 65);                 /* lifted sand */
+  --code-comment: oklch(0.55 0.01 95);
+  --code-punctuation: oklch(0.60 0.005 95);
+  --code-operator: oklch(0.75 0.13 35);                /* lifted coral */
+  --code-link: oklch(0.7400 0.1308 38.7559);           /* brand orange */
+  --card: oklch(0.2679 0.0036 106.6427);
+  --card-foreground: oklch(0.9818 0.0054 95.0986);
+  --popover: oklch(0.3085 0.0035 106.6039);
+  --popover-foreground: oklch(0.9211 0.004 106.4781);
+  --primary: oklch(0.6724 0.1308 38.7559);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.9818 0.0054 95.0986);
+  --secondary-foreground: oklch(0.3085 0.0035 106.6039);
+  --muted: oklch(0.2213 0.0038 106.707);
+  --muted-foreground: oklch(0.7713 0.0169 99.0657);
+  --accent: oklch(0.213 0.0078 95.4245);
+  --accent-foreground: oklch(0.9663 0.008 98.8792);
+  /* Figma fill/danger: #EF4444. */
+  --destructive: oklch(0.6368 0.2078 25.3313);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.3618 0.0101 106.8928);
+  /* Chrome controls, dark. Only the light frame was specified, so these keep
+     the RELATIONSHIP rather than the values: a control is one step away from
+     the ground it sits on, and on a dark ground that step is upward. Hover is
+     the exception — it darkens in both themes, which is what the light frame
+     does too (#E2DCCF sits below the #E9E6DC ground).
+
+     The values are existing dark tokens, reused so the chrome cannot drift
+     from the panel: --popover for the raised control, --accent for hover, and
+     --border for both hairlines. */
+  --chrome-control: oklch(0.3085 0.0035 106.6039);
+  --chrome-control-border: oklch(0.3618 0.0101 106.8928);
+  --chrome-hover: oklch(0.213 0.0078 95.4245);
+  /* Lighter than the fill, not darker: on a dark ground a raised control
+     brightens under the pointer. This is the one chrome token here that does
+     NOT reuse --border: --chrome-control-border already is --border's dark
+     value, so sharing it filled a hovered control with exactly its own
+     hairline colour and the outline vanished. A step past it instead. */
+  --chrome-control-hover: oklch(0.3951 0.0106 106.8928);
+  --divider: oklch(0.3618 0.0101 106.8928);
+  --input: oklch(0.4336 0.0113 100.2195);
+  --ring: oklch(0.6724 0.1308 38.7559);
+  /* Semantic status colors */
+  --success: oklch(0.648 0.15 152);
+  --success-foreground: oklch(1 0 0);
+  --warning: oklch(0.75 0.183 55);
+  --warning-foreground: oklch(0.95 0.06 70);
+  --info: oklch(0.623 0.214 259);
+  --info-foreground: oklch(1 0 0);
+  --pending: oklch(0.75 0.183 55);
+  --pending-foreground: oklch(0.95 0.06 70);
+  /* Diagram accent tokens — pastel hues for the client-diagram layers.
+     Higher lightness in dark mode so tints read against the dark canvas. */
+  --diagram-server: oklch(0.8 0.1 155);
+  --diagram-server-foreground: oklch(0.2 0.04 155);
+  --diagram-sandbox: oklch(0.82 0.11 75);
+  --diagram-sandbox-foreground: oklch(0.2 0.04 75);
+  --diagram-view: oklch(0.8 0.09 290);
+  --diagram-view-foreground: oklch(0.2 0.04 290);
+  /* Run-origin accent tokens — lifted, like the diagram hues above, and a
+     little more opaque, so the tints stay legible against the dark canvas. */
+  --run-origin-cli-border: oklch(0.78 0.1 195 / 0.5);
+  --run-origin-cli-bg: oklch(0.78 0.1 195 / 0.15);
+  --run-origin-agent-border: oklch(0.74 0.18 330 / 0.5);
+  --run-origin-agent-bg: oklch(0.74 0.18 330 / 0.15);
+  /* Overlay color */
+  --overlay: oklch(0 0 0 / 0.5);
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --radius: 0.5rem;
+  --shadow-x: 0;
+  --shadow-y: 1px;
+  --shadow-blur: 3px;
+  --shadow-spread: 0px;
+  --shadow-opacity: 0.1;
+  --shadow-color: oklch(0 0 0);
+  --shadow-2xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-sm:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+  --shadow: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+  --shadow-md:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 2px 4px -1px hsl(0 0% 0% / 0.1);
+  --shadow-lg:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 4px 6px -1px hsl(0 0% 0% / 0.1);
+  --shadow-xl:
+    0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 8px 10px -1px hsl(0 0% 0% / 0.1);
+  --shadow-2xl: 0 1px 3px 0px hsl(0 0% 0% / 0.25);
+  /* The chrome panel's lift. Mostly hidden BEHIND the panel — only what the
+     blur pushes past the top edge is ever visible — so the depth is in the
+     blur, not the offset. Like every other shadow here it is one value for
+     both themes. */
+  --shadow-chrome-panel: 0 3px 10px hsl(0 0% 0% / 0.22);
+  /* The active server tab's cast. Points UP, away from the panel: the tab
+     hangs on the panel's top edge, so the only side with anywhere to throw a
+     shadow is its head. A tenth of the panel's weight — it separates a sheet
+     from the chrome behind it, it does not lift a pane off the app. */
+  --shadow-chrome-tab: 0 -2px 6px hsl(0 0% 0% / 0.07);
+}
+`;

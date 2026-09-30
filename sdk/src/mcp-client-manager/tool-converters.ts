@@ -1,0 +1,391 @@
+/**
+ * Tool conversion utilities for integrating MCP tools with Vercel AI SDK
+ */
+
+import type { JSONSchema7, JSONSchema7Definition } from "json-schema";
+import {
+  type CallToolResult,
+  type ListToolsResult,
+} from "@modelcontextprotocol/client";
+import {
+  dynamicTool,
+  jsonSchema,
+  tool as defineTool,
+  type Tool,
+  type ToolCallOptions,
+  type ToolSet,
+} from "ai";
+import { assertCallToolResult } from "./result-guards.js";
+import {
+  MCP_PRESERVE_RAW_RESULT_FOR_UI,
+  type McpLinkedResourceReader,
+  type McpModelVisibleToolResultPolicy,
+  mcpCallToolResultToModelOutput,
+  mcpCallToolResultToModelOutputWithLinkedResources,
+} from "./model-output.js";
+import type { ModelVisibleMcpToolResults } from "../host-config/types.js";
+
+/**
+ * Normalizes a schema to a valid JSON Schema object.
+ * Many MCP tools omit the top-level type; Anthropic requires an object schema.
+ *
+ * @param schema - The input schema (may be incomplete)
+ * @returns A normalized JSONSchema7 object
+ */
+export function ensureJsonSchemaObject(schema: unknown): JSONSchema7 {
+  if (schema && typeof schema === "object") {
+    const record = schema as Record<string, unknown>;
+    const base: JSONSchema7 = record.jsonSchema
+      ? ensureJsonSchemaObject(record.jsonSchema)
+      : (record as JSONSchema7);
+
+    // Many MCP tools omit the top-level type; Anthropic requires an object schema
+    if (!("type" in base) || base.type === undefined) {
+      base.type = "object";
+    }
+
+    if (base.type === "object") {
+      base.properties = (base.properties ?? {}) as Record<
+        string,
+        JSONSchema7Definition
+      >;
+      if (base.additionalProperties === undefined) {
+        base.additionalProperties = false;
+      }
+    }
+
+    return base;
+  }
+
+  // Return a minimal valid object schema
+  return {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  } satisfies JSONSchema7;
+}
+
+/**
+ * Function type for executing tool calls
+ */
+export type CallToolExecutor = (params: {
+  name: string;
+  args: unknown;
+  options?: ToolCallOptions;
+}) => Promise<CallToolResult>;
+
+/**
+ * Input schema type for tool definitions
+ */
+type ToolInputSchema = Parameters<typeof dynamicTool>[0]["inputSchema"];
+
+/**
+ * Schema overrides for specific tools
+ * Maps tool name to custom input schema definition
+ */
+export type ToolSchemaOverrides = Record<
+  string,
+  { inputSchema: ToolInputSchema }
+>;
+
+/**
+ * Result type for converted tools
+ * When explicit schemas are provided, returns typed object
+ * When "automatic", returns generic record
+ */
+export type ConvertedToolSet<
+  SCHEMAS extends ToolSchemaOverrides | "automatic",
+> = SCHEMAS extends ToolSchemaOverrides
+  ? { [K in keyof SCHEMAS]: Tool }
+  : Record<string, Tool>;
+
+/**
+ * Options for tool conversion
+ */
+export interface ConvertOptions<
+  TOOL_SCHEMAS extends ToolSchemaOverrides | "automatic",
+> {
+  /** Schema overrides or "automatic" for dynamic conversion */
+  schemas?: TOOL_SCHEMAS;
+  /** Function to execute tool calls */
+  callTool: CallToolExecutor;
+  /** When true, each tool requires user approval before execution */
+  needsApproval?: boolean;
+  /**
+   * When true, include tools whose `_meta.ui.visibility` is `["app"]`
+   * (SEP-1865 app-only tools) in the returned tool set. Defaults to `false`,
+   * which is the spec-compliant behavior: app-only tools are hidden from the
+   * model-facing tool set. Set to `true` only when intentionally mirroring a
+   * host that does not implement SEP-1865 visibility filtering.
+   */
+  includeAppOnly?: boolean;
+  /** Host policy for model visibility of MCP tool-result content/resources. */
+  modelVisibleMcpToolResults?: ModelVisibleMcpToolResults;
+  /**
+   * Optional MCP `resources/read` bridge for resolving image `resource_link`
+   * content. The converter never fetches linked resource URIs directly.
+   */
+  readResource?: McpLinkedResourceReader;
+  /**
+   * Rewrite `description` on named tools. Description ONLY — name, input
+   * schema, and `_meta` stay byte-identical to the listTools row.
+   */
+  toolDescriptionOverrides?: Readonly<Record<string, string>>;
+}
+
+/**
+ * Checks whether a tool is an MCP App by inspecting its _meta for a UI resource URI.
+ *
+ * @param toolMeta - The tool's _meta field from listTools result
+ * @returns true if the tool is an MCP App
+ */
+export function isMcpAppTool(
+  toolMeta: Record<string, unknown> | undefined
+): boolean {
+  if (!toolMeta) return false;
+  // MCP Apps use _meta.ui.resourceUri (preferred) or legacy "ui/resourceUri".
+  const nested = (toolMeta as { ui?: { resourceUri?: unknown } }).ui;
+  if (typeof nested?.resourceUri === "string") return true;
+  return typeof toolMeta["ui/resourceUri"] === "string";
+}
+
+/**
+ * Checks whether a tool is a ChatGPT App by inspecting its _meta for an output template.
+ *
+ * @param toolMeta - The tool's _meta field from listTools result
+ * @returns true if the tool is a ChatGPT App
+ */
+export function isChatGPTAppTool(
+  toolMeta: Record<string, unknown> | undefined
+): boolean {
+  if (!toolMeta) return false;
+  return typeof toolMeta["openai/outputTemplate"] === "string";
+}
+
+import { isAppOnlyTool } from "../host-config/app-only-tool.js";
+export { isAppOnlyTool };
+
+/**
+ * Removes only the _meta field from a tool result (shallow copy).
+ *
+ * @param result - The full tool call result
+ * @returns A shallow copy of the result without _meta
+ */
+export function scrubMetaFromToolResult(
+  result: CallToolResult
+): CallToolResult {
+  if (!result) return result;
+  const copy = { ...result };
+  if ((copy as Record<string, unknown>)._meta) {
+    delete (copy as Record<string, unknown>)._meta;
+  }
+  return copy;
+}
+
+/**
+ * Removes only structuredContent from a tool result (shallow copy).
+ *
+ * @param result - The full tool call result
+ * @returns A shallow copy of the result without structuredContent
+ */
+export function scrubStructuredContentFromToolResult(
+  result: CallToolResult
+): CallToolResult {
+  if (!result) return result;
+  const copy = { ...result };
+  if ((copy as Record<string, unknown>).structuredContent) {
+    delete (copy as Record<string, unknown>).structuredContent;
+  }
+  return copy;
+}
+
+/**
+ * Returns a shallow copy of a CallToolResult with _meta and structuredContent removed.
+ *
+ * @param result - The full tool call result
+ * @returns A scrubbed shallow copy without _meta and structuredContent
+ */
+export function scrubMetaAndStructuredContentFromToolResult(
+  result: CallToolResult
+): CallToolResult {
+  if (!result) return result;
+  return scrubMetaFromToolResult(scrubStructuredContentFromToolResult(result));
+}
+
+function mcpToolResultToModelOutput(
+  result: CallToolResult,
+  options: McpModelVisibleToolResultPolicy & {
+    readResource?: McpLinkedResourceReader;
+    abortSignal?: AbortSignal;
+  }
+): any {
+  if (options.readResource) {
+    return mcpCallToolResultToModelOutputWithLinkedResources(result, {
+      modelVisibleMcpToolResults: options.modelVisibleMcpToolResults,
+      readResource: options.readResource,
+      abortSignal: options.abortSignal,
+    }).then(
+      (output) =>
+        output ?? {
+          type: "json" as const,
+          value: result as any,
+        }
+    );
+  }
+
+  return (
+    mcpCallToolResultToModelOutput(result, {
+      modelVisibleMcpToolResults: options.modelVisibleMcpToolResults,
+    }) ?? {
+      type: "json" as const,
+      value: result as any,
+    }
+  );
+}
+
+/**
+ * Converts MCP tools to Vercel AI SDK format.
+ *
+ * @param listToolsResult - The result from listTools()
+ * @param options - Conversion options including callTool executor
+ * @returns A ToolSet compatible with Vercel AI SDK
+ *
+ * @example
+ * ```typescript
+ * const tools = await convertMCPToolsToVercelTools(listToolsResult, {
+ *   callTool: async ({ name, args, options }) => {
+ *     return await mcpClient.callTool({ name, arguments: args });
+ *   },
+ * });
+ *
+ * // Use with Vercel AI SDK
+ * const result = await generateText({
+ *   model: openai("gpt-4"),
+ *   tools,
+ *   messages: [{ role: "user", content: "..." }],
+ * });
+ * ```
+ */
+export async function convertMCPToolsToVercelTools(
+  listToolsResult: ListToolsResult,
+  {
+    schemas = "automatic",
+    callTool,
+    needsApproval,
+    includeAppOnly = false,
+    modelVisibleMcpToolResults,
+    readResource,
+    toolDescriptionOverrides,
+  }: ConvertOptions<ToolSchemaOverrides | "automatic">
+): Promise<ToolSet> {
+  const tools: ToolSet = {};
+
+  for (const toolDescription of listToolsResult.tools) {
+    const { name, inputSchema } = toolDescription;
+    const description = Object.prototype.hasOwnProperty.call(
+      toolDescriptionOverrides ?? {},
+      name
+    )
+      ? toolDescriptionOverrides![name]
+      : toolDescription.description;
+    const toolMeta = toolDescription._meta as
+      | Record<string, unknown>
+      | undefined;
+
+    // SEP-1865: hosts that negotiate `io.modelcontextprotocol/ui` MUST NOT
+    // include tools whose visibility omits `"model"` in the agent's tool list.
+    if (!includeAppOnly && isAppOnlyTool(toolMeta)) {
+      continue;
+    }
+
+    // Create the execute function that delegates to the provided callTool
+    const execute = async (args: unknown, options?: ToolCallOptions) => {
+      options?.abortSignal?.throwIfAborted();
+      const result = await callTool({ name, args, options });
+      return assertCallToolResult(result, `Tool "${name}" result`);
+    };
+
+    // For MCP app tools, strip _meta and structuredContent before sending to the LLM.
+    // For ChatGPT app tools, strip structuredContent before sending to the LLM.
+    // The raw execute() return value still reaches the UI stream unchanged.
+    // Runtime signature: ({ toolCallId, input, output }) => ToolResultOutput.
+    // MCPJam also passes abortSignal from its local executor so linked
+    // resource reads can stop promptly when the user cancels the turn.
+    // Note: Type assertion needed due to slight type misalignment between CallToolResult and JSONValue
+    const toModelOutput = isMcpAppTool(toolMeta)
+      ? (opts: {
+          toolCallId: string;
+          input: unknown;
+          output: unknown;
+          abortSignal?: AbortSignal;
+        }) => {
+          const scrubbed = scrubMetaAndStructuredContentFromToolResult(
+            opts.output as CallToolResult
+          );
+          return mcpToolResultToModelOutput(scrubbed, {
+            modelVisibleMcpToolResults,
+            readResource,
+            abortSignal: opts.abortSignal,
+          });
+        }
+      : isChatGPTAppTool(toolMeta)
+        ? (opts: {
+            toolCallId: string;
+            input: unknown;
+            output: unknown;
+            abortSignal?: AbortSignal;
+          }) => {
+            const scrubbed = scrubStructuredContentFromToolResult(
+              opts.output as CallToolResult
+            );
+            return mcpToolResultToModelOutput(scrubbed, {
+              modelVisibleMcpToolResults,
+              readResource,
+              abortSignal: opts.abortSignal,
+            });
+          }
+        : (opts: {
+            toolCallId: string;
+            input: unknown;
+            output: unknown;
+            abortSignal?: AbortSignal;
+          }) =>
+            mcpToolResultToModelOutput(opts.output as CallToolResult, {
+              modelVisibleMcpToolResults,
+              readResource,
+              abortSignal: opts.abortSignal,
+            });
+
+    let vercelTool: Tool;
+
+    if (schemas === "automatic") {
+      // Automatic mode: normalize the schema and create a dynamic tool
+      const normalizedInputSchema = ensureJsonSchemaObject(inputSchema);
+      vercelTool = dynamicTool({
+        description,
+        inputSchema: jsonSchema(normalizedInputSchema),
+        execute,
+        toModelOutput,
+        ...(needsApproval != null ? { needsApproval } : {}),
+      });
+    } else {
+      // Override mode: only include tools explicitly listed in overrides
+      const overrides = schemas;
+      if (!(name in overrides)) {
+        continue;
+      }
+      vercelTool = defineTool<unknown, CallToolResult>({
+        description,
+        inputSchema: overrides[name].inputSchema,
+        execute,
+        toModelOutput,
+        ...(needsApproval != null ? { needsApproval } : {}),
+      });
+    }
+
+    (vercelTool as any)[MCP_PRESERVE_RAW_RESULT_FOR_UI] = true;
+    tools[name] = vercelTool;
+  }
+
+  return tools;
+}

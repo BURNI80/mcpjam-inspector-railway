@@ -1,0 +1,299 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { ToolPart } from "../tool-part";
+import { useHostContextStore } from "@/stores/client-context-store";
+
+// Mock lucide-react icons
+vi.mock("lucide-react", () => {
+  const s = (props: any) => <div {...props} />;
+  return {
+    AlignLeft: s,
+    AlertCircle: s,
+    Box: s,
+    Check: s,
+    ChevronDown: s,
+    ChevronRight: s,
+    Copy: s,
+    Database: s,
+    ExternalLink: s,
+    Eye: s,
+    Lightbulb: s,
+    Maximize2: s,
+    MessageCircle: s,
+    Minimize2: s,
+    Pencil: s,
+    PictureInPicture2: s,
+    Play: s,
+    Redo2: s,
+    RotateCcw: s,
+    Shield: s,
+    Undo2: s,
+  };
+});
+
+// Mock stores
+vi.mock("@/stores/preferences/preferences-provider", () => ({
+  usePreferencesStore: () => "light",
+}));
+
+vi.mock("@/stores/widget-debug-store", () => ({
+  useWidgetDebugStore: (selector: any) =>
+    // Return a truthy value so hasWidgetDebug=true and display mode controls show
+    selector({
+      widgets: new Map([
+        ["call-1", { globals: {}, logs: [], cspViolations: [] }],
+      ]),
+    }),
+}));
+
+// Mock thread-helpers
+// `importOriginal` rather than a bare factory: this module re-exports the
+// package's graph-free `@mcpjam/chat-ui/thread-helpers` subpath, and the parts
+// this file does not care about (notably `readTraceDisplayText`, which decides
+// whether a readable tool result is shown at all) have to behave like the real
+// thing rather than be re-stubbed in every test file that shadows one helper.
+vi.mock("../../thread-helpers", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../thread-helpers")>()),
+  getToolNameFromType: () => "test-tool",
+  getToolStateMeta: () => ({
+    Icon: (props: any) => <div data-testid="status-icon" {...props} />,
+    className: "",
+  }),
+  safeStringify: (v: any) => JSON.stringify(v),
+  isDynamicTool: () => false,
+}));
+
+// Mock UIType
+vi.mock("@/lib/mcp-ui/mcp-apps-utils", () => ({
+  UIType: { MCP_APPS: "mcp-apps", OPENAI_SDK: "openai-apps" },
+}));
+
+vi.mock("@mcpjam/design-system/badge", () => ({
+  Badge: ({ children, ...props }: any) => <span {...props}>{children}</span>,
+}));
+
+vi.mock("../../csp-workbench", () => ({
+  CspWorkbench: ({ recordedPolicy }: any) => (
+    <div data-testid="recorded-widget-diagnostics">
+      Saved with this eval run
+      {JSON.stringify(recordedPolicy)}
+    </div>
+  ),
+}));
+
+// Mock JsonEditor to avoid pulling in additional lucide icons
+vi.mock("@/components/ui/json-editor", () => ({
+  JsonEditor: ({ value }: any) => (
+    <pre data-testid="json-editor">{JSON.stringify(value)}</pre>
+  ),
+}));
+
+const basePart = {
+  type: "tool-invocation" as const,
+  toolName: "test-tool",
+  toolCallId: "call-1",
+  state: "output-available",
+  input: {},
+  output: {},
+};
+
+describe("ToolPart display mode controls", () => {
+  let onDisplayModeChange: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    onDisplayModeChange = vi.fn();
+    useHostContextStore.setState({
+      activeProjectId: null,
+      defaultHostContext: {},
+      savedHostContext: undefined,
+      draftHostContext: {},
+      hostContextText: "{}",
+      hostContextError: null,
+      isSaving: false,
+      isDirty: false,
+      pendingProjectId: null,
+      pendingSavedHostContext: undefined,
+      isAwaitingRemoteEcho: false,
+    });
+  });
+
+  const renderWithDisplayModes = (
+    appSupportedDisplayModes?: ("inline" | "pip" | "fullscreen")[],
+    options?: { minimalMode?: boolean; allowInlineEdit?: boolean },
+  ) =>
+    render(
+      <ToolPart
+        part={basePart as any}
+        uiType="mcp-apps"
+        displayMode="inline"
+        onDisplayModeChange={onDisplayModeChange}
+        appSupportedDisplayModes={appSupportedDisplayModes}
+        minimalMode={options?.minimalMode}
+        allowInlineEdit={options?.allowInlineEdit}
+      />,
+    );
+
+  it("shows all display mode buttons enabled when appSupportedDisplayModes is undefined", () => {
+    renderWithDisplayModes(undefined);
+
+    const buttons = screen.getAllByRole("button");
+    const displayButtons = buttons.filter(
+      (b) => !b.hasAttribute("disabled") || b.getAttribute("disabled") === "",
+    );
+    // All 3 display mode buttons should be present and none disabled
+    const disabledButtons = buttons.filter(
+      (b) => b.getAttribute("disabled") !== null,
+    );
+    expect(disabledButtons).toHaveLength(0);
+  });
+
+  it("disables pip and fullscreen when app only supports inline", async () => {
+    renderWithDisplayModes(["inline"]);
+    const user = userEvent.setup();
+
+    const buttons = screen.getAllByRole("button");
+    // Find disabled buttons (pip and fullscreen)
+    const disabledButtons = buttons.filter((b) => b.disabled);
+    expect(disabledButtons).toHaveLength(2);
+
+    // Click disabled buttons — onDisplayModeChange should NOT be called
+    for (const btn of disabledButtons) {
+      await user.click(btn);
+    }
+    expect(onDisplayModeChange).not.toHaveBeenCalled();
+  });
+
+  it("disables only fullscreen when app supports inline and pip", async () => {
+    renderWithDisplayModes(["inline", "pip"]);
+    const user = userEvent.setup();
+
+    const buttons = screen.getAllByRole("button");
+    const disabledButtons = buttons.filter((b) => b.disabled);
+    expect(disabledButtons).toHaveLength(1);
+
+    await user.click(disabledButtons[0]);
+    expect(onDisplayModeChange).not.toHaveBeenCalled();
+  });
+
+  it("enables all buttons when app supports all three modes", () => {
+    renderWithDisplayModes(["inline", "pip", "fullscreen"]);
+
+    const buttons = screen.getAllByRole("button");
+    const disabledButtons = buttons.filter((b) => b.disabled);
+    expect(disabledButtons).toHaveLength(0);
+  });
+
+  it("disables modes that the host does not advertise even when the app supports them", () => {
+    useHostContextStore.setState({
+      draftHostContext: {
+        availableDisplayModes: ["inline"],
+      },
+      hostContextText: JSON.stringify(
+        {
+          availableDisplayModes: ["inline"],
+        },
+        null,
+        2,
+      ),
+    });
+
+    renderWithDisplayModes(["inline", "pip", "fullscreen"]);
+
+    const disabledButtons = screen
+      .getAllByRole("button")
+      .filter((b) => b.disabled);
+    expect(disabledButtons).toHaveLength(2);
+    expect(screen.getByLabelText("Inline")).not.toBeDisabled();
+    expect(screen.getByLabelText("PiP")).toBeDisabled();
+    expect(screen.getByLabelText("Fullscreen")).toBeDisabled();
+  });
+
+  it("allows clicking enabled display mode buttons", async () => {
+    renderWithDisplayModes(["inline", "pip"]);
+    const user = userEvent.setup();
+
+    const buttons = screen.getAllByRole("button");
+    const enabledButtons = buttons.filter((b) => !b.disabled);
+    // Click first enabled display mode button (the header toggle is also a button, so find the right ones)
+    // The inline button should be enabled and clickable
+    for (const btn of enabledButtons) {
+      await user.click(btn);
+    }
+    // At least one call for the pip button
+    expect(onDisplayModeChange).toHaveBeenCalled();
+  });
+
+  it("marks unsupported modes as disabled with aria-labels", () => {
+    renderWithDisplayModes(["inline"]);
+
+    const buttons = screen.getAllByRole("button");
+    const disabledButtons = buttons.filter((b) => b.disabled);
+    expect(disabledButtons).toHaveLength(2);
+    // Disabled buttons should still have descriptive aria-labels
+    const labels = disabledButtons.map((b) => b.getAttribute("aria-label"));
+    expect(labels).toContain("PiP");
+    expect(labels).toContain("Fullscreen");
+  });
+
+  it("renders display mode controls in minimal mode", () => {
+    renderWithDisplayModes(["inline", "pip", "fullscreen"], {
+      minimalMode: true,
+    });
+
+    expect(screen.getByLabelText("Inline")).toBeInTheDocument();
+    expect(screen.getByLabelText("PiP")).toBeInTheDocument();
+    expect(screen.getByLabelText("Fullscreen")).toBeInTheDocument();
+  });
+
+  it("hides debug tabs and edit controls in minimal mode", () => {
+    renderWithDisplayModes(["inline", "pip", "fullscreen"], {
+      minimalMode: true,
+      allowInlineEdit: true,
+    });
+
+    expect(screen.queryByLabelText("Data")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Widget State")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("CSP")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Edit input and output"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows recorded Data and CSP without live display or edit controls", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToolPart
+        part={basePart as any}
+        uiType="mcp-apps"
+        recordedWidgetDiagnostics={{
+          resourceUri: "ui://widget/create-view.html",
+          csp: { connectDomains: ["https://api.example.com"] },
+          permissions: { clipboardWrite: {} },
+          permissive: false,
+          prefersBorder: true,
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Data")).toBeInTheDocument();
+    expect(screen.getByLabelText("Sandbox")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Inline")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Edit input and output"),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("test-tool"));
+    expect(screen.getByText("Recorded tool data")).toBeInTheDocument();
+    expect(screen.getAllByTestId("json-editor")).toHaveLength(2);
+
+    await user.click(screen.getByLabelText("Sandbox"));
+    expect(screen.getByTestId("recorded-widget-diagnostics")).toHaveTextContent(
+      "Saved with this eval run",
+    );
+    expect(screen.getByTestId("recorded-widget-diagnostics")).toHaveTextContent(
+      "https://api.example.com",
+    );
+  });
+});

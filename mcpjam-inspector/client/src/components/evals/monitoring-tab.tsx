@@ -1,0 +1,287 @@
+/**
+ * Monitoring tab (synthetic monitors) — uptime-style view of a suite's
+ * SCHEDULED runs: a clickable pass/fail strip, the probe render-latency
+ * trend, and a last-failure card. Interactive runs are deliberately
+ * excluded — this surface answers "has the widget kept working unattended",
+ * not "what did my last manual run do" (the Runs tab owns that).
+ *
+ * TWO FEATURES SHARE THIS PANE, and each answers to its own flag: the
+ * scheduled-run sections (uptime strip, last-failure card, and the empty state
+ * that tells you to enable a schedule) to `scheduled-evals-enabled`, the
+ * render-latency trend to `synthetic-monitors`. `suite-dashboard.tsx` decides
+ * whether the pane is reachable; the props below decide what it may show.
+ *
+ * Gating only the rail item is not enough. A suite with BOTH a schedule and a
+ * probe case earns the pane from either flag, so a deployment with only
+ * `synthetic-monitors` on would open a pane headed "Scheduled runs" — the exact
+ * surface the schedule flag exists to keep dark.
+ */
+
+import { useMemo } from "react";
+import { useQuery } from "convex/react";
+import { Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart";
+import { Area, AreaChart, XAxis, YAxis } from "recharts";
+import { formatRunId } from "./helpers";
+
+export type ScheduledRunStat = {
+  runId: string;
+  status:
+    | "pending"
+    | "running"
+    /** Held for its gating judge. Not terminal; `result` is still "pending". */
+    | "grading"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "timed_out";
+  result: "pending" | "passed" | "failed" | "cancelled" | "timed_out";
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    passRate: number;
+  } | null;
+  createdAt: number;
+  completedAt: number | null;
+  probeIterations: number;
+  meanRenderLatencyMs: number | null;
+};
+
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function segmentClass(stat: ScheduledRunStat): string {
+  // `grading` belongs with the in-progress states: every trial has run, but
+  // the verdict does not exist yet, and painting it by `result` would colour
+  // the segment for a "pending" nobody is going to see.
+  if (
+    stat.status === "running" ||
+    stat.status === "pending" ||
+    stat.status === "grading"
+  ) {
+    return "bg-warning/50 hover:bg-warning/70";
+  }
+  if (stat.result === "passed") return "bg-success/70 hover:bg-success";
+  if (stat.result === "failed") return "bg-destructive/70 hover:bg-destructive";
+  if (stat.result === "timed_out") return "bg-warning/70 hover:bg-warning";
+  return "bg-muted-foreground/30 hover:bg-muted-foreground/50";
+}
+
+export function MonitoringTab({
+  suiteId,
+  onRunClick,
+  showScheduledRuns = true,
+  showProbeLatency = true,
+}: {
+  suiteId: string;
+  onRunClick: (runId: string) => void;
+  /** `scheduled-evals-enabled` — uptime strip, last failure, empty state. */
+  showScheduledRuns?: boolean;
+  /** `synthetic-monitors` — the render-latency trend. */
+  showProbeLatency?: boolean;
+}) {
+  const stats = useQuery("testSuites:listScheduledRunStats" as any, {
+    suiteId,
+  }) as ScheduledRunStat[] | undefined;
+
+  // Backend returns newest-first; uptime strips read oldest → newest.
+  const chronological = useMemo(
+    () => (stats ? [...stats].reverse() : []),
+    [stats],
+  );
+  const lastFailure = useMemo(
+    () =>
+      stats?.find(
+        (stat) => stat.result === "failed" || stat.result === "timed_out",
+      ) ?? null,
+    [stats],
+  );
+  const latencyTrend = useMemo(
+    () =>
+      chronological
+        .filter((stat) => stat.meanRenderLatencyMs !== null)
+        .map((stat) => ({
+          runId: stat.runId,
+          runIdDisplay: formatRunId(stat.runId),
+          latencyMs: stat.meanRenderLatencyMs as number,
+          label: formatTimestamp(stat.completedAt ?? stat.createdAt),
+        })),
+    [chronological],
+  );
+
+  if (stats === undefined) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (stats.length === 0) {
+    // Schedule UI even though it renders no run data: the copy names the
+    // schedule and points at the row that enables one. With the schedule flag
+    // off there is nothing honest left here — the probe half has no stats of
+    // its own to show.
+    if (!showScheduledRuns) return null;
+    return (
+      <div className="rounded-lg border border-dashed border-border/60 bg-muted/10 p-8 text-center">
+        <p className="text-sm font-medium text-foreground">
+          No scheduled runs yet
+        </p>
+        <p className="mx-auto mt-1 max-w-md text-xs text-muted-foreground">
+          Enable a schedule in Suite settings and results will appear here as
+          an uptime strip — every segment is one unattended run of this suite.
+        </p>
+      </div>
+    );
+  }
+
+  const passed = stats.filter((stat) => stat.result === "passed").length;
+  const terminal = stats.filter(
+    (stat) =>
+      stat.result === "passed" ||
+      stat.result === "failed" ||
+      stat.result === "timed_out",
+  ).length;
+  const passRatePct =
+    terminal > 0 ? Math.round((passed / terminal) * 100) : null;
+
+  return (
+    <div className="flex flex-col gap-5">
+      {/* ── pass/fail strip ─────────────────────────────────────────── */}
+      {showScheduledRuns ? (
+        <section className="space-y-2">
+          <div className="flex items-baseline justify-between gap-3">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Scheduled runs
+            </h3>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {passRatePct !== null
+                ? `${passRatePct}% passing · last ${stats.length} run${stats.length === 1 ? "" : "s"}`
+                : `${stats.length} run${stats.length === 1 ? "" : "s"}`}
+            </span>
+          </div>
+          <div
+            className="flex h-8 items-stretch gap-[3px]"
+            role="list"
+            aria-label="Scheduled run results, oldest to newest"
+          >
+            {chronological.map((stat) => (
+              <button
+                key={stat.runId}
+                type="button"
+                role="listitem"
+                onClick={() => onRunClick(stat.runId)}
+                className={cn(
+                  "min-w-[6px] flex-1 rounded-[3px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60",
+                  segmentClass(stat),
+                )}
+                title={`${formatTimestamp(stat.completedAt ?? stat.createdAt)} — ${
+                  stat.result === "pending" ? stat.status : stat.result
+                }${
+                  stat.summary
+                    ? ` (${stat.summary.passed}/${stat.summary.total} iterations)`
+                    : ""
+                }`}
+                aria-label={`Run ${formatRunId(stat.runId)}: ${stat.result}`}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {/* ── probe latency trend ─────────────────────────────────────── */}
+      {!showProbeLatency ? null : latencyTrend.length > 1 ? (
+        <section className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Render latency
+          </h3>
+          <ChartContainer
+            config={{
+              latencyMs: {
+                label: "Mean render ms",
+                color: "hsl(var(--chart-2, 220 70% 50%))",
+              },
+            }}
+            className="aspect-auto h-28 w-full"
+          >
+            <AreaChart
+              data={latencyTrend}
+              margin={{ top: 12, right: 6, left: 6, bottom: 2 }}
+            >
+              <XAxis dataKey="label" hide padding={{ left: 8, right: 8 }} />
+              <YAxis hide domain={[0, "dataMax"]} />
+              <ChartTooltip
+                cursor={false}
+                content={<ChartTooltipContent indicator="line" />}
+              />
+              <Area
+                type="monotone"
+                dataKey="latencyMs"
+                stroke="var(--color-latencyMs)"
+                fill="var(--color-latencyMs)"
+                fillOpacity={0.12}
+                strokeWidth={2}
+                isAnimationActive={false}
+                dot={false}
+              />
+            </AreaChart>
+          </ChartContainer>
+        </section>
+      ) : latencyTrend.length === 1 ? (
+        <section className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Render latency
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            One run recorded — the latency trend appears once there are at least
+            two.
+          </p>
+        </section>
+      ) : null}
+
+      {/* ── last failure ────────────────────────────────────────────── */}
+      {showScheduledRuns && lastFailure ? (
+        <section className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Last failure
+          </h3>
+          <button
+            type="button"
+            onClick={() => onRunClick(lastFailure.runId)}
+            className="w-full rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-left transition-colors hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs font-medium text-foreground">
+                Run {formatRunId(lastFailure.runId)}
+              </span>
+              <span className="text-[11px] text-muted-foreground">
+                {formatTimestamp(
+                  lastFailure.completedAt ?? lastFailure.createdAt,
+                )}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {lastFailure.summary
+                ? `${lastFailure.summary.failed} of ${lastFailure.summary.total} iterations failed.`
+                : "Run did not complete."}{" "}
+              Open the run to see assertion verdicts and the rendered widget.
+            </p>
+          </button>
+        </section>
+      ) : null}
+    </div>
+  );
+}

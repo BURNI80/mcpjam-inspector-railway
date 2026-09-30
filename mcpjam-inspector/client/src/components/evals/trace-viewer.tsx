@@ -1,0 +1,1262 @@
+import { readTraceRequestPayloads } from "@/shared/live-chat-trace";
+import { isLiveChatPreviewSpanId } from "@/shared/live-chat-trace-preview";
+import { TranscriptEmptyState } from "@/components/chat-v2/transcript-empty-state";
+import {
+  lazy,
+  Suspense,
+  useMemo,
+  useState,
+  useEffect,
+  type ReactNode,
+  type ComponentProps,
+} from "react";
+import type { ContentBlock } from "@modelcontextprotocol/client";
+import { Loader2, Minus, Plus, Code2, Columns2 } from "lucide-react";
+import { StickToBottom } from "use-stick-to-bottom";
+import { Button } from "@mcpjam/design-system/button";
+import { ScrollToBottomButton } from "@/components/chat-v2/shared/scroll-to-bottom-button";
+import type { ModelDefinition, ModelProvider } from "@/shared/types";
+import type {
+  EvalTraceBrowserInteractionStepView,
+  EvalTraceSpan,
+  EvalTraceVideoMeta,
+  EvalTraceWidgetRenderObservationView,
+} from "@/shared/eval-trace";
+import { evalTraceVideoMetaZ } from "@/shared/eval-trace";
+import type { ToolServerMap } from "@/lib/apis/mcp-tools-api";
+import { JsonEditor } from "@/components/ui/json-editor";
+import { Thread, TRANSCRIPT_COLUMN_CLASS } from "@/components/chat-v2/thread";
+import { HostStyledShell } from "@/components/chat-v2/host-styled-shell";
+import type { HostSnapshot } from "@/lib/host-snapshot";
+import type { RecorderProps } from "@/components/chat-v2/thread/recorder-types";
+import type { DisplayMode } from "@/stores/ui-playground-store";
+import {
+  adaptTraceToUiMessages,
+  type TraceEnvelope,
+  type AdaptedTraceResult,
+  type TraceMessage,
+} from "./trace-viewer-adapter";
+import {
+  buildPromptGroups,
+  collectStepSpanIdsWithChildren,
+  type TraceRevealSelection,
+} from "./trace-timeline";
+import {
+  RecordedTraceToolbar,
+  type TimelineFilter,
+} from "./recorded-trace-toolbar";
+import { cn } from "@/lib/utils";
+import { TraceViewModeTabs } from "./trace-view-mode-tabs";
+import { BrowserArtifactsView } from "./browser-artifacts-view";
+import { hasReplayArtifacts } from "./browser-step-replay";
+import {
+  StepReplayView,
+  type StepPresentation,
+} from "./step-replay-view";
+import type { EvalStepReplay } from "@/shared/eval-step-replay";
+import { buildFrozenScreenshotOverrides } from "./frozen-screenshot-overrides";
+import { buildAppToolInvocationsFromBrowserSteps } from "./widget-tool-calls-to-app-invocations";
+import type { TestStep } from "@/shared/steps";
+import type { EvalStepStatus } from "@/shared/eval-stream-events";
+import { ToolCallsDiffView } from "./tool-calls-diff-view";
+import {
+  TraceRawView,
+  type TraceRawRequestPayloadHistory,
+} from "./trace-raw-view";
+import type { HarnessBuiltinToolInfo } from "@/hooks/useHarnessBuiltinTools";
+import { ActiveHostCapsResolverScope } from "@/contexts/active-host-client-capabilities-context";
+import type {
+  HostConfigDtoV2,
+  McpToolResultImageRendering,
+} from "@/lib/client-config-v2";
+
+// Preserve the existing caps seed for activeHost-only callers. Explicit
+// snapshots instead seed their capabilities through HostStyledShell.
+const DEFAULT_TRACE_HOST_STYLE_FALLBACK = "mcpjam";
+
+const TraceTimelineLazy = lazy(() =>
+  import("./trace-timeline").then((m) => ({ default: m.TraceTimeline }))
+);
+
+const NOOP = (..._args: unknown[]) => {};
+
+type TranscriptNavigation = {
+  focusMessageId: string | null;
+  highlightedMessageIds: string[];
+  navigationKey: number;
+};
+
+const TRANSCRIPT_NAVIGATION_AT_REST: TranscriptNavigation = {
+  focusMessageId: null,
+  highlightedMessageIds: [],
+  navigationKey: 0,
+};
+
+/** Adds the rows in `rowIds` not seen before; keeps `open` when there are none. */
+function withNewRowsOpen(
+  open: Set<string>,
+  rowIds: Set<string>,
+  seenRowIds: Set<string>
+): Set<string> {
+  let next: Set<string> | null = null;
+  for (const id of rowIds) {
+    if (seenRowIds.has(id) || open.has(id)) continue;
+    next ??= new Set(open);
+    next.add(id);
+  }
+  return next ?? open;
+}
+
+export type TraceViewerEvalToolCall = {
+  toolName: string;
+  arguments: Record<string, any>;
+};
+
+interface TraceViewerProps {
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null;
+  model?: ModelDefinition;
+  /** Prepared from the same trace; lets session ratings share the exact rendered IDs. */
+  adaptedTrace?: AdaptedTraceResult;
+  renderAssistantTurnFooter?: ComponentProps<typeof Thread>["renderAssistantTurnFooter"];
+  reasoningDisplayMode?: ComponentProps<typeof Thread>["reasoningDisplayMode"];
+  widgetPolicy?: ComponentProps<typeof Thread>["widgetPolicy"];
+  frame?: "inset" | "none";
+  /**
+   * Chat: forwarded to the transcript `Thread`. Tools (Results): shows a spinner
+   * beside "Actual" while the run is still in progress.
+   */
+  isLoading?: boolean;
+  toolsMetadata?: Record<string, Record<string, any>>;
+  toolServerMap?: ToolServerMap;
+  connectedServerIds?: string[];
+  /** Wall-clock timestamp for the trace start when available. */
+  traceStartedAtMs?: number | null;
+  /** Wall-clock timestamp for the trace end when available. */
+  traceEndedAtMs?: number | null;
+  /** Fallback when the blob has no recorded spans (Convex wall-clock only). */
+  estimatedDurationMs?: number | null;
+  /** Shown under the toolbar row (e.g. run case insight caption). */
+  traceInsight?: ReactNode;
+  /** Tighter toolbar/card spacing for full-pane run detail. */
+  chromeDensity?: "default" | "compact";
+  /** Expected tool calls from the eval case (snapshot); enables the Tools tab. */
+  expectedToolCalls?: TraceViewerEvalToolCall[];
+  /** Tool calls observed for this iteration; enables the Tools tab. */
+  actualToolCalls?: TraceViewerEvalToolCall[];
+  /** Authored step list (the run's testCaseSnapshot). When present, enables the
+   *  step-aligned "Steps" tab — one row per step, mirroring the left pane. */
+  steps?: TestStep[];
+  /** Live/persisted per-step verdict keyed by `TestStep.id` (for the Steps tab). */
+  stepStatusById?: Map<string, EvalStepStatus>;
+  /** Authoritative iteration result; renders the Steps-tab verdict header. */
+  iterationResult?:
+    | "passed"
+    | "failed"
+    | "pending"
+    | "cancelled"
+    | "timed_out"
+    | null;
+  /** Step hovered/selected elsewhere (e.g. the left step list) — highlights the
+   *  matching Steps row for left↔right sync. */
+  syncedStepId?: string | null;
+  /** Fired on Steps-row hover/select, to drive the synced highlight. */
+  onSyncStep?: (stepId: string | null) => void;
+  /** Steps-tab presentation. Pass-through; see `StepReplayView`. */
+  stepPresentation?: StepPresentation;
+  /** Per-step verdicts WITH reasons, so a failed row can say why. */
+  stepResults?: ReadonlyArray<EvalStepReplay>;
+  /** The verdict word the page already computed, so this tab does not derive a second. */
+  verdictWord?: string;
+  /** Force a single mode (used when TraceViewer is embedded into a larger shell).
+   *  Chat host shells force only timeline/chat/raw/tools. The eval RunColumn
+   *  (quick-run result panel) additionally forces "browser" so it can surface
+   *  the same replay/screenshots the standalone Browser tab shows. */
+  forcedViewMode?: "timeline" | "chat" | "raw" | "tools" | "browser" | "steps";
+  /** Hide the internal toolbar when the parent shell provides its own tabs. */
+  hideToolbar?: boolean;
+  /** Let the active panel fill the available height instead of clamping to a max height. */
+  fillContent?: boolean;
+  /** Hide transcript reveal controls when the parent shell owns chat mode separately. */
+  hideTranscriptRevealControls?: boolean;
+  /**
+   * When `forcedViewMode` is set (e.g. parent tabs), internal `setViewMode("chat")` from
+   * "Reveal in Chat" is ignored — call this so the shell can switch to its chat tab.
+   */
+  onRevealNavigateToChat?: () => void;
+  chatSessionId?: string;
+  sendFollowUpMessage?: (text: string) => void;
+  onWidgetStateChange?: (toolCallId: string, state: any) => void;
+  onModelContextUpdate?: (
+    toolCallId: string,
+    context: {
+      content?: ContentBlock[];
+      structuredContent?: Record<string, unknown>;
+    }
+  ) => void;
+  displayMode?: DisplayMode;
+  onDisplayModeChange?: (mode: DisplayMode) => void;
+  onToolApprovalResponse?: (options: { id: string; approved: boolean }) => void;
+  interactive?: boolean;
+  /** Tier 3 recorder bundle, forwarded to Thread (default off). */
+  recorder?: RecorderProps;
+  enableFullscreenChatOverlay?: boolean;
+  fullscreenChatPlaceholder?: string;
+  fullscreenChatDisabled?: boolean;
+  fullscreenChatSendBlocked?: boolean;
+  onFullscreenChatStop?: () => void;
+  /** Forwarded to `Thread` so ancestors can drop GPU transforms that trap `position: fixed` widgets. */
+  onFullscreenChange?: (isFullscreen: boolean) => void;
+  /**
+   * When set (live chat), Raw tab shows the resolved model request payload
+   * (`system`, `tools`, `messages`) instead of the diagnostic trace blob.
+   */
+  rawRequestPayloadHistory?: TraceRawRequestPayloadHistory | null;
+  /**
+   * Harness native built-in tools — forwarded to Raw so a harness host's
+   * request is annotated (its `tools` are empty because the harness builds its
+   * own request in-sandbox). Only the playground passes this; undefined
+   * elsewhere. See {@link TraceRawView}.
+   */
+  harnessBuiltinTools?: HarnessBuiltinToolInfo[];
+  /**
+   * When true, Raw JSON uses `height: auto` and minimal wrappers so a parent
+   * `StickToBottom` (or similar) owns vertical scroll as the payload grows.
+   */
+  rawGrowWithContent?: boolean;
+  /**
+   * Soften the Raw view's scroll edges. Opt-in, and forwarded verbatim — see
+   * {@link TraceRawView}'s own note for why it is not simply on.
+   */
+  rawFadeScrollEdges?: boolean;
+  /**
+   * Active host (resolved by `useAppState`) at the time the trace is
+   * being viewed — NOT the host that was active when the trace was
+   * recorded. When provided, TraceViewer installs an inner
+   * `ActiveHostCapsResolverScope` so the render gate matches what the
+   * user is modeling right now (switch to Codex → widgets hide in
+   * replays). When `undefined`, TraceViewer does NOT install an inner
+   * scope — any outer scope from a parent chat surface (e.g.
+   * `ClientStyledChatTabV2`, `PlaygroundTab`) flows through with the
+   * user's saved capability edits intact. Pass `null` explicitly to
+   * install a scope with no host (template-seed fallback).
+   */
+  activeHost?: HostConfigDtoV2 | null;
+  /** undefined inherits the surrounding host; null explicitly uses the generic shell. */
+  hostSnapshot?: HostSnapshot | null;
+  /**
+   * Human-facing render policy for MCP tool-result images, mirroring the
+   * chat surfaces (App.tsx / ChatTabV2). When omitted, the trace `Thread`
+   * falls back to the default "inline" placement. Pass the value already
+   * gated by model visibility via
+   * `gateMcpToolResultImageRenderingByModelVisibility`.
+   */
+  mcpToolResultImageRendering?: McpToolResultImageRendering;
+}
+
+function getTraceMessages(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+) {
+  if (!trace) return [];
+
+  if (Array.isArray(trace)) {
+    return trace;
+  }
+
+  if (
+    typeof trace === "object" &&
+    trace !== null &&
+    "messages" in trace &&
+    Array.isArray(trace.messages)
+  ) {
+    return trace.messages;
+  }
+
+  if (
+    typeof trace === "object" &&
+    trace !== null &&
+    "role" in trace &&
+    typeof trace.role === "string"
+  ) {
+    return [trace as TraceMessage];
+  }
+
+  return [];
+}
+
+function getRecordedSpans(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): EvalTraceSpan[] | undefined {
+  if (!trace || Array.isArray(trace)) return undefined;
+  if (typeof trace !== "object") return undefined;
+  if (!("spans" in trace)) return undefined;
+  const raw = (trace as TraceEnvelope).spans;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  return raw as EvalTraceSpan[];
+}
+
+type TraceTurnRuntime = {
+  engine?: "emulated" | "harness";
+  harness?: string;
+};
+
+function getTraceTurnRuntimeByPromptIndex(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): Map<number, TraceTurnRuntime> | undefined {
+  if (!trace || Array.isArray(trace) || typeof trace !== "object") {
+    return undefined;
+  }
+  const rawEvents = (trace as TraceEnvelope).events;
+  if (!Array.isArray(rawEvents) || rawEvents.length === 0) return undefined;
+
+  const byPromptIndex = new Map<number, TraceTurnRuntime>();
+  for (const rawEvent of rawEvents) {
+    if (!rawEvent || typeof rawEvent !== "object") continue;
+    const event = rawEvent as Record<string, unknown>;
+    if (event.type !== "turn_start") continue;
+    if (typeof event.promptIndex !== "number") continue;
+    const engine =
+      event.engine === "emulated" || event.engine === "harness"
+        ? event.engine
+        : undefined;
+    const harness =
+      typeof event.harness === "string" && event.harness.trim()
+        ? event.harness
+        : undefined;
+    if (!engine && !harness) continue;
+    byPromptIndex.set(event.promptIndex, { engine, harness });
+  }
+
+  return byPromptIndex.size > 0 ? byPromptIndex : undefined;
+}
+
+// PR 7: pull the browser-rendered MCP App artifacts off the trace envelope.
+function getBrowserObservations(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): EvalTraceWidgetRenderObservationView[] {
+  if (!trace || Array.isArray(trace) || typeof trace !== "object") return [];
+  const raw = (trace as TraceEnvelope).widgetRenderObservations;
+  return Array.isArray(raw) ? raw : [];
+}
+
+function getBrowserSteps(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): EvalTraceBrowserInteractionStepView[] {
+  if (!trace || Array.isArray(trace) || typeof trace !== "object") return [];
+  const raw = (trace as TraceEnvelope).browserInteractionSteps;
+  return Array.isArray(raw) ? raw : [];
+}
+
+// Iteration-level replay video URL (backend-resolved from `videoBlobId`).
+function getBrowserVideoUrl(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): string | null {
+  if (!trace || Array.isArray(trace) || typeof trace !== "object") return null;
+  const raw = (trace as TraceEnvelope).videoUrl;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+/**
+ * What that recording says about itself, when it says anything.
+ *
+ * Read only ALONGSIDE a resolved URL, by the caller: metadata under an empty
+ * player would render a duration and a frame rate for a recording that is not
+ * there.
+ */
+function getBrowserVideoMeta(
+  trace: TraceEnvelope | TraceMessage | TraceMessage[] | null
+): EvalTraceVideoMeta | null {
+  if (!trace || Array.isArray(trace) || typeof trace !== "object") return null;
+  const raw = (trace as TraceEnvelope).videoMeta;
+  if (!raw || typeof raw !== "object") return null;
+  // PARSED, not cast. The badge renders on `truncated` and the header formats
+  // `durationMs` and `fps`, so a value of the wrong TYPE does not degrade — a
+  // `truncated: "false"` string is truthy and would claim a recording stopped
+  // at its size limit when it did not. That is the one thing this metadata
+  // exists to say, so it is the one thing worth refusing to guess at.
+  const parsed = evalTraceVideoMetaZ.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+export function TraceViewer({
+  trace,
+  adaptedTrace: preparedTrace,
+  renderAssistantTurnFooter,
+  reasoningDisplayMode = "collapsed",
+  widgetPolicy = "live",
+  frame = "inset",
+  model,
+  isLoading = false,
+  toolsMetadata = {},
+  toolServerMap = {},
+  connectedServerIds = [],
+  traceStartedAtMs = null,
+  traceEndedAtMs = null,
+  estimatedDurationMs = null,
+  traceInsight,
+  chromeDensity = "default",
+  expectedToolCalls = [],
+  actualToolCalls = [],
+  steps,
+  stepStatusById,
+  iterationResult = null,
+  syncedStepId,
+  onSyncStep,
+  stepPresentation = "legacy",
+  stepResults,
+  verdictWord,
+  forcedViewMode,
+  hideToolbar = false,
+  fillContent = false,
+  hideTranscriptRevealControls = false,
+  onRevealNavigateToChat,
+  chatSessionId,
+  sendFollowUpMessage = NOOP,
+  onWidgetStateChange,
+  onModelContextUpdate,
+  displayMode,
+  onDisplayModeChange,
+  onToolApprovalResponse,
+  interactive = false,
+  recorder,
+  enableFullscreenChatOverlay = false,
+  fullscreenChatPlaceholder = "Message…",
+  fullscreenChatDisabled = false,
+  fullscreenChatSendBlocked,
+  onFullscreenChatStop,
+  onFullscreenChange,
+  rawRequestPayloadHistory = null,
+  harnessBuiltinTools,
+  rawGrowWithContent = false,
+  rawFadeScrollEdges = false,
+  activeHost,
+  hostSnapshot,
+  mcpToolResultImageRendering,
+}: TraceViewerProps) {
+  const persistedRequestPayloads = useMemo(
+    () => readTraceRequestPayloads(trace),
+    [trace],
+  );
+  // Only live chat shells should opt into the interactive widget path.
+  const threadInteractive = interactive || sendFollowUpMessage !== NOOP;
+
+  // An explicit snapshot owns the full shell. Otherwise preserve the existing
+  // activeHost-only capability scope and ambient presentation (PR #2169).
+  const shouldInstallTraceScope =
+    hostSnapshot === undefined && activeHost !== undefined;
+
+  const [viewMode, setViewMode] = useState<
+    "timeline" | "chat" | "raw" | "tools" | "browser" | "steps"
+  >("chat");
+  const [toolsCompareLayout, setToolsCompareLayout] = useState<"diff" | "json">(
+    "diff"
+  );
+  const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>("all");
+  const [expandedPromptIds, setExpandedPromptIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [expandedStepIds, setExpandedStepIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [transcriptNavigation, setTranscriptNavigation] =
+    useState<TranscriptNavigation>(TRANSCRIPT_NAVIGATION_AT_REST);
+  const [timelineViewportMaxMs, setTimelineViewportMaxMs] = useState(1);
+  const resolvedModel: ModelDefinition = model ?? {
+    id: "unknown",
+    name: "Unknown",
+    provider: "custom" as ModelProvider,
+  };
+  const traceMessages = getTraceMessages(trace);
+  const hasEvalToolCalls =
+    expectedToolCalls.length > 0 || actualToolCalls.length > 0;
+  const effectiveViewMode = forcedViewMode ?? viewMode;
+  const recordedSpans = useMemo(() => getRecordedSpans(trace), [trace]);
+  const turnRuntimeByPromptIndex = useMemo(
+    () => getTraceTurnRuntimeByPromptIndex(trace),
+    [trace]
+  );
+  // PR 7: browser-rendered MCP App eval artifacts (render observations +
+  // Computer Use steps). Only iterations driven through the headless-Chromium
+  // harness carry these, so the Browser tab is gated on their presence.
+  const browserObservations = useMemo(
+    () => getBrowserObservations(trace),
+    [trace]
+  );
+  const browserSteps = useMemo(() => getBrowserSteps(trace), [trace]);
+  const browserVideoUrl = useMemo(() => getBrowserVideoUrl(trace), [trace]);
+  const browserVideoMeta = useMemo(
+    () => (browserVideoUrl ? getBrowserVideoMeta(trace) : null),
+    [trace, browserVideoUrl]
+  );
+  // Step-aligned replay tab: gated on the run carrying its authored step list.
+  const hasSteps = (steps?.length ?? 0) > 0;
+  // Replay tab gate — ONE predicate, shared with every other surface that shows
+  // this tab (see `hasReplayArtifacts`). Steps count now that the tab carries the
+  // synchronized filmstrip: a step-rich, observation-less run (a swarm session
+  // driving one already-mounted widget by Computer Use) has a full recording to
+  // show, and used to get no tab at all.
+  const hasBrowserArtifacts = hasReplayArtifacts({
+    widgetRenderObservations: browserObservations,
+    browserInteractionSteps: browserSteps,
+    videoUrl: browserVideoUrl,
+  });
+  const promptGroups = useMemo(
+    () => (recordedSpans?.length ? buildPromptGroups(recordedSpans) : []),
+    [recordedSpans]
+  );
+  const traceIdentityForToolbar = useMemo(
+    () =>
+      recordedSpans
+        ?.map((span) => `${span.id}:${span.startMs}:${span.endMs}`)
+        .join("|") ?? "no-spans",
+    [recordedSpans]
+  );
+  const maxEndMsForToolbar = useMemo(
+    () =>
+      recordedSpans?.length
+        ? recordedSpans.reduce((max, span) => Math.max(max, span.endMs), 1)
+        : 1,
+    [recordedSpans]
+  );
+  const fullyExpandedStepIds = useMemo(
+    () => collectStepSpanIdsWithChildren(promptGroups),
+    [promptGroups]
+  );
+  const isTimelineFullyExpanded = useMemo(() => {
+    if (promptGroups.length === 0) return false;
+    for (const group of promptGroups) {
+      if (!expandedPromptIds.has(group.key)) return false;
+    }
+    for (const id of fullyExpandedStepIds) {
+      if (!expandedStepIds.has(id)) return false;
+    }
+    return true;
+  }, [promptGroups, expandedPromptIds, expandedStepIds, fullyExpandedStepIds]);
+
+  // Reset the timeline's zoom and filter when its spans change, by
+  // adjusting state during render rather than in an effect. A streaming reply
+  // hands this viewer a new trace on every token, and an effect here set state
+  // after each token's commit. A fast stream stacks enough of those in a row
+  // to trip React's "Maximum update depth exceeded", the same failure the
+  // compare cards had in INSPECTOR-CLIENT-2HP. React applies an update to this
+  // component's own state within the same render pass, so it never schedules
+  // more work. The key starts at `null` so the first render applies the reset,
+  // as the mount-time effect did.
+  const [timelineResetIdentity, setTimelineResetIdentity] = useState<
+    string | null
+  >(null);
+  if (timelineResetIdentity !== traceIdentityForToolbar) {
+    setTimelineResetIdentity(traceIdentityForToolbar);
+    setTimelineViewportMaxMs(maxEndMsForToolbar);
+    setTimelineFilter("all");
+  }
+
+  // Open every timeline row by default, but only when the rows change, during
+  // render for the same reason as above. Keying this on the spans' times too
+  // reopened a row the user had just closed, since a streaming bar grows on
+  // every token. While rows are only being added (new steps and tools, or the
+  // live preview rows giving way to the recorded ones), open just the new
+  // rows. Any other change, such as another trace, opens every row again.
+  const timelineRowIdsKey = useMemo(
+    () => recordedSpans?.map((span) => span.id).join("|") ?? "",
+    [recordedSpans]
+  );
+  const [openedTimelineRows, setOpenedTimelineRows] = useState<{
+    key: string;
+    spanIds: Set<string>;
+    promptIds: Set<string>;
+    stepIds: Set<string>;
+  } | null>(null);
+  if (openedTimelineRows?.key !== timelineRowIdsKey) {
+    const spanIds = new Set(recordedSpans?.map((span) => span.id) ?? []);
+    const promptIds = new Set(promptGroups.map((g) => g.key));
+    const stepIds = collectStepSpanIdsWithChildren(promptGroups);
+    setOpenedTimelineRows({
+      key: timelineRowIdsKey,
+      spanIds,
+      promptIds,
+      stepIds,
+    });
+
+    // Preview rows may only go away when the recorded rows replace them. If
+    // the new trace still has preview rows, it is another preview.
+    const previewGaveWayToRecorded = ![...spanIds].some(
+      isLiveChatPreviewSpanId
+    );
+    const onlyRowsAdded =
+      openedTimelineRows !== null &&
+      [...openedTimelineRows.spanIds].every(
+        (id) =>
+          spanIds.has(id) ||
+          (previewGaveWayToRecorded && isLiveChatPreviewSpanId(id))
+      );
+    if (onlyRowsAdded) {
+      setExpandedPromptIds(
+        withNewRowsOpen(
+          expandedPromptIds,
+          promptIds,
+          openedTimelineRows.promptIds
+        )
+      );
+      setExpandedStepIds(
+        withNewRowsOpen(expandedStepIds, stepIds, openedTimelineRows.stepIds)
+      );
+    } else {
+      setExpandedPromptIds(promptIds);
+      setExpandedStepIds(stepIds);
+    }
+  }
+
+  const adaptedTrace = useMemo(
+    () =>
+      preparedTrace ?? adaptTraceToUiMessages({
+        trace,
+        toolsMetadata,
+        toolServerMap,
+        connectedServerIds,
+        toolResultDisplay: "tool-card",
+      }),
+    [preparedTrace, trace, toolsMetadata, toolServerMap, connectedServerIds]
+  );
+
+  // Frozen replay: when simply VIEWING a completed run, show each widget's
+  // RECORDED screenshot instead of a live re-render — which drifts to the
+  // widget's default state once its MCP server is gone. While a widget is armed
+  // for recording, keep widgets live: the record flow needs the real widget and
+  // a reachable server (which then shows real data, so no drift). Non-eval
+  // surfaces carry no `browserObservations`, so this is a no-op there.
+  const toolRenderOverrides = useMemo(() => {
+    const base = adaptedTrace.toolRenderOverrides;
+    // While a widget is armed for recording, keep widgets live (the record flow
+    // needs the real widget + a reachable server).
+    if (recorder?.recordingTarget) return base;
+    return buildFrozenScreenshotOverrides(
+      base,
+      browserObservations,
+      browserSteps
+    );
+  }, [
+    adaptedTrace.toolRenderOverrides,
+    browserObservations,
+    browserSteps,
+    recorder?.recordingTarget,
+  ]);
+
+  // Reconstruct the widget→host tool-call cards from the recorded interaction
+  // steps so the Chat tab shows app-initiated calls (e.g. "Add to cart") as
+  // MCP-branded `AppToolInvocationPart`s under the parent widget — the frozen
+  // analogue of Playground's live host-bridge invocations. While recording, the
+  // live bridge owns these, so skip the override and let the widget re-fire.
+  const appToolInvocationsOverride = useMemo(
+    () =>
+      recorder?.recordingTarget
+        ? undefined
+        : buildAppToolInvocationsFromBrowserSteps(browserSteps),
+    [browserSteps, recorder?.recordingTarget]
+  );
+
+  // A reveal-in-transcript highlight belongs to the trace it was made on. Clear
+  // it when the trace changes, during render for the same reason as the
+  // timeline reset above, and only when there is a highlight to clear.
+  const [transcriptNavigationTrace, setTranscriptNavigationTrace] =
+    useState(trace);
+  if (transcriptNavigationTrace !== trace) {
+    setTranscriptNavigationTrace(trace);
+    if (transcriptNavigation !== TRANSCRIPT_NAVIGATION_AT_REST) {
+      setTranscriptNavigation(TRANSCRIPT_NAVIGATION_AT_REST);
+    }
+  }
+
+  useEffect(() => {
+    if (!hasEvalToolCalls) {
+      setViewMode((mode) => (mode === "tools" ? "timeline" : mode));
+    }
+  }, [hasEvalToolCalls]);
+
+  useEffect(() => {
+    if (!hasBrowserArtifacts) {
+      setViewMode((mode) => (mode === "browser" ? "timeline" : mode));
+    }
+  }, [hasBrowserArtifacts]);
+
+  useEffect(() => {
+    if (!hasSteps) {
+      setViewMode((mode) => (mode === "steps" ? "timeline" : mode));
+    }
+  }, [hasSteps]);
+
+  useEffect(() => {
+    if (effectiveViewMode !== "raw" && effectiveViewMode !== "chat") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      setViewMode("timeline");
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [effectiveViewMode]);
+
+  function handleRevealInTranscript(selection: TraceRevealSelection) {
+    const highlightedIds = new Set<string>();
+    for (const sourceIndex of selection.highlightSourceIndices) {
+      for (const messageId of adaptedTrace.sourceMessageIndexToUiMessageIds[
+        sourceIndex
+      ] ?? []) {
+        highlightedIds.add(messageId);
+      }
+    }
+
+    const focusMessageId =
+      adaptedTrace.sourceMessageIndexToFocusUiMessageId[
+        selection.focusSourceIndex
+      ] ??
+      adaptedTrace.sourceMessageIndexToUiMessageIds[
+        selection.focusSourceIndex
+      ]?.[0] ??
+      null;
+    if (focusMessageId) {
+      highlightedIds.add(focusMessageId);
+    }
+
+    const orderedIds = adaptedTrace.messages
+      .map((message) => message.id)
+      .filter((messageId) => highlightedIds.has(messageId));
+    if (orderedIds.length === 0 || !focusMessageId) {
+      return;
+    }
+
+    setTranscriptNavigation((current) => ({
+      focusMessageId,
+      highlightedMessageIds: orderedIds,
+      navigationKey: current.navigationKey + 1,
+    }));
+    if (forcedViewMode != null) {
+      if (forcedViewMode !== "chat") {
+        onRevealNavigateToChat?.();
+      }
+    } else {
+      setViewMode("chat");
+    }
+  }
+
+  if (!trace) {
+    return (
+      <div className="text-xs text-muted-foreground">
+        No trace data available
+      </div>
+    );
+  }
+
+  const hasRecordedSpans = Boolean(recordedSpans?.length);
+  const showRecordedChrome =
+    effectiveViewMode === "timeline" && hasRecordedSpans;
+  const timelineZoomMinMs = Math.max(1, Math.round(maxEndMsForToolbar / 50));
+  const compactChrome = chromeDensity === "compact";
+  const flexFillChrome =
+    fillContent ||
+    effectiveViewMode === "raw" ||
+    effectiveViewMode === "browser" ||
+    (effectiveViewMode === "tools" && hasEvalToolCalls);
+  const flatToolbar = compactChrome && flexFillChrome;
+
+  const toolsCompareLayoutToggle = (
+    <div className="flex items-center gap-1 rounded-md border border-border/40 bg-background p-0.5">
+      <button
+        type="button"
+        onClick={() => setToolsCompareLayout("diff")}
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs transition-colors",
+          toolsCompareLayout === "diff"
+            ? "bg-primary/10 font-medium text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+        title="Structured diff view"
+        data-testid="trace-viewer-tools-layout-diff"
+      >
+        <Columns2 className="size-3" aria-hidden />
+        Diff
+      </button>
+      <button
+        type="button"
+        onClick={() => setToolsCompareLayout("json")}
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs transition-colors",
+          toolsCompareLayout === "json"
+            ? "bg-primary/10 font-medium text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+        title="Raw JSON view"
+        data-testid="trace-viewer-tools-layout-json"
+      >
+        <Code2 className="size-3" aria-hidden />
+        JSON
+      </button>
+    </div>
+  );
+
+  const content = (
+    <div
+      className={cn(flexFillChrome && "flex min-h-0 min-w-0 flex-1 flex-col")}
+      data-testid="trace-viewer-root"
+    >
+      <div
+        className={cn(
+          compactChrome ? "space-y-2" : "space-y-3",
+          flexFillChrome && "flex min-h-0 min-w-0 flex-1 flex-col"
+        )}
+      >
+        {!hideToolbar ? (
+          <div
+            className={cn(
+              "z-10 shrink-0 backdrop-blur-sm",
+              flatToolbar
+                ? "relative border-b border-border/60 bg-background/95"
+                : "sticky top-0 rounded-lg border border-border/50 bg-muted/95 shadow-sm",
+              compactChrome ? "px-2 py-1.5 sm:px-2.5" : "px-2 py-2 sm:px-3"
+            )}
+          >
+            <div
+              className={cn(
+                "flex min-w-0 flex-row items-center justify-between gap-2",
+                compactChrome ? "min-h-8" : "min-h-9"
+              )}
+            >
+              <div className="flex min-w-0 min-h-0 flex-1 items-center gap-2">
+                {showRecordedChrome ? (
+                  <RecordedTraceToolbar
+                    filter={timelineFilter}
+                    onFilterChange={setTimelineFilter}
+                    isFullyExpanded={isTimelineFullyExpanded}
+                    expandDisabled={promptGroups.length === 0}
+                    showBottomBorder={false}
+                    zoomControls={
+                      <>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          className="h-7 w-7 border-border/50"
+                          title="Zoom in timeline"
+                          aria-label="Zoom in timeline"
+                          disabled={timelineViewportMaxMs <= timelineZoomMinMs}
+                          onClick={() =>
+                            setTimelineViewportMaxMs((v) =>
+                              Math.max(timelineZoomMinMs, Math.round(v * 0.8))
+                            )
+                          }
+                        >
+                          <Plus className="size-3.5" aria-hidden />
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          className="h-7 w-7 border-border/50"
+                          title="Zoom out timeline"
+                          aria-label="Zoom out timeline"
+                          disabled={
+                            timelineViewportMaxMs >= maxEndMsForToolbar * 4
+                          }
+                          onClick={() =>
+                            setTimelineViewportMaxMs((v) =>
+                              Math.min(
+                                maxEndMsForToolbar * 4,
+                                Math.round(v * 1.25)
+                              )
+                            )
+                          }
+                        >
+                          <Minus className="size-3.5" aria-hidden />
+                        </Button>
+                      </>
+                    }
+                    onToggleExpandAll={() => {
+                      if (isTimelineFullyExpanded) {
+                        setExpandedPromptIds(new Set());
+                        setExpandedStepIds(new Set());
+                      } else {
+                        setExpandedPromptIds(
+                          new Set(promptGroups.map((group) => group.key))
+                        );
+                        setExpandedStepIds(new Set(fullyExpandedStepIds));
+                      }
+                    }}
+                  />
+                ) : (
+                  <div className="text-xs font-medium text-muted-foreground">
+                    {effectiveViewMode === "raw"
+                      ? "Trace JSON"
+                      : effectiveViewMode === "tools"
+                      ? "Expected vs actual tools"
+                      : traceMessages.length > 0
+                      ? `${traceMessages.length} message${
+                          traceMessages.length !== 1 ? "s" : ""
+                        }`
+                      : "Trace"}
+                  </div>
+                )}
+              </div>
+              {!forcedViewMode ? (
+                <TraceViewModeTabs
+                  mode={
+                    effectiveViewMode === "browser" ||
+                    effectiveViewMode === "steps"
+                      ? "timeline"
+                      : effectiveViewMode
+                  }
+                  onModeChange={setViewMode}
+                  showToolsTab={hasEvalToolCalls}
+                  showStepsTab={hasSteps}
+                  stepsActive={effectiveViewMode === "steps"}
+                  onSelectSteps={() => setViewMode("steps")}
+                  showBrowserTab={hasBrowserArtifacts}
+                  browserActive={effectiveViewMode === "browser"}
+                  onSelectBrowser={() => setViewMode("browser")}
+                  appearance={compactChrome ? "segment" : "default"}
+                />
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        {traceInsight ? (
+          <div
+            className={cn(
+              "rounded-lg border border-border/50 bg-muted/15",
+              flexFillChrome && "shrink-0",
+              compactChrome ? "px-2 py-1.5 sm:px-2.5" : "px-2 py-2 sm:px-3"
+            )}
+            data-testid="trace-viewer-insight-slot"
+          >
+            {traceInsight}
+          </div>
+        ) : null}
+
+        {effectiveViewMode === "raw" && (
+          <div
+            className={cn(
+              "min-w-0 flex flex-col",
+              rawGrowWithContent
+                ? ""
+                : cn(
+                    "overflow-hidden",
+                    flexFillChrome
+                      ? "min-h-0 flex-1"
+                      : "min-h-0 max-h-[min(70vh,36rem)]"
+                  )
+            )}
+            data-testid="trace-viewer-raw-json"
+          >
+            <TraceRawView
+              trace={trace}
+              requestPayloadHistory={
+                rawRequestPayloadHistory ??
+                (persistedRequestPayloads.length
+                  ? { entries: persistedRequestPayloads, hasUiMessages: false }
+                  : null)
+              }
+              harnessBuiltinTools={harnessBuiltinTools}
+              growWithContent={rawGrowWithContent}
+              fadeScrollEdges={rawFadeScrollEdges}
+            />
+          </div>
+        )}
+
+        {effectiveViewMode === "browser" && (
+          <div
+            className={cn(
+              "min-w-0 flex flex-col",
+              flexFillChrome
+                ? "min-h-0 flex-1"
+                : "min-h-0 max-h-[min(70vh,36rem)]"
+            )}
+            data-testid="trace-viewer-browser"
+          >
+            <BrowserArtifactsView
+              observations={browserObservations}
+              steps={browserSteps}
+              videoUrl={browserVideoUrl}
+              videoMeta={browserVideoMeta}
+              isRunning={isLoading}
+              className={flexFillChrome ? "flex-1" : undefined}
+            />
+          </div>
+        )}
+
+        {effectiveViewMode === "steps" && (
+          <div
+            className={cn(
+              "min-w-0 flex flex-col overflow-y-auto",
+              flexFillChrome
+                ? "min-h-0 flex-1"
+                : "min-h-0 max-h-[min(70vh,36rem)]"
+            )}
+            data-testid="trace-viewer-steps"
+          >
+            <StepReplayView
+              steps={steps ?? []}
+              renderObservations={browserObservations}
+              interactionSteps={browserSteps}
+              stepStatusById={stepStatusById}
+              verdict={
+                iterationResult === "timed_out"
+                  ? "failed"
+                  : (iterationResult ?? null)
+              }
+              hoveredStepId={syncedStepId}
+              onHoverStep={onSyncStep}
+              onSelectStep={onSyncStep}
+              presentation={stepPresentation}
+              stepResults={stepResults}
+              verdictWord={verdictWord}
+            />
+          </div>
+        )}
+
+        {effectiveViewMode === "timeline" && (
+          <Suspense
+            fallback={
+              <div className="flex justify-center py-8">
+                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+              </div>
+            }
+          >
+            <div
+              className={cn(
+                flexFillChrome &&
+                  "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+              )}
+            >
+              <TraceTimelineLazy
+                recordedSpans={recordedSpans}
+                interactionSteps={browserSteps}
+                estimatedDurationMs={
+                  recordedSpans?.length ? undefined : estimatedDurationMs
+                }
+                transcriptMessageCount={
+                  recordedSpans?.length ? 0 : traceMessages.length
+                }
+                transcriptMessages={traceMessages}
+                traceStartedAtMs={traceStartedAtMs}
+                traceEndedAtMs={traceEndedAtMs}
+                onRevealInTranscript={
+                  hideTranscriptRevealControls
+                    ? undefined
+                    : handleRevealInTranscript
+                }
+                hideToolbar={hasRecordedSpans}
+                timelineFilter={hasRecordedSpans ? timelineFilter : undefined}
+                onTimelineFilterChange={
+                  hasRecordedSpans ? setTimelineFilter : undefined
+                }
+                expandedPromptIds={
+                  hasRecordedSpans ? expandedPromptIds : undefined
+                }
+                onExpandedPromptIdsChange={
+                  hasRecordedSpans ? setExpandedPromptIds : undefined
+                }
+                expandedStepIds={hasRecordedSpans ? expandedStepIds : undefined}
+                onExpandedStepIdsChange={
+                  hasRecordedSpans ? setExpandedStepIds : undefined
+                }
+                viewportMaxMs={
+                  hasRecordedSpans ? timelineViewportMaxMs : undefined
+                }
+                turnRuntimeByPromptIndex={turnRuntimeByPromptIndex}
+                fillContent={fillContent}
+              />
+            </div>
+          </Suspense>
+        )}
+
+        {effectiveViewMode === "chat" &&
+          (traceMessages.length === 0 ? (
+            <TranscriptEmptyState {...(isLoading
+              ? { kind: "streaming" as const }
+              : { kind: "unrecorded" as const, execution: hasRecordedSpans ? "observed" as const : "unknown" as const })} />
+          ) : (
+            <div
+              className={cn(
+                "min-w-0 flex flex-col",
+                frame === "inset" && "rounded-md border border-border/30 bg-background/50",
+                fillContent ? "min-h-0 flex-1 overflow-hidden" : "min-h-0"
+              )}
+              data-testid="trace-viewer-chat"
+            >
+              {(() => {
+                // With no explicit host inputs, inherit the caller's providers.
+                const threadEl = (
+                  <Thread
+                    chatSessionId={chatSessionId}
+                    messages={adaptedTrace.messages}
+                    sendFollowUpMessage={sendFollowUpMessage}
+                    model={resolvedModel}
+                    isLoading={isLoading}
+                    toolsMetadata={toolsMetadata}
+                    toolServerMap={toolServerMap}
+                    mcpToolResultImageRendering={mcpToolResultImageRendering}
+                    onWidgetStateChange={onWidgetStateChange}
+                    onModelContextUpdate={onModelContextUpdate}
+                    displayMode={displayMode}
+                    onDisplayModeChange={onDisplayModeChange}
+                    enableFullscreenChatOverlay={enableFullscreenChatOverlay}
+                    fullscreenChatPlaceholder={fullscreenChatPlaceholder}
+                    fullscreenChatDisabled={fullscreenChatDisabled}
+                    fullscreenChatSendBlocked={fullscreenChatSendBlocked}
+                    onFullscreenChatStop={onFullscreenChatStop}
+                    onFullscreenChange={onFullscreenChange}
+                    onToolApprovalResponse={onToolApprovalResponse}
+                    toolRenderOverrides={toolRenderOverrides}
+                    appToolInvocationsOverride={appToolInvocationsOverride}
+                    showInlineEdit={false}
+                    minimalMode={false}
+                    interactive={threadInteractive}
+                    recorder={recorder}
+                    reasoningDisplayMode={reasoningDisplayMode}
+                    widgetPolicy={widgetPolicy}
+                    renderAssistantTurnFooter={renderAssistantTurnFooter}
+                    focusMessageId={transcriptNavigation.focusMessageId}
+                    highlightedMessageIds={
+                      transcriptNavigation.highlightedMessageIds
+                    }
+                    navigationKey={transcriptNavigation.navigationKey}
+                    contentClassName={cn(TRANSCRIPT_COLUMN_CLASS, "pt-8 pb-8 space-y-8")}
+                    getMessageWrapperProps={({ message }) => {
+                      const sourceRange =
+                        adaptedTrace.uiMessageSourceRanges[message.id];
+                      return {
+                        "data-source-range": sourceRange
+                          ? `${sourceRange.startIndex}-${sourceRange.endIndex}`
+                          : undefined,
+                      };
+                    }}
+                  />
+                );
+                const scoped = shouldInstallTraceScope ? (
+                  <ActiveHostCapsResolverScope
+                    activeHost={activeHost ?? null}
+                    hostStyle={DEFAULT_TRACE_HOST_STYLE_FALLBACK}
+                  >
+                    {threadEl}
+                  </ActiveHostCapsResolverScope>
+                ) : (
+                  threadEl
+                );
+                // Live streaming (fillContent): keep StickToBottom so
+                // new messages auto-pin to the bottom inside the
+                // viewport-bounded shell. Static replay: render
+                // directly and let the surrounding page own scroll,
+                // starting from the first message.
+                if (!fillContent) return scoped;
+                return (
+                  <StickToBottom
+                    className="relative flex min-h-0 flex-1 flex-col"
+                    resize="smooth"
+                    initial="smooth"
+                  >
+                    <div className="relative flex-1 min-h-0">
+                      <StickToBottom.Content className="flex flex-col min-h-0">
+                        {scoped}
+                      </StickToBottom.Content>
+                      <ScrollToBottomButton />
+                    </div>
+                  </StickToBottom>
+                );
+              })()}
+            </div>
+          ))}
+
+        {effectiveViewMode === "tools" && hasEvalToolCalls ? (
+          <div
+            className="flex min-h-0 min-w-0 flex-1 flex-col gap-2"
+            data-testid="trace-viewer-tools-compare"
+          >
+            {toolsCompareLayout === "diff" ? (
+              <ToolCallsDiffView
+                expected={expectedToolCalls}
+                actual={actualToolCalls}
+                isLoading={isLoading}
+                headerTrailing={toolsCompareLayoutToggle}
+              />
+            ) : (
+              <>
+                <div className="flex shrink-0 items-center justify-end">
+                  {toolsCompareLayoutToggle}
+                </div>
+                <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 md:flex-row">
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2 rounded-md border border-border/40 bg-muted/10 p-3">
+                    <div className="shrink-0 text-xs font-medium uppercase text-muted-foreground">
+                      Expected
+                    </div>
+                    {expectedToolCalls.length === 0 ? (
+                      <div className="text-xs italic text-muted-foreground">
+                        No expected tool calls
+                      </div>
+                    ) : (
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-border/30 bg-background/50">
+                        <JsonEditor
+                          value={expectedToolCalls}
+                          viewOnly
+                          collapsible
+                          defaultExpandDepth={2}
+                          collapseStringsAfterLength={160}
+                          height="100%"
+                          className="min-h-0"
+                        />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2 rounded-md border border-border/40 bg-muted/10 p-3">
+                    <div className="flex shrink-0 items-center gap-1.5 text-xs font-medium uppercase text-muted-foreground">
+                      Actual
+                      {isLoading ? (
+                        <Loader2
+                          className="h-3 w-3 shrink-0 animate-spin"
+                          aria-hidden
+                          data-testid="trace-viewer-actual-loading"
+                        />
+                      ) : null}
+                    </div>
+                    {actualToolCalls.length === 0 ? (
+                      <div className="text-xs italic text-muted-foreground">
+                        No tool calls made
+                      </div>
+                    ) : (
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-border/30 bg-background/50">
+                        <JsonEditor
+                          value={actualToolCalls.map(
+                            ({ toolName, arguments: args }) => ({
+                              toolName,
+                              arguments: args,
+                            })
+                          )}
+                          viewOnly
+                          collapsible
+                          defaultExpandDepth={2}
+                          collapseStringsAfterLength={160}
+                          height="100%"
+                          className="min-h-0"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+
+  return hostSnapshot !== undefined ? (
+    <HostStyledShell
+      hostSnapshot={hostSnapshot}
+      activeHost={activeHost ?? null}
+      className={cn(flexFillChrome && "flex min-h-0 min-w-0 flex-1 flex-col")}
+    >
+      {content}
+    </HostStyledShell>
+  ) : (
+    content
+  );
+}

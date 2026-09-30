@@ -1,0 +1,5891 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-batch hybrid pinned (toolCall + prompt): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Pinned tool call: show_map on "srv-1"",
+        "runs": 1,
+        "steps": [
+          {
+            "arguments": {
+              "city": "SF",
+            },
+            "id": "turn-1",
+            "kind": "toolCall",
+            "serverName": "srv-1",
+            "toolName": "show_map",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Describe the widget",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [
+              {
+                "arguments": {
+                  "city": "SF",
+                },
+                "toolName": "show_map",
+              },
+            ],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[]",
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Describe the widget",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":1,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Pinned tool call: show_map on \\"srv-1\\""},{"role":"assistant","content":"Pinned tool call show_map executed"},{"role":"user","content":"Describe the widget"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+          {
+            "content": "Describe the widget",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-1-step-0",
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [
+        {
+          "arguments": {
+            "city": "SF",
+          },
+          "toolName": "show_map",
+        },
+      ],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 1,
+          "identifierSignals": {
+            "reason": "resultsUnavailable",
+            "state": "notMeasured",
+          },
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "measured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "toolCall",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-batch hybrid pinned setup failure (server not connected): convex payload + status > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Pinned tool call: search on "Asana"",
+        "runs": 1,
+        "steps": [
+          {
+            "arguments": {
+              "q": "x",
+            },
+            "id": "turn-1",
+            "kind": "toolCall",
+            "serverName": "Asana",
+            "toolName": "search",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Describe it",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: search on "Asana"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call skipped: server "Asana" not connected",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Describe it",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: search on "Asana"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call skipped: server "Asana" not connected",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": "pinned_server_not_connected: "Asana" is not connected in this run's environment",
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "failureCategory": "setup",
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 0,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 0,
+        "skippedSteps": [
+          {
+            "kind": "prompt",
+            "reason": "step 0 errored: pinned_server_not_connected: "Asana" is not connected in this run's environment",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "unknown",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "setupAborted",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "selection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "toolCall",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "reason": "step 0 errored: pinned_server_not_connected: "Asana" is not connected in this run's environment",
+            "status": "skipped",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "setup_failed",
+      "tokensUsed": 0,
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_failed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-batch multi-turn: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Hello",
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Again",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":0,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Hello"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-0-step-0",
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Again",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":1,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":[{"type":"text","text":"Done"}]},{"role":"user","content":"Again"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+          {
+            "content": "Again",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-1-step-0",
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 2,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 4,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 6,
+      "usage": {
+        "inputTokens": 2,
+        "outputTokens": 4,
+        "totalTokens": 6,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-batch prompt-only: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Hello",
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":0,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Hello"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-0-step-0",
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-stream hybrid pinned (toolCall + prompt): events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Pinned tool call: show_map on "srv-1"",
+        "runs": 1,
+        "steps": [
+          {
+            "arguments": {
+              "city": "SF",
+            },
+            "id": "turn-1",
+            "kind": "toolCall",
+            "serverName": "srv-1",
+            "toolName": "show_map",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Describe the widget",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [
+              {
+                "arguments": {
+                  "city": "SF",
+                },
+                "toolName": "show_map",
+              },
+            ],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[]",
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Describe the widget",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":1,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Pinned tool call: show_map on \\"srv-1\\""},{"role":"assistant","content":"Pinned tool call show_map executed"},{"role":"user","content":"Describe the widget"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+          {
+            "content": "Describe the widget",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-1-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 3,
+            "messageStartIndex": 3,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-1-step-0",
+            "promptIndex": 1,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [
+        {
+          "arguments": {
+            "city": "SF",
+          },
+          "toolName": "show_map",
+        },
+      ],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 1,
+          "identifierSignals": {
+            "reason": "resultsUnavailable",
+            "state": "notMeasured",
+          },
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "measured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stepResults": [
+          {
+            "kind": "toolCall",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-stream hybrid pinned (toolCall + prompt): events + convex payload > events 1`] = `
+[
+  {
+    "kind": "toolCall",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "toolCall",
+    "status": "running",
+    "type": "step_status",
+  },
+  "tool_call",
+  "tool_result",
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "toolCall",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "toolCall",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  "text_delta",
+  "step_finish",
+  "trace_snapshot",
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-stream prompt-only: events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "claude-haiku-4.5",
+        "provider": "anthropic",
+        "query": "Hello",
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "anthropic/claude-haiku-4.5",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "requestPayloadsJson": "[{"turnId":"trace_turn_<scrubbed>","promptIndex":0,"stepIndex":0,"payload":{"system":"","tools":{},"messages":[{"role":"user","content":"Hello"}]}}]",
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": [
+              {
+                "text": "Done",
+                "type": "text",
+              },
+            ],
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "step",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "Step 1",
+            "outputTokens": 2,
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+          {
+            "category": "llm",
+            "endMs": "<scrubbed>",
+            "finishReason": "stop",
+            "id": "eval-backend-prompt-0-step-0-llm",
+            "inputTokens": 1,
+            "messageEndIndex": 1,
+            "messageStartIndex": 1,
+            "modelId": "anthropic/claude-haiku-4.5",
+            "name": "anthropic/claude-haiku-4.5 · response",
+            "outputTokens": 2,
+            "parentId": "eval-backend-prompt-0-step-0",
+            "promptIndex": 0,
+            "provider": "anthropic",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+            "stepIndex": 0,
+            "totalTokens": 3,
+            "ttfcMs": "<scrubbed>",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > hosted-stream prompt-only: events + convex payload > events 1`] = `
+[
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  "text_delta",
+  "step_finish",
+  "trace_snapshot",
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch case predicate + per-turn check (ordering): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+          {
+            "assertion": {
+              "needle": "Done",
+              "type": "responseContains",
+            },
+            "id": "turn-1-check-0",
+            "kind": "assert",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "predicateResults": [
+              {
+                "passed": true,
+                "predicate": {
+                  "needle": "Done",
+                  "type": "responseContains",
+                },
+                "reason": "final assistant message contains "Done"",
+                "scope": {
+                  "kind": "turn",
+                  "promptIndex": 0,
+                },
+              },
+            ],
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "predicates": [
+          {
+            "passed": true,
+            "predicate": {
+              "type": "finalAssistantMessageNonEmpty",
+            },
+            "reason": "final assistant message is non-empty",
+          },
+          {
+            "passed": true,
+            "predicate": {
+              "needle": "Done",
+              "type": "responseContains",
+            },
+            "reason": "final assistant message contains "Done"",
+            "scope": {
+              "kind": "turn",
+              "promptIndex": 0,
+            },
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "reached",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "observed",
+            "stage": "userValue",
+            "state": "passed",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "assert",
+            "reason": "final assistant message contains "Done"",
+            "status": "ok",
+            "stepId": "turn-1-check-0",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch interact fires widget tool call (merged into matcher): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [
+          {
+            "arguments": {
+              "id": 1,
+            },
+            "toolName": "add-to-cart",
+          },
+        ],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Add it",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Add it",
+          },
+          {
+            "assertion": {
+              "args": {
+                "args": {
+                  "id": 1,
+                },
+              },
+              "toolName": "add-to-cart",
+              "type": "toolCalledWith",
+            },
+            "id": "turn-1-expect-0",
+            "kind": "assert",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "browserInteractionSteps": [
+          {
+            "action": "left_click",
+            "elapsedMs": 15,
+            "locatorLabel": "role=button[name="Add to cart"]",
+            "source": "scripted",
+            "stepIndex": 0,
+            "toolCallId": "tc-1",
+            "ts": 2,
+            "widgetToolCalls": [
+              {
+                "args": {
+                  "id": 1,
+                },
+                "elapsedMs": 10,
+                "name": "add-to-cart",
+                "ok": true,
+              },
+            ],
+          },
+        ],
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [
+              {
+                "arguments": {
+                  "id": 1,
+                },
+                "toolName": "add-to-cart",
+              },
+            ],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [
+              {
+                "arguments": {
+                  "id": 1,
+                },
+                "toolName": "add-to-cart",
+              },
+            ],
+            "missing": [],
+            "passed": true,
+            "predicateResults": [
+              {
+                "passed": false,
+                "predicate": {
+                  "args": {
+                    "args": {
+                      "id": 1,
+                    },
+                  },
+                  "toolName": "add-to-cart",
+                  "type": "toolCalledWith",
+                },
+                "reason": "expected tool "add-to-cart" called ≥1× with {"id":1} (partial match), but it was never called",
+                "scope": {
+                  "kind": "turn",
+                  "promptIndex": 0,
+                },
+              },
+            ],
+            "prompt": "Add it",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Add it",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgetRenderObservations": [
+          {
+            "elapsedMs": 50,
+            "serverId": "srv-1",
+            "status": "rendered",
+            "toolCallId": "tc-1",
+            "toolName": "search-products",
+            "ts": 1,
+          },
+        ],
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [
+        {
+          "arguments": {
+            "id": 1,
+          },
+          "toolName": "add-to-cart",
+        },
+      ],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "failureCategory": "userValue",
+        "firstFailedStage": "userValue",
+        "frictionSignals": {
+          "callCount": 1,
+          "identifierSignals": {
+            "reason": "resultsUnavailable",
+            "state": "notMeasured",
+          },
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "measured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "predicates": [
+          {
+            "passed": false,
+            "predicate": {
+              "args": {
+                "args": {
+                  "id": 1,
+                },
+              },
+              "toolName": "add-to-cart",
+              "type": "toolCalledWith",
+            },
+            "reason": "expected tool "add-to-cart" called ≥1× with {"id":1} (partial match), but it was never called",
+            "scope": {
+              "kind": "turn",
+              "promptIndex": 0,
+            },
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "reached",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "evidence": {
+              "predicateReasons": [
+                "expected tool "add-to-cart" called ≥1× with {"id":1} (partial match), but it was never called",
+              ],
+            },
+            "reason": "predicateFailed",
+            "stage": "userValue",
+            "state": "failed",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "assert",
+            "reason": "expected tool "add-to-cart" called ≥1× with {"id":1} (partial match), but it was never called",
+            "status": "fail",
+            "stepId": "turn-1-expect-0",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch model-free pinned (setup failure: server not connected): convex payload + status > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Pinned tool call: search on "Asana"",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "arguments": {
+              "q": "x",
+            },
+            "id": "turn-1",
+            "kind": "toolCall",
+            "serverName": "Asana",
+            "toolName": "search",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "eval/unknown",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: search on "Asana"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call skipped: server "Asana" not connected",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": "pinned_server_not_connected: "Asana" is not connected in this run's environment",
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "failureCategory": "setup",
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 0,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 0,
+        "predicates": [
+          {
+            "passed": false,
+            "predicate": {
+              "type": "widgetRendered",
+            },
+            "reason": "no widget render observations recorded",
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "setupAborted",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "selection",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "setupAborted",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "toolCall",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "setup_failed",
+      "tokensUsed": 0,
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_failed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch multi-turn: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Again",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Again",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+          {
+            "content": "Again",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 2,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 4,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 6,
+      "usage": {
+        "inputTokens": 2,
+        "outputTokens": 4,
+        "totalTokens": 6,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch negative test (no forbidden calls): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": true,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "reached",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "evidence": {
+              "promptIndexes": [
+                0,
+              ],
+            },
+            "reason": "observed",
+            "stage": "call",
+            "state": "passed",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch prompt-only: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch tool call matches expected: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [
+          {
+            "arguments": {
+              "q": "x",
+            },
+            "toolName": "search",
+          },
+        ],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Search",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Search",
+          },
+          {
+            "assertion": {
+              "args": {
+                "args": {
+                  "q": "x",
+                },
+              },
+              "toolName": "search",
+              "type": "toolCalledWith",
+            },
+            "id": "turn-1-expect-0",
+            "kind": "assert",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [
+              {
+                "arguments": {
+                  "q": "x",
+                },
+                "toolName": "search",
+              },
+            ],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [
+              {
+                "arguments": {
+                  "q": "x",
+                },
+                "toolName": "search",
+              },
+            ],
+            "missing": [],
+            "passed": true,
+            "predicateResults": [
+              {
+                "passed": true,
+                "predicate": {
+                  "args": {
+                    "args": {
+                      "q": "x",
+                    },
+                  },
+                  "toolName": "search",
+                  "type": "toolCalledWith",
+                },
+                "reason": "tool "search" called with matching args (1/1 required; partial match)",
+                "scope": {
+                  "kind": "turn",
+                  "promptIndex": 0,
+                },
+              },
+            ],
+            "prompt": "Search",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Search",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [
+        {
+          "arguments": {
+            "q": "x",
+          },
+          "toolName": "search",
+        },
+      ],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 1,
+          "identifierSignals": {
+            "reason": "resultsUnavailable",
+            "state": "notMeasured",
+          },
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "measured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "predicates": [
+          {
+            "passed": true,
+            "predicate": {
+              "args": {
+                "args": {
+                  "q": "x",
+                },
+              },
+              "toolName": "search",
+              "type": "toolCalledWith",
+            },
+            "reason": "tool "search" called with matching args (1/1 required; partial match)",
+            "scope": {
+              "kind": "turn",
+              "promptIndex": 0,
+            },
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "reached",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "userValue",
+            "state": "passed",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "assert",
+            "reason": "tool "search" called with matching args (1/1 required; partial match)",
+            "status": "ok",
+            "stepId": "turn-1-expect-0",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch tool error, failOnToolError:false → passed: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": {
+          "failOnToolError": false,
+        },
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+          {
+            "content": [
+              {
+                "isError": true,
+                "output": {
+                  "type": "error-text",
+                  "value": "boom",
+                },
+                "toolCallId": "tc-err",
+                "toolName": "search",
+                "type": "tool-result",
+              },
+            ],
+            "role": "tool",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch tool error, failOnToolError:true → failed: convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": {
+          "failOnToolError": true,
+        },
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+          {
+            "content": [
+              {
+                "isError": true,
+                "output": {
+                  "type": "error-text",
+                  "value": "boom",
+                },
+                "toolCallId": "tc-err",
+                "toolName": "search",
+                "type": "tool-result",
+              },
+            ],
+            "role": "tool",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch unrendered widget fail-closed (scriptedCheckFailures gate): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-batch widget rendered (widgetRendered predicate passes): convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [
+          {
+            "category": "connection",
+            "endMs": "<scrubbed>",
+            "id": "run-connect-srv-1",
+            "name": "connect",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+          {
+            "category": "discovery",
+            "endMs": "<scrubbed>",
+            "id": "run-toolslist-srv-1",
+            "name": "tools/list",
+            "serverId": "srv-1",
+            "startMs": "<scrubbed>",
+            "status": "ok",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgetRenderObservations": [
+          {
+            "elapsedMs": 50,
+            "serverId": "srv-1",
+            "status": "rendered",
+            "toolCallId": "tc-1",
+            "toolName": "search-products",
+            "ts": 1,
+          },
+        ],
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "predicates": [
+          {
+            "passed": true,
+            "predicate": {
+              "type": "widgetRendered",
+            },
+            "reason": "widget rendered (1/1 observation(s))",
+          },
+        ],
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "reached",
+              "stage": "connection",
+            },
+            {
+              "reach": "reached",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "reached",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "observed",
+            "stage": "connection",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "discovery",
+            "state": "passed",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "observed",
+            "stage": "userValue",
+            "state": "passed",
+          },
+        ],
+        "stageSetupAudit": {
+          "egressCanary": {
+            "ran": false,
+          },
+          "signals": {
+            "connection": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+            "discovery": {
+              "durationMs": "<scrubbed>",
+              "outcome": "ok",
+            },
+          },
+        },
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream hybrid pinned (toolCall + prompt): events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Pinned tool call: show_map on "srv-1"",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "arguments": {
+              "city": "SF",
+            },
+            "id": "turn-1",
+            "kind": "toolCall",
+            "serverName": "srv-1",
+            "toolName": "show_map",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Describe the widget",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [
+              {
+                "arguments": {
+                  "city": "SF",
+                },
+                "toolName": "show_map",
+              },
+            ],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Describe the widget",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Pinned tool call: show_map on "srv-1"",
+            "role": "user",
+          },
+          {
+            "content": "Pinned tool call show_map executed",
+            "role": "assistant",
+          },
+          {
+            "content": "Describe the widget",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [
+        {
+          "arguments": {
+            "city": "SF",
+          },
+          "toolName": "show_map",
+        },
+      ],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 1,
+          "identifierSignals": {
+            "reason": "resultsUnavailable",
+            "state": "notMeasured",
+          },
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "measured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "call",
+            },
+            {
+              "reach": "unknown",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "call",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "executorEmitsNoSpans",
+            "stage": "response",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stepResults": [
+          {
+            "kind": "toolCall",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream hybrid pinned (toolCall + prompt): events + convex payload > events 1`] = `
+[
+  {
+    "kind": "toolCall",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "toolCall",
+    "status": "running",
+    "type": "step_status",
+  },
+  "tool_call",
+  "tool_result",
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "toolCall",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "toolCall",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream multi-turn: events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+          {
+            "id": "turn-2",
+            "kind": "prompt",
+            "prompt": "Again",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 1,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Again",
+            "promptIndex": 1,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+          {
+            "content": "Again",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 2,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "multiTurn": true,
+        "outputTokens": 4,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-2",
+            "stepIndex": 1,
+          },
+        ],
+        "turnCount": 2,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 6,
+      "usage": {
+        "inputTokens": 2,
+        "outputTokens": 4,
+        "totalTokens": 6,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream multi-turn: events + convex payload > events 1`] = `
+[
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream prompt-only throw path: events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+        ],
+        "spans": [
+          {
+            "category": "error",
+            "endMs": "<scrubbed>",
+            "id": "eval-ai-err-<scrubbed>",
+            "name": "Generation error",
+            "promptIndex": 0,
+            "startMs": "<scrubbed>",
+            "status": "error",
+          },
+        ],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": "provider stream exploded",
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 0,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 0,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "failed",
+      "resultSource": "reported",
+      "status": "failed",
+      "tokensUsed": 0,
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_failed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream prompt-only throw path: events + convex payload > events 1`] = `
+[
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "trace_snapshot",
+  "error",
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream prompt-only: events + convex payload > convex 1`] = `
+[
+  {
+    "payload": {
+      "iterationNumber": 1,
+      "startedAt": "<scrubbed>",
+      "testCaseId": "case-1",
+      "testCaseSnapshot": {
+        "advancedConfig": undefined,
+        "expectedOutput": undefined,
+        "expectedToolCalls": [],
+        "hostConfigOverride": undefined,
+        "isNegativeTest": undefined,
+        "matchOptions": undefined,
+        "model": "gpt-4-turbo",
+        "passThreshold": undefined,
+        "provider": "openai",
+        "query": "Hello",
+        "repetitions": undefined,
+        "runs": 1,
+        "steps": [
+          {
+            "id": "turn-1",
+            "kind": "prompt",
+            "prompt": "Hello",
+          },
+        ],
+        "title": "Case",
+      },
+    },
+    "ref": "testSuites:startQuickRunIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "lastActivityAt": "<scrubbed>",
+      "modelId": "gpt-4-turbo",
+      "modelSource": "mcpjam",
+      "startedAt": "<scrubbed>",
+      "turn": {
+        "promptIndex": 0,
+        "prompts": [
+          {
+            "actualToolCalls": [],
+            "argumentMismatches": [],
+            "expectedOutput": undefined,
+            "expectedToolCalls": [],
+            "missing": [],
+            "passed": true,
+            "prompt": "Hello",
+            "promptIndex": 0,
+            "unexpected": [],
+          },
+        ],
+        "sessionMessages": [
+          {
+            "content": "Hello",
+            "role": "user",
+          },
+          {
+            "content": "Done",
+            "role": "assistant",
+          },
+        ],
+        "spans": [],
+        "turnEndedAt": "<scrubbed>",
+        "turnStartedAt": "<scrubbed>",
+        "widgets": [],
+      },
+    },
+    "ref": "testSuites:appendEvalTurnTrace",
+  },
+  {
+    "payload": {
+      "actualToolCalls": [],
+      "error": undefined,
+      "errorDetails": undefined,
+      "iterationId": "iter-1",
+      "metadata": {
+        "argumentMismatchCount": 0,
+        "endedWithQuestion": false,
+        "failedTurnCount": 0,
+        "frictionSignals": {
+          "callCount": 0,
+          "identifierSignals": {
+            "reason": "noToolCalls",
+            "state": "notMeasured",
+          },
+          "notMeasuredReason": "noToolCalls",
+          "resultAvailableCount": 0,
+          "signals": [],
+          "state": "notMeasured",
+          "timedCallCount": 0,
+          "version": 1,
+        },
+        "inputTokens": 1,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "outputTokens": 2,
+        "stageAnalyzerVersion": 11,
+        "stageMeasurements": {
+          "rows": [
+            {
+              "reach": "unknown",
+              "stage": "connection",
+            },
+            {
+              "reach": "unknown",
+              "stage": "discovery",
+            },
+            {
+              "reach": "reached",
+              "stage": "selection",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "call",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "response",
+            },
+            {
+              "reach": "notApplicable",
+              "stage": "userValue",
+            },
+          ],
+          "schemaVersion": 1,
+          "stageAnalyzerVersion": 11,
+        },
+        "stageResults": [
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "connection",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "noEvidenceCaptured",
+            "stage": "discovery",
+            "state": "notMeasured",
+          },
+          {
+            "reason": "observed",
+            "stage": "selection",
+            "state": "passed",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "call",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "response",
+            "state": "notApplicable",
+          },
+          {
+            "reason": "notAuthored",
+            "stage": "userValue",
+            "state": "notApplicable",
+          },
+        ],
+        "stepResults": [
+          {
+            "kind": "prompt",
+            "status": "ok",
+            "stepId": "turn-1",
+            "stepIndex": 0,
+          },
+        ],
+        "turnCount": 1,
+        "unexpectedCount": 0,
+      },
+      "result": "passed",
+      "resultSource": "reported",
+      "status": "completed",
+      "tokensUsed": 3,
+      "usage": {
+        "inputTokens": 1,
+        "outputTokens": 2,
+        "totalTokens": 3,
+      },
+    },
+    "ref": "testSuites:updateTestIteration",
+  },
+  {
+    "payload": {
+      "iterationId": "iter-1",
+      "reason": "eval_completed",
+    },
+    "ref": "testSuites:lockEvalSession",
+  },
+]
+`;
+
+exports[`runner parity (golden Convex payload + event sequence) > local-stream prompt-only: events + convex payload > events 1`] = `
+[
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "turn_start",
+  {
+    "kind": "prompt",
+    "status": "running",
+    "type": "step_status",
+  },
+  "trace_snapshot",
+  "turn_finish",
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+  {
+    "kind": "prompt",
+    "status": "ok",
+    "type": "step_status",
+  },
+]
+`;

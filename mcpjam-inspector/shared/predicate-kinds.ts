@@ -1,0 +1,551 @@
+/**
+ * Predicate kind metadata shared between client authoring UI and migration helpers.
+ */
+
+import type { Predicate } from "@/shared/eval-matching";
+import {
+  describeMatchExpectation,
+  isObservationPredicateKind,
+  isTurnScopablePredicateKind,
+  OBSERVATION_PREDICATE_KINDS,
+  parseMatchPath,
+  TURN_SCOPABLE_PREDICATE_KINDS,
+} from "@mcpjam/sdk/predicates";
+
+export { isObservationPredicateKind, OBSERVATION_PREDICATE_KINDS };
+
+export type PredicateKind = Predicate["type"];
+
+/**
+ * What a failing assertion does to the iteration, as the UI names it.
+ *
+ * Two tiers, named by consequence rather than by mechanism: `required` fails
+ * the iteration, `advisory` is shown on the result and never fails it. The
+ * wire spells the first one `"gating"` on historical rows and `"required"`
+ * canonically; `severity: "warn"` no longer splits advisory into two tiers.
+ *
+ * Declared here rather than in the authoring model so the two places that
+ * enumerate the set — {@link rolesForPredicateKind} and the scorer table's
+ * `ROLE_LEGEND` — cannot drift apart.
+ */
+export type ScorerUiRole = "required" | "advisory";
+
+/**
+ * The roles this kind's authoring control may offer.
+ *
+ * An observation is a heuristic, and a heuristic must not decide a release —
+ * so Required is not a segment it can reach. The schema refuses a gating
+ * observation on save; withholding the segment means an author never gets to
+ * click a control that is going to be rejected.
+ */
+export function rolesForPredicateKind(
+  kind: PredicateKind,
+): readonly ScorerUiRole[] {
+  return isObservationPredicateKind(kind)
+    ? (["advisory"] as const)
+    : (["required", "advisory"] as const);
+}
+
+export const PREDICATE_KIND_LABELS: Record<PredicateKind, string> = {
+  toolDescriptionsPresent: "Tool descriptions meet the minimum length",
+  toolAnnotationsPresent: "Every tool declares annotations",
+  toolNamesUnique: "Tool names are unique within each server",
+  noDeprecatedToolExposed: "No tool description marks itself deprecated",
+  toolInputSchemasWellFormed:
+    "Input schemas have an object root and documented parameters",
+  toolOutputSchemasPresent: "Every tool declares an output schema",
+
+  toolCalledWith: "Tool was called with…",
+  toolCalledAtLeastOnce: "Tool was called at least once",
+  toolNeverCalled: "Tool was never called",
+  onlyToolsCalled: "Only these tools may be called",
+  firstToolWas: "First tool called was…",
+  responseContains: "Response contains…",
+  responseCloseTo: "Response close to…",
+  responseMatches: "Response matches regex…",
+  noToolErrors: "No tool errors",
+  finalAssistantMessageNonEmpty: "Final message non-empty",
+  tokenBudgetUnder: "Token budget under N",
+  widgetRendered: "View rendered",
+  widgetRenderLatencyUnder: "View rendered under N ms",
+  widgetNoConsoleErrors: "No view console errors",
+  // "Fewer than", not "maximum": the comparator is a strict `<`, so
+  // `turnCountUnder: 3` passes at 2 turns and fails at 3. "Maximum 3" would
+  // read as inclusive and mislead every author who set it.
+  turnCountUnder: "Fewer than N user turns",
+  // Says what was SEEN, not what it means. "Ended by asking the user
+  // something" is true of an offer and of a request for a missing parameter,
+  // and this label must not pick one — the check cannot tell them apart.
+  noEndingQuestion: "Final message does not end with a question",
+  // ── Response: what the server answered with ─────────────────────────────
+  toolLatencyUnder: "Tool call under N ms",
+  toolResultContains: "Tool result contains…",
+  toolResultMatches: "Tool output matches pattern(s)",
+  toolResultMatchesSchema: "Tool result matches schema…",
+  toolResultSizeUnder: "Tool result under N bytes",
+  // Labels say what was SEEN. None of the observations below may name what it
+  // means: a repeat is what a poll loop looks like, a full page is not proof
+  // that more results exist, and an error that names no input may still be
+  // the best error a server can write.
+  toolErrorNamesInput: "Tool errors name an input",
+  fullPageHasContinuation: "Full pages carry continuation metadata",
+  // ── Tool call: was the call itself well formed ──────────────────────────
+  argumentsMatchToolSchema: "Arguments match the tool's schema",
+  toolInputMatches: "Tool input matches pattern(s)",
+  noRepeatedIdenticalCall: "No identical call repeated back-to-back",
+  // ── Selection: which tools the run reached ──────────────────────────────
+  toolCallCountUnder: "Fewer than N tool calls",
+  toolCalledBefore: "Tool called before another tool",
+  noDeprecatedToolCalled: "No tool marked deprecated was called",
+  noDestructiveToolCalled: "No tool marked destructive was called",
+};
+
+/**
+ * The TURN-SCOPED variant of {@link PREDICATE_KIND_LABELS} — not a fork of it.
+ *
+ * Only the kinds whose meaning actually narrows when they are evaluated at a
+ * point in the flow rather than over the finished transcript appear here: "no
+ * tool errors" over the whole run and "no tool errors *so far*" are different
+ * claims, and a step-scoped row that borrowed the whole-run wording would
+ * overstate what it checked. Every other kind falls through to the canonical
+ * label via {@link labelForInlineAssert}, so adding a predicate kind needs no
+ * entry here unless it has that same scope-sensitivity.
+ */
+export const INLINE_ASSERT_LABELS: Partial<Record<PredicateKind, string>> = {
+  noToolErrors: "No tool errors so far",
+  widgetNoConsoleErrors: "No view console errors so far",
+};
+
+export const STEP_ASSERT_PREDICATE_KINDS: readonly PredicateKind[] = [
+  ...TURN_SCOPABLE_PREDICATE_KINDS,
+] as PredicateKind[];
+
+export function isScenarioPredicateKind(kind: PredicateKind): boolean {
+  return isTurnScopablePredicateKind(kind) && kind !== "tokenBudgetUnder";
+}
+
+export const PREDICATE_KIND_ORDER: PredicateKind[] = [
+  "toolDescriptionsPresent",
+  "toolAnnotationsPresent",
+  "toolNamesUnique",
+  "noDeprecatedToolExposed",
+  "toolInputSchemasWellFormed",
+  "toolOutputSchemasPresent",
+
+  "toolCalledWith",
+  "toolCalledAtLeastOnce",
+  "toolNeverCalled",
+  "onlyToolsCalled",
+  "firstToolWas",
+  "responseContains",
+  "responseCloseTo",
+  "responseMatches",
+  "noToolErrors",
+  "finalAssistantMessageNonEmpty",
+  "tokenBudgetUnder",
+  "turnCountUnder",
+  "widgetRendered",
+  "widgetRenderLatencyUnder",
+  "widgetNoConsoleErrors",
+  "noEndingQuestion",
+  "toolLatencyUnder",
+  "toolResultSizeUnder",
+  "toolResultContains",
+  "toolResultMatches",
+  "toolResultMatchesSchema",
+  "toolErrorNamesInput",
+  "fullPageHasContinuation",
+  "argumentsMatchToolSchema",
+  "toolInputMatches",
+  "noRepeatedIdenticalCall",
+  "toolCallCountUnder",
+  "toolCalledBefore",
+  "noDeprecatedToolCalled",
+  "noDestructiveToolCalled",
+];
+
+export const SYNTHETIC_MONITOR_KINDS: ReadonlySet<PredicateKind> = new Set([
+  "widgetRendered",
+  "widgetRenderLatencyUnder",
+  "widgetNoConsoleErrors",
+]);
+
+export const GLOBAL_POLICY_MENU_KINDS: readonly PredicateKind[] = [
+  "tokenBudgetUnder",
+  "noToolErrors",
+  "widgetNoConsoleErrors",
+];
+
+/** Authoring catalog for whole-run global gates — short labels + tooltip copy. */
+export type GlobalGateCatalogEntry = {
+  kind: PredicateKind;
+  label: string;
+  /** One-line summary (tooltip title line). */
+  description: string;
+  /** Longer tooltip body for progressive disclosure. */
+  detail: string;
+};
+
+export const GLOBAL_GATES_SECTION_HELP = {
+  title: "Whole-run checks",
+  paragraphs: [
+    "Whole-run rules evaluated after the scenario finishes, using the full transcript.",
+    "Step checks run inline at a specific point in the flow. Use those for conversation and view assertions.",
+    "Case checks extend suite defaults. Add here only for policies that must hold across the entire run.",
+  ],
+} as const;
+
+export const GLOBAL_GATE_CATALOG: GlobalGateCatalogEntry[] = [
+  {
+    kind: "tokenBudgetUnder",
+    label: "Token budget",
+    description: "Keep total tokens under a limit",
+    detail:
+      "Counts input and output tokens across the whole iteration. Fails when the total is greater than or equal to your limit.",
+  },
+  {
+    kind: "noToolErrors",
+    label: "No tool errors",
+    description: "No MCP or transport tool failures",
+    detail:
+      "Passes when no tool reported an error anywhere in the run — neither MCP isError nor a transport failure.",
+  },
+  {
+    kind: "widgetNoConsoleErrors",
+    label: "No view console errors",
+    description: "Rendered views must not log console errors",
+    detail:
+      "Passes when no rendered view logged console errors. Fails when the run recorded no view renders. Optionally limit to one view tool.",
+  },
+];
+
+/**
+ * True iff `kind` is a predicate kind THIS BUILD knows, checked as an own
+ * property rather than with `in` or a truthiness test on the lookup.
+ *
+ * Both of the lazier forms walk the prototype chain, so a persisted
+ * discriminator of `"__proto__"` or `"constructor"` — reachable, because
+ * `parseIterationPredicates` validates only that `type` is a string — resolves
+ * to an inherited object. That object is truthy, survives `??`, and then
+ * throws when React tries to render it as a text child. An unknown kind must
+ * degrade to its raw string, never to whatever `Object.prototype` has.
+ */
+export function isKnownPredicateKind(kind: string): kind is PredicateKind {
+  return Object.prototype.hasOwnProperty.call(PREDICATE_KIND_LABELS, kind);
+}
+
+export function isGlobalPolicyKind(kind: PredicateKind): boolean {
+  return (GLOBAL_POLICY_MENU_KINDS as readonly string[]).includes(kind);
+}
+
+export function globalGateLabel(kind: PredicateKind): string {
+  const entry = GLOBAL_GATE_CATALOG.find((g) => g.kind === kind);
+  return entry?.label ?? PREDICATE_KIND_LABELS[kind];
+}
+
+export function globalGateDescription(kind: PredicateKind): string | undefined {
+  return GLOBAL_GATE_CATALOG.find((g) => g.kind === kind)?.description;
+}
+
+export function globalGateDetail(kind: PredicateKind): string | undefined {
+  return GLOBAL_GATE_CATALOG.find((g) => g.kind === kind)?.detail;
+}
+
+export function labelForGlobalGate(kind: PredicateKind): string {
+  return globalGateLabel(kind);
+}
+
+export function labelForInlineAssert(kind: PredicateKind): string {
+  return INLINE_ASSERT_LABELS[kind] ?? PREDICATE_KIND_LABELS[kind];
+}
+
+export function blankPredicate(kind: PredicateKind): Predicate {
+  switch (kind) {
+    case "toolDescriptionsPresent":
+      return { type: kind, minLength: 20, role: "advisory", severity: "warn" };
+    case "toolAnnotationsPresent":
+    case "toolNamesUnique":
+    case "noDeprecatedToolExposed":
+    case "toolInputSchemasWellFormed":
+    case "toolOutputSchemasPresent":
+      return { type: kind, role: "advisory", severity: "warn" };
+    case "toolCalledWith":
+      return { type: "toolCalledWith", toolName: "", args: { args: {} } };
+    case "toolCalledAtLeastOnce":
+      return { type: "toolCalledAtLeastOnce", toolName: "" };
+    case "toolNeverCalled":
+      return { type: "toolNeverCalled", toolName: "" };
+    case "onlyToolsCalled":
+      // Blank, not empty-meaning-"no tool": an empty list is a real claim
+      // ("no tool was called"), and a freshly added check must not assert it
+      // before the author has said so. The editor requires a choice.
+      return { type: "onlyToolsCalled", toolNames: [] };
+    case "firstToolWas":
+      return { type: "firstToolWas", toolName: "" };
+    case "responseCloseTo":
+      return { type: "responseCloseTo", reference: "", maxDistance: 0.1 };
+    case "responseContains":
+      return { type: "responseContains", needle: "" };
+    case "responseMatches":
+      return { type: "responseMatches", pattern: "" };
+    case "noToolErrors":
+      return { type: "noToolErrors" };
+    case "finalAssistantMessageNonEmpty":
+      return { type: "finalAssistantMessageNonEmpty" };
+    case "tokenBudgetUnder":
+      return { type: "tokenBudgetUnder", tokens: 1000 };
+    case "turnCountUnder":
+      return { type: "turnCountUnder", turns: 10 };
+    case "widgetRendered":
+      return { type: "widgetRendered" };
+    case "widgetRenderLatencyUnder":
+      return { type: "widgetRenderLatencyUnder", ms: 3000 };
+    case "widgetNoConsoleErrors":
+      return { type: "widgetNoConsoleErrors" };
+    // Observations seed advisory because that is the only role they may
+    // carry — the schema refuses a gating one, so a blank that omitted the
+    // role would fail the very first save.
+    case "noEndingQuestion":
+      return { type: "noEndingQuestion", role: "advisory" };
+    case "toolLatencyUnder":
+      return { type: "toolLatencyUnder", ms: 3000 };
+    case "toolResultContains":
+      return { type: "toolResultContains", needle: "" };
+    // No `toolName`: omitted means every tool's results, and the editor's
+    // "Any tool" is that omission. Defaults stay unwritten, for the reason
+    // given at `toolInputMatches` below.
+    case "toolResultMatches":
+      return { type: "toolResultMatches", patterns: [""] };
+    case "toolResultMatchesSchema":
+      return {
+        type: "toolResultMatchesSchema",
+        schema: { type: "object" },
+      };
+    // Seeded as REPORT even though a byte ceiling is a measurement and may
+    // gate: a budget nobody has measured yet is a guess, and a guess that
+    // fails builds on its first run is how a useful check gets deleted.
+    case "toolResultSizeUnder":
+      return {
+        type: "toolResultSizeUnder",
+        maxBytes: 32_000,
+        role: "advisory",
+        severity: "warn",
+      };
+    case "argumentsMatchToolSchema":
+      return { type: "argumentsMatchToolSchema" };
+    // One empty pattern and nothing else. `min`, `max` and `flags` stay
+    // unwritten rather than seeded with their defaults: the predicate is the
+    // criterion's identity, so a blank that wrote `min: 1` would mint a
+    // different id from the same check authored anywhere that omits it.
+    case "toolInputMatches":
+      return { type: "toolInputMatches", toolName: "", patterns: [""] };
+    case "toolCallCountUnder":
+      return { type: "toolCallCountUnder", count: 10 };
+    case "toolCalledBefore":
+      return { type: "toolCalledBefore", toolName: "", beforeToolName: "" };
+    case "noDestructiveToolCalled":
+      return { type: "noDestructiveToolCalled" };
+    // Observations seed advisory — the schema refuses a gating one.
+    case "noRepeatedIdenticalCall":
+      return { type: "noRepeatedIdenticalCall", role: "advisory" };
+    case "noDeprecatedToolCalled":
+      return {
+        type: "noDeprecatedToolCalled",
+        role: "advisory",
+        severity: "warn",
+      };
+    case "toolErrorNamesInput":
+      return { type: "toolErrorNamesInput", role: "advisory" };
+    case "fullPageHasContinuation":
+      return { type: "fullPageHasContinuation", role: "advisory" };
+  }
+}
+
+/**
+ * Human label for one rubric criterion.
+ *
+ * `label` is the author's own words and always wins. When absent, the
+ * predicate itself is formatted with its distinguishing argument inlined —
+ * "Tool was called at least once" alone is useless on a scorecard with three
+ * such rows, so the tool name goes in the label.
+ *
+ * Accepts either a rubric entry or a bare predicate so the run scorecard
+ * (which receives `{label?, kind}` without the predicate) and the authoring
+ * form (which has the whole entry) can share one function.
+ */
+/** A number for a label, tolerant of a row whose payload lost the field. */
+function num(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toLocaleString()
+    : "?";
+}
+
+export function formatCriterion(
+  entry:
+    | { label?: string; predicate: Predicate }
+    | { label?: string; kind: PredicateKind },
+): string {
+  if (entry.label !== undefined && entry.label.trim().length > 0) {
+    return entry.label.trim();
+  }
+  if (!("predicate" in entry)) return PREDICATE_KIND_LABELS[entry.kind];
+
+  const predicate = entry.predicate;
+  const base = PREDICATE_KIND_LABELS[predicate.type];
+  switch (predicate.type) {
+    case "toolDescriptionsPresent":
+      return `Tool descriptions have at least ${num(predicate.minLength ?? 20)} characters`;
+    case "toolAnnotationsPresent":
+      return predicate.require?.length
+        ? `Tools declare boolean annotations: ${predicate.require.join(", ")}`
+        : base;
+    case "toolCalledWith":
+    case "toolCalledAtLeastOnce":
+    case "toolNeverCalled":
+    case "firstToolWas":
+      return predicate.toolName ? `${base} ${predicate.toolName}` : base;
+    case "onlyToolsCalled": {
+      // A bare `{ type }` reaches here from an older or newer build; an empty
+      // list is a REAL claim ("no tool"), so a missing one must not be read as
+      // making it. Fall back to the kind label instead.
+      const names = predicate.toolNames;
+      if (!Array.isArray(names)) return base;
+      return names.length === 0
+        ? "No tool should be called"
+        : `Only these tools may be called: ${names.join(", ")}`;
+    }
+    case "responseCloseTo":
+      return `Response distance ≤ ${num(predicate.maxDistance)} from reference`;
+    case "responseContains":
+      return `Response contains "${predicate.needle}"`;
+    case "responseMatches":
+      return `Response matches /${predicate.pattern}/`;
+    case "tokenBudgetUnder":
+      return `Token budget under ${predicate.tokens}`;
+    case "turnCountUnder":
+      return `Fewer than ${predicate.turns} user turns`;
+    case "widgetRenderLatencyUnder":
+      return predicate.toolName
+        ? `${predicate.toolName} rendered under ${predicate.ms} ms`
+        : `View rendered under ${predicate.ms} ms`;
+    case "widgetRendered":
+    case "widgetNoConsoleErrors":
+      return predicate.toolName ? `${base} (${predicate.toolName})` : base;
+    // `num()` rather than a bare `.toLocaleString()`: this formatter also runs
+    // over rows read back from storage, where a payload field can be missing
+    // (a corrupted row, a kind written by a newer build). A label is not worth
+    // a render crash.
+    case "toolLatencyUnder":
+      return predicate.toolName
+        ? `${predicate.toolName} answered under ${num(predicate.ms)} ms`
+        : `Every tool answered under ${num(predicate.ms)} ms`;
+    case "toolResultSizeUnder":
+      return predicate.toolName
+        ? `${predicate.toolName} result under ${num(predicate.maxBytes)} bytes`
+        : `Every tool result under ${num(predicate.maxBytes)} bytes`;
+    case "toolResultContains":
+      return predicate.toolName
+        ? `${predicate.toolName} result contains "${predicate.needle ?? ""}"`
+        : `A tool result contains "${predicate.needle ?? ""}"`;
+    case "toolResultMatchesSchema":
+      return predicate.toolName
+        ? `${predicate.toolName} result matches the authored schema`
+        : `Every tool result matches the authored schema`;
+    case "toolErrorNamesInput":
+    case "fullPageHasContinuation":
+    case "argumentsMatchToolSchema":
+    case "noRepeatedIdenticalCall":
+      return predicate.toolName ? `${base} (${predicate.toolName})` : base;
+    case "toolCallCountUnder":
+      return predicate.toolName
+        ? `Fewer than ${num(predicate.count)} calls to ${predicate.toolName}`
+        : `Fewer than ${num(predicate.count)} tool calls`;
+    case "toolCalledBefore":
+      return predicate.toolName && predicate.beforeToolName
+        ? `${predicate.toolName} called before ${predicate.beforeToolName}`
+        : base;
+    case "toolInputMatches":
+    case "toolResultMatches": {
+      const sentence = describePatternMatch(predicate);
+      if (sentence) return sentence[0]!.toUpperCase() + sentence.slice(1);
+      return predicate.toolName ? `${base} (${predicate.toolName})` : base;
+    }
+    default:
+      return base;
+  }
+}
+
+/** A pattern as a reader sees it — `/Idea/i` — cut so eight stay one line. */
+function shownPattern(pattern: string, flags: string): string {
+  const text = pattern.length > 60 ? `${pattern.slice(0, 60)}…` : pattern;
+  return `/${text}/${flags}`;
+}
+
+/**
+ * A `toolInputMatches` or `toolResultMatches` check in one counting-exact
+ * sentence, or `undefined` when a stored row lost the fields it needs.
+ *
+ * It always says "matching", and says what a match is: `min`/`max` count the
+ * calls (or results) that match EVERY pattern, never all of them. "No
+ * matching call" is the `0/0` spelling — a reader who took it for "never
+ * called" would read a pass beside a transcript full of calls as a
+ * contradiction. A `path` shows as the key it names, never as the pointer.
+ */
+export function describePatternMatch(
+  predicate: Extract<
+    Predicate,
+    { type: "toolInputMatches" | "toolResultMatches" }
+  >,
+): string | undefined {
+  const { toolName, patterns } = predicate;
+  const isInput = predicate.type === "toolInputMatches";
+  if (isInput && !toolName) return undefined;
+  if (!Array.isArray(patterns) || patterns.length === 0) return undefined;
+  const flags = typeof predicate.flags === "string" ? predicate.flags : "";
+  const shown = patterns.map((p) => shownPattern(String(p), flags)).join(", ");
+  const all = patterns.length === 1 ? "" : "all of ";
+  const key = pathKey(predicate.path);
+  const expectation = describeMatchExpectation(
+    {
+      min: typeof predicate.min === "number" ? predicate.min : 1,
+      max: typeof predicate.max === "number" ? predicate.max : undefined,
+    },
+    isInput ? "call" : "result",
+  );
+  if (isInput) {
+    const subject =
+      key === undefined
+        ? `whose arguments match ${all}`
+        : `whose "${key}" argument matches ${all}`;
+    return `${expectation} to ${toolName} ${subject}${shown}`;
+  }
+  const subject =
+    key === undefined
+      ? `whose content matches ${all}`
+      : `whose "${key}" field matches ${all}`;
+  return `${expectation} from ${toolName || "any tool"} ${subject}${shown}`;
+}
+
+/**
+ * The key a stored `path` names, for display: `"/elements"` reads as
+ * `elements`. A row whose pointer does not parse shows it as stored rather
+ * than hiding that it reads anything.
+ */
+function pathKey(path: unknown): string | undefined {
+  if (typeof path !== "string") return undefined;
+  const parsed = parseMatchPath(path);
+  return parsed.ok ? parsed.key : path;
+}
+
+export function filterKindsForMenu(
+  kinds: readonly PredicateKind[],
+  syntheticMonitorsEnabled: boolean,
+  allowed?: readonly PredicateKind[] | null,
+): PredicateKind[] {
+  const allowedSet = allowed ? new Set(allowed) : null;
+  return kinds.filter(
+    (kind) =>
+      (syntheticMonitorsEnabled || !SYNTHETIC_MONITOR_KINDS.has(kind)) &&
+      (!allowedSet || allowedSet.has(kind)),
+  );
+}

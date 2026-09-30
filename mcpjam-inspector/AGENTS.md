@@ -1,0 +1,118 @@
+# AGENTS.md
+
+Instructions for AI coding agents working on this codebase.
+
+## Logging
+
+**Do not use `console.log`, `console.warn`, or `console.error` directly.**
+
+### Server code (`server/`)
+
+Use the centralized logger utility:
+
+```typescript
+import { logger } from "@/utils/logger";
+
+logger.error("Something failed", error, { userId: "123" });
+logger.warn("Deprecated API used", { endpoint: "/old" });
+logger.info("Server started");
+logger.debug("Processing request", requestData);
+```
+
+**Why?** The logger routes diagnostics to the right sink and respects the
+`--verbose` flag (silent in production by default).
+
+- `logger.error` → Sentry **and** Axiom. This is the server's single Sentry
+  capture path for free-form errors. `logger.ts` owns every
+  `Sentry.captureException` call in the server; the error-origin policy
+  (`error-origin-capture.ts`) decides _whether_ to capture and then calls
+  `captureOriginErrorToSentry` here, so there is one policy module and one
+  mechanism, not two of each.
+- Route catch-sites use `reportRouteFailure` (`utils/route-error-report.ts`),
+  not `logger.error` directly: it asks whose fault the failure was before
+  paging, and still writes the Axiom row either way.
+- `logger.warn` / `logger.info` / `logger.debug` → Axiom only. Warnings
+  deliberately do **not** create Sentry issues: a warning is by definition
+  something we chose not to treat as a failure, and capturing every one across
+  thousands of self-hosted installs was our largest quota-spike vector.
+- Need an issue for a non-error condition? Use the typed-event opt-in:
+  `logger.event(name, base, payload, { error, sentry: true })`.
+
+See `docs/server-error-reporting.md`.
+
+### CLI script (`bin/start.js`)
+
+Use the built-in colored logging functions:
+
+```javascript
+logSuccess("Server started"); // ✅ green
+logInfo("Using port 6274"); // ℹ️  blue
+logWarning("Port in use"); // ⚠️  yellow
+logError("Failed to start"); // ❌ red
+logStep("Build", "Compiling..."); // [Build] cyan header
+logProgress("Waiting..."); // ⏳ magenta
+logDivider(); // ── dim line
+logBox("http://localhost:6274", "MCPJam"); // boxed output
+```
+
+For verbose-only output (hidden unless `--verbose` flag):
+
+```javascript
+verboseInfo("Loading config...");
+verboseSuccess("Config loaded");
+verboseStep("Setup", "Initializing...");
+```
+
+### Client code
+
+Browser `console.*` is acceptable for client-side debugging.
+
+---
+
+## Testing
+
+**All changes should include tests.** In this repo, `npm run test` runs the Vitest suite (`test:watch`, `test:coverage` are available); we are not opinionated about test frameworks elsewhere.
+
+### Structure
+
+Tests live in `__tests__/` directories next to source files. Use existing tests as examples:
+
+- **Components**: `client/src/components/*/__tests__/*.test.tsx`
+- **State**: `client/src/state/__tests__/app-reducer.test.ts`
+- **Server routes**: `server/routes/mcp/__tests__/*.test.ts`
+- **Utilities**: `shared/__tests__/*.test.ts`
+
+### Key Resources
+
+- **Factories** (`client/src/test/factories.ts`): `createServer()`, `createTool()`, `createMany()`, etc.
+- **Mock presets** (`client/src/test/mocks/`): `mcpApiPresets`, `storePresets`
+- **Server helpers** (`server/routes/mcp/__tests__/helpers/`): `createTestApp()`, `createMockMcpClientManager()`, `postJson()`, `expectError()`
+- **WorkOS emulator** (`server/test/support/workos-emulator.ts`): `startWorkosEmulator()`, `loginWithPkce()`, `mintUserApiKey()`. The `*.emulator.test.ts` suites drive the real WorkOS paths against a local `@workos/emulate` server instead of stubbing `fetch` — use them when the assertion depends on what WorkOS actually does (a rotated refresh token, a revoked key, a real JWKS). One emulator per file on port 0; see the WorkOS contract tests section in `../CONTRIBUTING.md`.
+
+### Checklist
+
+Cover: happy path, validation errors, error handling, edge cases (null, empty, etc.).
+
+## Design
+
+UI work starts from [`../DESIGN.md`](../DESIGN.md) — the design system's color
+roles, typography, layout, elevation, shapes and component conventions.
+
+Import primitives per-file from the shared package:
+
+```tsx
+import { Button } from "@mcpjam/design-system/button";
+import { cn } from "@mcpjam/design-system/cn";
+```
+
+`design-system/src/tokens.css` is the source of truth for the palette; DESIGN.md's
+front matter and the docs/chat-ui token mirrors are generated from it. Edit
+tokens.css, then `npm run design:sync`. `npm run design:check` and
+`npm run design:lint` gate CI. Never hardcode a color value.
+
+## Eval Prompt Policy
+
+- Keep eval-generation and repair prompts focused on attributable cases: prefer short, discovery-backed, live-workspace-safe scenarios over long synthetic workflows.
+- Do not rely on fake names, ids, places, or other brittle workspace fixtures unless an earlier step in the case establishes them.
+- When tool metadata supports a stable prerequisite or discovery sequence, preserve it instead of simplifying it away.
+- Major case rewrites are allowed when they are needed to remove brittle fixture assumptions and isolate MCP server behavior.

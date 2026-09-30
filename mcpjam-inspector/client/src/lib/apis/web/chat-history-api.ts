@@ -1,0 +1,316 @@
+import type { ResumeExecutionTarget } from "@/shared/execution-target";
+import { authFetch } from "@/lib/session-token";
+import { registerArtifactUrls } from "@/lib/artifact-urls";
+import type { MintedPageToolRecord } from "@/shared/declared-tools";
+import { WebApiError, requestIdOfResponse } from "./base";
+import type {
+  McpToolResultImageRenderingPolicy,
+  ModelVisibleMcpToolResults,
+} from "@/lib/client-config-v2";
+
+/**
+ * Per-message shape inside the JSON pointed at by `messagesBlobUrl`.
+ * The backend currently produces `{ role, content, ... }`; once Convex begins
+ * stamping `senderUserId` on user-role messages, the transcript reader will
+ * surface it directly via this type.
+ */
+export interface PersistedChatMessage {
+  id?: string;
+  role?: string;
+  content?: unknown;
+  /** Set by the backend on newly appended user messages once shipped. */
+  senderUserId?: string;
+  [key: string]: unknown;
+}
+
+export interface ChatHistorySession {
+  _id: string;
+  chatSessionId: string;
+  projectId?: string;
+  customTitle?: string;
+  firstMessagePreview: string;
+  status: "active" | "archived";
+  directVisibility: "private" | "project";
+  modelId?: string;
+  modelSource?: string;
+  messageCount: number;
+  version: number;
+  startedAt: number;
+  lastActivityAt: number;
+  userId?: string;
+  guestExternalId?: string;
+  isPinned: boolean;
+  pinnedAt?: number;
+  lastReadAt?: number;
+  manualUnread: boolean;
+  isUnread: boolean;
+}
+
+export interface ChatHistoryListResponse {
+  ok: boolean;
+  personal: ChatHistorySession[];
+  project: ChatHistorySession[];
+}
+
+export interface ResumeConfig {
+  /** Destination of the last saved turn; re-authorized when resumed. */
+  executionTarget?: ResumeExecutionTarget;
+  systemPrompt?: string;
+  temperature?: number;
+  requireToolApproval?: boolean;
+  respectToolVisibility?: boolean;
+  modelVisibleMcpToolResults?: ModelVisibleMcpToolResults;
+  mcpToolResultImageRendering?: McpToolResultImageRenderingPolicy;
+  selectedServers?: string[];
+  /** Legacy environment pin; target-aware writers also record executionTarget. */
+  environmentId?: string;
+}
+
+/**
+ * The `/direct-chat/detail` proxy returns the whole `chatSessions` document
+ * spread into `session`, so this interface is a hand-mirror of the fields we
+ * consume — narrower than what arrives. Adding a field here is a read, not a
+ * contract change.
+ */
+export interface ChatHistoryDetailSession extends ChatHistorySession {
+  origin?: string;
+  browser?: { browserSessionId: string; state: string } | null;
+  messagesBlobUrl: string | null;
+  usedServerIds?: string[];
+  resumeConfig?: ResumeConfig;
+  /**
+   * Host attribution stamped at ingest. Present for scenario- and swarm-sourced
+   * rows; the direct-chat read only ever serves `sourceType: "direct"` rows,
+   * which are not stamped today, so treat absence as "unrecorded" rather than
+   * "no host".
+   */
+  hostId?: string;
+}
+
+export interface ChatHistoryWidgetSnapshot {
+  _id: string;
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  serverId: string;
+  uiType: "mcp-apps" | "openai-apps";
+  resourceUri?: string;
+  widgetCsp: Record<string, unknown> | null;
+  widgetPermissions: Record<string, unknown> | null;
+  widgetPermissive: boolean;
+  prefersBorder: boolean;
+  widgetHtmlUrl?: string | null;
+  toolOutputUrl?: string | null;
+}
+
+export interface ChatHistoryTurnTrace {
+  turnId: string;
+  promptIndex: number;
+  startedAt: number;
+  endedAt: number;
+  finishReason?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  };
+  spanCount: number;
+  modelId?: string;
+  spansBlobUrl?: string | null;
+  requestPayloadsBlobUrl?: string | null;
+  /**
+   * The `webmcp_*` page tools this turn actually advertised, when the backend
+   * projected them (`mintedPageTool.ts`). A fact about the turn, not the live
+   * browser — see `resolvePageToolAttribution`'s header for why that matters.
+   */
+  pageToolsAtTurn?: MintedPageToolRecord[];
+}
+
+export interface ChatHistoryDetailResponse {
+  ok: boolean;
+  session: ChatHistoryDetailSession;
+  widgetSnapshots?: ChatHistoryWidgetSnapshot[];
+  turnTraces?: ChatHistoryTurnTrace[];
+}
+
+export interface CreateChatHistoryWidgetSnapshotRequest {
+  chatSessionId: string;
+  serverId?: string;
+  toolCallId: string;
+  toolName: string;
+  widgetHtmlBlobId: string;
+  uiType: "mcp-apps" | "openai-apps";
+  resourceUri?: string;
+  toolInputBlobId?: string;
+  toolOutputBlobId?: string;
+  widgetCsp?: Record<string, unknown> | null;
+  widgetPermissions?: Record<string, unknown> | null;
+  widgetPermissive?: boolean;
+  prefersBorder?: boolean;
+  displayContext?: Record<string, unknown>;
+}
+
+export interface CreateChatHistoryWidgetSnapshotResponse {
+  ok: boolean;
+  snapshotId: string | null;
+}
+
+interface ChatHistoryRequestOptions {
+  headers?: HeadersInit;
+  signal?: AbortSignal;
+}
+
+function buildChatHistoryHeaders(
+  initHeaders?: HeadersInit
+): HeadersInit | undefined {
+  const headers = new Headers(initHeaders);
+  return Array.from(headers.keys()).length > 0 ? headers : undefined;
+}
+
+async function webGet<T>(
+  path: string,
+  options?: ChatHistoryRequestOptions
+): Promise<T> {
+  const response = await authFetch(path, {
+    method: "GET",
+    headers: buildChatHistoryHeaders(options?.headers),
+    ...(options?.signal ? { signal: options.signal } : {}),
+  });
+
+  let body: any = null;
+  try {
+    body = await response.json();
+  } catch {
+    // ignored
+  }
+
+  if (!response.ok) {
+    const code = typeof body?.code === "string" ? body.code : null;
+    const message =
+      typeof body?.message === "string"
+        ? body.message
+        : typeof body?.error === "string"
+        ? body.error
+        : `Request failed (${response.status})`;
+    throw new WebApiError(
+      response.status,
+      code,
+      message,
+      undefined,
+      undefined,
+      requestIdOfResponse(response),
+    );
+  }
+
+  return body as T;
+}
+
+async function webPost<TRequest, TResponse>(
+  path: string,
+  payload: TRequest,
+  options?: ChatHistoryRequestOptions
+): Promise<TResponse> {
+  const initHeaders = new Headers(options?.headers);
+  initHeaders.set("Content-Type", "application/json");
+  const headers = new Headers(buildChatHistoryHeaders(initHeaders));
+  const response = await authFetch(path, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    ...(options?.signal ? { signal: options.signal } : {}),
+  });
+
+  let body: any = null;
+  try {
+    body = await response.json();
+  } catch {
+    // ignored
+  }
+
+  if (!response.ok) {
+    const code = typeof body?.code === "string" ? body.code : null;
+    const message =
+      typeof body?.message === "string"
+        ? body.message
+        : typeof body?.error === "string"
+        ? body.error
+        : `Request failed (${response.status})`;
+    throw new WebApiError(
+      response.status,
+      code,
+      message,
+      undefined,
+      undefined,
+      requestIdOfResponse(response),
+    );
+  }
+
+  return body as TResponse;
+}
+
+export async function listChatHistory(
+  params: {
+    projectId?: string;
+    status: "active" | "archived";
+    limit?: number;
+    before?: number;
+  },
+  requestOptions?: ChatHistoryRequestOptions
+): Promise<ChatHistoryListResponse> {
+  const searchParams = new URLSearchParams();
+  if (params.projectId) searchParams.set("projectId", params.projectId);
+  searchParams.set("status", params.status);
+  if (params.limit) searchParams.set("limit", String(params.limit));
+  if (params.before) searchParams.set("before", String(params.before));
+
+  return webGet<ChatHistoryListResponse>(
+    `/api/web/chat-history/list?${searchParams.toString()}`,
+    requestOptions
+  );
+}
+
+export async function getChatHistoryDetail(
+  params: {
+    sessionId?: string;
+    chatSessionId: string;
+    projectId?: string;
+  },
+  requestOptions?: ChatHistoryRequestOptions
+): Promise<ChatHistoryDetailResponse> {
+  const searchParams = new URLSearchParams();
+  if (params.sessionId) searchParams.set("sessionId", params.sessionId);
+  searchParams.set("chatSessionId", params.chatSessionId);
+  if (params.projectId) searchParams.set("projectId", params.projectId);
+
+  const detail = await webGet<ChatHistoryDetailResponse>(
+    `/api/web/chat-history/detail?${searchParams.toString()}`,
+    requestOptions
+  );
+  // Freshly minted artifact links: record them so anything still holding an
+  // older link to the same object reads through this one.
+  registerArtifactUrls(detail);
+  return detail;
+}
+
+export async function chatHistoryAction(
+  action: string,
+  sessionId: string,
+  params?: Record<string, unknown>,
+  requestOptions?: ChatHistoryRequestOptions
+): Promise<{ ok: boolean }> {
+  return webPost<Record<string, unknown>, { ok: boolean }>(
+    "/api/web/chat-history/action",
+    { action, sessionId, ...params },
+    requestOptions
+  );
+}
+
+export async function createChatHistoryWidgetSnapshot(
+  payload: CreateChatHistoryWidgetSnapshotRequest,
+  requestOptions?: ChatHistoryRequestOptions
+): Promise<CreateChatHistoryWidgetSnapshotResponse> {
+  return webPost<
+    CreateChatHistoryWidgetSnapshotRequest,
+    CreateChatHistoryWidgetSnapshotResponse
+  >("/api/web/chat-history/widget-snapshot/create", payload, requestOptions);
+}

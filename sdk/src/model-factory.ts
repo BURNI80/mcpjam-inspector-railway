@@ -1,0 +1,803 @@
+/**
+ * Model factory for creating AI SDK language models from provider/model strings.
+ * Supports both built-in providers and user-defined custom providers.
+ *
+ * Also exports buildOrgModelFromResolvedConfig / assertOrgModelAllowed for
+ * building models from org-resolved provider configs (local BYOK runtime).
+ */
+
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createAzure } from "@ai-sdk/azure";
+import { createDeepSeek } from "@ai-sdk/deepseek";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createMistral } from "@ai-sdk/mistral";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createXai } from "@ai-sdk/xai";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { createOllama } from "ollama-ai-provider-v2";
+import type { LanguageModel } from "ai";
+import type { LLMProvider, CustomProvider } from "./types.js";
+import {
+  getMcpjamLeaseClient,
+  type McpjamAuthContext,
+  type McpjamModelLeaseScope,
+  resolveMcpjamBaseUrl,
+  resolveMcpjamProject,
+  MCPJAM_PLACEHOLDER_API_KEY,
+  MCPJAM_PROXY_PLACEHOLDER_ORIGIN,
+} from "./mcpjam-model-lease.js";
+import { anthropicNativeModelId } from "./model-native-ids.js";
+
+export {
+  ANTHROPIC_NATIVE_MODEL_IDS,
+  anthropicNativeModelId,
+  type NativeModelIdMapping,
+} from "./model-native-ids.js";
+
+/**
+ * Custom base URLs for built-in providers that support them.
+ */
+export interface BaseUrls {
+  ollama?: string;
+  azure?: string;
+  anthropic?: string;
+  openai?: string;
+  /**
+   * Amazon Bedrock regional runtime endpoint, e.g.
+   * https://bedrock-runtime.us-east-1.amazonaws.com.
+   * When omitted, the provider derives it from the AWS_REGION env var.
+   */
+  bedrock?: string;
+  /**
+   * MCPJam APP origin for `mcpjam/…` models, e.g. https://app.mcpjam.com — the
+   * host a lease is minted from, NOT a model endpoint. Falls back to
+   * `MCPJAM_BASE_URL` and then the public app.
+   */
+  mcpjam?: string;
+}
+
+/**
+ * Options for creating a model.
+ */
+export interface CreateModelOptions {
+  /** @internal Lease ownership for a suite run. */
+  mcpjamLeaseScope?: McpjamModelLeaseScope;
+  apiKey: string;
+  baseUrls?: BaseUrls;
+  /** Custom providers registry (name -> config) */
+  customProviders?:
+    | Map<string, CustomProvider>
+    | Record<string, CustomProvider>;
+  /**
+   * Which project pays for `mcpjam/…` models. Falls back to
+   * `MCPJAM_PROJECT_ID` and then the `default` sentinel, which resolves
+   * server-side to the API key organization's Default project — the same
+   * resolution eval reporting uses, so inference and results land together.
+   */
+  mcpjamProject?: string;
+  /**
+   * MCPJam-hosted inference as a caller whose credential REFRESHES — a CLI
+   * login's session — instead of a fixed `sk_` key. The bearer is read for
+   * every mint, retry and revoke, and the headers go to MCPJam's API only,
+   * never to the model proxy or a provider. For `mcpjam/…` models this and a
+   * non-empty `apiKey` are mutually exclusive; with neither, `MCPJAM_API_KEY`
+   * is read as before. A lease scope bound to an auth context supplies one
+   * implicitly.
+   */
+  mcpjamAuth?: McpjamAuthContext;
+}
+
+/** Built-in providers list */
+const BUILT_IN_PROVIDERS: LLMProvider[] = [
+  "anthropic",
+  "openai",
+  "azure",
+  "bedrock",
+  "deepseek",
+  "google",
+  "ollama",
+  "mistral",
+  "openrouter",
+  "xai",
+  "mcpjam",
+];
+
+/**
+ * Canonical (OpenRouter-style) hosted-catalog id prefixes whose MCPJam provider
+ * key differs from the prefix. Mirrors `MODEL_ID_PREFIX_ALIASES` in
+ * `mcpjam-inspector/shared/model-id-prefix-aliases.ts`: the picker has always
+ * known these prefixes are vendor names rather than provider keys, and this
+ * parser did not.
+ *
+ * `meta-llama` maps to `meta`, which is not a built-in provider — that entry
+ * exists so the two tables stay recognisably the same, and the id resolves
+ * through the hosted-vendor fallback below like any other vendor path.
+ */
+const HOSTED_PROVIDER_ALIASES: Record<string, string> = {
+  "x-ai": "xai",
+  spacexai: "xai",
+  "meta-llama": "meta",
+  mistralai: "mistral",
+};
+
+/**
+ * The provider every MCPJam-hosted model that is not a direct built-in is
+ * served through. A catalog id like `qwen/qwen3-max` is an OpenRouter vendor
+ * path, not a `provider/model` pair.
+ */
+const HOSTED_CATALOG_PROVIDER: LLMProvider = "openrouter";
+
+/**
+ * Result of parsing an LLM string
+ */
+export type ParsedLLMString =
+  | { type: "builtin"; provider: LLMProvider; model: string }
+  | { type: "custom"; providerName: string; model: string };
+
+/**
+ * Parse an LLM string into provider and model components.
+ * Supports built-in providers, custom provider names, and the MCPJam-hosted
+ * catalog's canonical ids.
+ *
+ * A hosted catalog id is a VENDOR path, not a provider key: `list_models` and
+ * the model picker hand out `anthropic/claude-haiku-4.5` but also
+ * `qwen/qwen3-max` and `z-ai/glm-4.6`. Ids whose leading segment is not a
+ * built-in provider (directly or through `HOSTED_PROVIDER_ALIASES`) and not a
+ * registered custom provider resolve to OpenRouter with the whole id as the
+ * model, which is how MCPJam serves them.
+ *
+ * @param llmString - String in format "provider/model" (e.g., "openai/gpt-4o" or "my-litellm/gpt-4"), or a hosted catalog id (e.g., "qwen/qwen3-max")
+ * @param customProviderNames - Optional set of registered custom provider names for validation
+ * @returns Parsed result with type discriminator
+ */
+export function parseLLMString(
+  llmString: string,
+  customProviderNames?: Set<string>
+): ParsedLLMString {
+  const parts = llmString.split("/");
+  if (parts.length < 2) {
+    const allProviders = customProviderNames
+      ? [...BUILT_IN_PROVIDERS, ...customProviderNames]
+      : BUILT_IN_PROVIDERS;
+    throw new Error(
+      `Invalid LLM string format: "${llmString}". Expected format: "provider/model" (e.g., "openai/gpt-4o"). ` +
+        `Supported providers: ${allProviders.join(", ")}. ` +
+        `An MCPJam-hosted catalog id already carries its vendor as the first segment ` +
+        `(e.g. "anthropic/claude-haiku-4.5", "qwen/qwen3-max") and is accepted as-is — ` +
+        `vendors that are not providers above are routed through ${HOSTED_CATALOG_PROVIDER}.`
+    );
+  }
+
+  const providerName = parts[0];
+  const model = parts.slice(1).join("/"); // Handle models with slashes in name
+
+  // Check if it's a built-in provider
+  if (BUILT_IN_PROVIDERS.includes(providerName as LLMProvider)) {
+    return {
+      type: "builtin",
+      provider: providerName as LLMProvider,
+      model,
+    };
+  }
+
+  // Check if it's a registered custom provider.
+  //
+  // Deliberately BEFORE the alias table, not after: a caller may already have
+  // registered a custom provider literally named `mistralai` or `x-ai`, and an
+  // alias that shadowed it would change the meaning of a string that parses
+  // today. The alias only ever fires where this function used to throw.
+  if (customProviderNames?.has(providerName)) {
+    return {
+      type: "custom",
+      providerName,
+      model,
+    };
+  }
+
+  // An EMPTY segment is not a vendor path. `"/gpt-4o"`, `"vendor/"` and
+  // `"qwen//qwen3-max"` all reach here with `parts.length >= 2` and would
+  // otherwise be resolved by one of the two paths below, turning a local,
+  // obvious mistake into a remote API error (or, through the alias table, into
+  // a built-in provider with an empty model name).
+  //
+  // Placed after the built-in and custom-provider checks and before the alias
+  // table: those two are the paths that existed before this parser learned the
+  // hosted catalog, and `"openai/"` parses today, so tightening them would
+  // change the meaning of a string that already works. Everything below this
+  // line used to throw, so it can be strict.
+  //
+  // Tested on the raw SEGMENTS, not on `providerName` and the re-joined
+  // `model`: a doubled slash in the middle leaves both of those non-empty, so
+  // checking them would let exactly the case this guard names slip through.
+  if (parts.some((part) => part === "")) {
+    throw new Error(
+      `Invalid LLM string format: "${llmString}". Expected format: "provider/model" (e.g., "openai/gpt-4o") — no segment may be empty.`
+    );
+  }
+
+  // A hosted-catalog prefix that is a built-in provider under another name.
+  const aliased = HOSTED_PROVIDER_ALIASES[providerName.toLowerCase()];
+  if (aliased && BUILT_IN_PROVIDERS.includes(aliased as LLMProvider)) {
+    return {
+      type: "builtin",
+      provider: aliased as LLMProvider,
+      model,
+    };
+  }
+
+  // Anything else with a leading segment is a hosted-catalog vendor path
+  // (`qwen/qwen3-max`, `meta-llama/llama-3.3-70b-instruct`, `z-ai/glm-4.6`).
+  // The catalog MCPJam hands out through `list_models` and the model picker is
+  // majority vendor paths, and every one of them threw here before, so this
+  // widens what parses without changing any string that already parsed.
+  //
+  // The cost is that a MISTYPED custom-provider name (`litelm/gpt-4` for a
+  // provider registered as `litellm`) no longer fails here; it is routed to
+  // OpenRouter and fails at the API call instead. A parser that could tell the
+  // two apart would need the hosted catalog itself, which the SDK does not
+  // ship and which grows without it.
+  return {
+    type: "builtin",
+    provider: HOSTED_CATALOG_PROVIDER,
+    model: llmString,
+  };
+}
+
+/**
+ * Model type returned by provider factories.
+ */
+export type ProviderLanguageModel = ReturnType<ReturnType<typeof createOpenAI>>;
+
+/**
+ * Read an environment variable where one exists, and answer `undefined` where
+ * it does not. Returns `undefined` rather than throwing in a browser/Worker.
+ */
+function readEnvVar(name: string): string | undefined {
+  if (typeof process === "undefined" || !process.env) return undefined;
+  return process.env[name];
+}
+
+/**
+ * Create a model from a custom provider configuration.
+ */
+function createModelFromCustomProvider(
+  customProvider: CustomProvider,
+  model: string,
+  runtimeApiKey?: string
+): ProviderLanguageModel {
+  // Resolve API key: runtime > config > env var.
+  //
+  // The env-var read is guarded because this function is reachable from the
+  // `@mcpjam/sdk/browser` and `/host-config` entry points, which exist to be
+  // loadable where there is no `process` at all. An unguarded read throws
+  // `ReferenceError: process is not defined` in a browser or a Worker the
+  // moment a custom provider declares `apiKeyEnvVar` — so the environment
+  // simply has no value to offer there, and the caller must pass one.
+  const apiKey =
+    runtimeApiKey ||
+    customProvider.apiKey ||
+    (customProvider.apiKeyEnvVar
+      ? readEnvVar(customProvider.apiKeyEnvVar)
+      : undefined) ||
+    "";
+
+  switch (customProvider.protocol) {
+    case "openai-compatible": {
+      const openai = createOpenAI({
+        apiKey,
+        baseURL: customProvider.baseUrl,
+      });
+      // Use .chat() for providers that need Chat Completions API (like LiteLLM)
+      return customProvider.useChatCompletions
+        ? openai.chat(model)
+        : openai(model);
+    }
+
+    case "anthropic-compatible": {
+      const anthropic = createAnthropic({
+        apiKey,
+        baseURL: customProvider.baseUrl,
+      });
+      return anthropic(model) as ProviderLanguageModel;
+    }
+
+    default: {
+      const _exhaustiveCheck: never = customProvider.protocol;
+      throw new Error(`Unknown protocol: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+/**
+ * Create a language model from an LLM string.
+ * @param llmString - String in format "provider/model" (e.g., "openai/gpt-4o" or "my-provider/model")
+ * @param options - API key, optional base URLs, and custom providers registry
+ * @returns AI SDK language model instance
+ */
+export function createModelFromString(
+  llmString: string,
+  options: CreateModelOptions
+): ProviderLanguageModel {
+  const { apiKey, baseUrls, customProviders, mcpjamProject } = options;
+
+  // Convert custom providers to Map if provided as object
+  const customProvidersMap =
+    customProviders instanceof Map
+      ? customProviders
+      : customProviders
+        ? new Map(Object.entries(customProviders))
+        : new Map<string, CustomProvider>();
+
+  const customProviderNames = new Set(customProvidersMap.keys());
+  const parsed = parseLLMString(llmString, customProviderNames);
+
+  // Handle custom providers
+  if (parsed.type === "custom") {
+    const customProvider = customProvidersMap.get(parsed.providerName);
+    if (!customProvider) {
+      throw new Error(
+        `Custom provider "${parsed.providerName}" not found in registry`
+      );
+    }
+    return createModelFromCustomProvider(customProvider, parsed.model, apiKey);
+  }
+
+  // Handle built-in providers
+  const { provider, model } = parsed;
+
+  switch (provider) {
+    case "anthropic": {
+      const anthropic = createAnthropic({
+        apiKey,
+        ...(baseUrls?.anthropic && { baseURL: baseUrls.anthropic }),
+      });
+      // The canonical spelling a suite or the model picker hands out
+      // (`claude-sonnet-4.5`) is not an id api.anthropic.com serves; the
+      // reviewed native one is. Native ids and unknown ids pass through.
+      return anthropic(anthropicNativeModelId(model)) as ProviderLanguageModel;
+    }
+
+    case "openai": {
+      const openai = createOpenAI({
+        apiKey,
+        ...(baseUrls?.openai && { baseURL: baseUrls.openai }),
+      });
+      return openai(model);
+    }
+
+    case "deepseek": {
+      const deepseek = createDeepSeek({ apiKey });
+      return deepseek(model) as ProviderLanguageModel;
+    }
+
+    case "google": {
+      const google = createGoogleGenerativeAI({ apiKey });
+      return google(model) as ProviderLanguageModel;
+    }
+
+    case "ollama": {
+      // Normalize the base URL to ensure it ends with /api
+      const raw = baseUrls?.ollama || "http://127.0.0.1:11434/api";
+      const normalized = /\/api\/?$/.test(raw)
+        ? raw
+        : `${raw.replace(/\/+$/, "")}/api`;
+      const ollama = createOllama({ baseURL: normalized });
+      return ollama(model) as unknown as ProviderLanguageModel;
+    }
+
+    case "mistral": {
+      const mistral = createMistral({ apiKey });
+      return mistral(model) as ProviderLanguageModel;
+    }
+
+    case "openrouter": {
+      const openrouter = createOpenRouter({ apiKey });
+      return openrouter(model) as unknown as ProviderLanguageModel;
+    }
+
+    case "xai": {
+      const xai = createXai({ apiKey });
+      return xai(model) as ProviderLanguageModel;
+    }
+
+    case "azure": {
+      const azure = createAzure({
+        apiKey,
+        baseURL: baseUrls?.azure,
+      });
+      return azure(model) as ProviderLanguageModel;
+    }
+
+    case "bedrock": {
+      // Bearer-token (API key) auth. The endpoint comes from baseUrls.bedrock
+      // when set; otherwise the provider derives it from AWS_REGION.
+      const bedrock = createAmazonBedrock({
+        apiKey,
+        ...(baseUrls?.bedrock && { baseURL: baseUrls.bedrock }),
+      });
+      return bedrock(model) as unknown as ProviderLanguageModel;
+    }
+
+    // MCPJam-hosted inference. Not a vendor: `model` here is still a full
+    // vendor id (`anthropic/claude-sonnet-4.5`), and `apiKey` is an `sk_`
+    // MCPJam key rather than a provider key.
+    //
+    // Built on the VENDOR providers on purpose. MCPJam's proxy speaks
+    // Anthropic's and OpenAI's own wire formats, so the existing providers work
+    // against it unchanged — no custom LanguageModel to write, and none to keep
+    // in step with the AI SDK. What they cannot express is the lease: a
+    // deployment-specific URL and a header they know nothing about, neither
+    // knowable until an authenticated call mints one. So the provider is
+    // pointed at a placeholder and the lease client's `fetch` rewrites the URL,
+    // strips the placeholder credential and attaches the lease. See
+    // `mcpjam-model-lease.ts`.
+    case "mcpjam": {
+      const slash = model.indexOf("/");
+      const vendor = slash === -1 ? model : model.slice(0, slash);
+      const auth = options.mcpjamAuth ?? options.mcpjamLeaseScope?.auth;
+      let client;
+      if (auth) {
+        // Two credential sources would make WHO a lease is minted and billed
+        // as depend on an unwritten precedence. The env fallback is not a
+        // source here: it applies only when the caller named none.
+        if (apiKey) {
+          throw new Error(
+            `"mcpjam/${model}" was given both an MCPJam API key and an auth ` +
+              "callback; supply exactly one."
+          );
+        }
+        client = getMcpjamLeaseClient(
+          {
+            baseUrl: resolveMcpjamBaseUrl(baseUrls?.mcpjam),
+            getAuth: auth.getAuth,
+            ...(auth.headers ? { headers: auth.headers } : {}),
+            project: resolveMcpjamProject(mcpjamProject),
+            model,
+          },
+          options.mcpjamLeaseScope
+        );
+      } else {
+        // `apiKey` first so an explicit key always wins; the env fallback is
+        // what makes `MCPJAM_API_KEY` alone enough in CI.
+        const mcpjamApiKey = apiKey || readEnvVar("MCPJAM_API_KEY") || "";
+        if (!mcpjamApiKey) {
+          throw new Error(
+            `An MCPJam API key is required for "mcpjam/${model}". ` +
+              "Set MCPJAM_API_KEY, or pass it as the runner's apiKey."
+          );
+        }
+        client = getMcpjamLeaseClient(
+          {
+            baseUrl: resolveMcpjamBaseUrl(baseUrls?.mcpjam),
+            apiKey: mcpjamApiKey,
+            project: resolveMcpjamProject(mcpjamProject),
+            model,
+          },
+          options.mcpjamLeaseScope
+        );
+      }
+
+      // The FULL vendor id is what reaches the wire, so the proxy's model
+      // allowlist matches the lease exactly rather than through its
+      // alias-tolerance rule.
+      if (vendor === "anthropic") {
+        const anthropic = createAnthropic({
+          apiKey: MCPJAM_PLACEHOLDER_API_KEY,
+          baseURL: `${MCPJAM_PROXY_PLACEHOLDER_ORIGIN}/v1`,
+          fetch: client.proxyFetch,
+        });
+        return anthropic(model) as ProviderLanguageModel;
+      }
+      if (vendor === "openai") {
+        const openai = createOpenAI({
+          apiKey: MCPJAM_PLACEHOLDER_API_KEY,
+          baseURL: `${MCPJAM_PROXY_PLACEHOLDER_ORIGIN}/v1`,
+          fetch: client.proxyFetch,
+        });
+        return openai(model);
+      }
+      throw new Error(
+        `MCPJam-hosted inference serves anthropic/* and openai/* models; ` +
+          `"mcpjam/${model}" names "${vendor}".`
+      );
+    }
+
+    default: {
+      const _exhaustiveCheck: never = provider;
+      throw new Error(`Unhandled provider: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+/**
+ * Parse a comma-separated string of model IDs into an array.
+ * Handles whitespace and empty entries.
+ */
+export function parseModelIds(modelIdsString: string): string[] {
+  return modelIdsString
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
+
+/**
+ * Create a CustomProvider configuration from user input.
+ * This is a helper for building the configuration from form inputs.
+ */
+export function createCustomProvider(config: {
+  name: string;
+  protocol: "openai-compatible" | "anthropic-compatible";
+  baseUrl: string;
+  modelIds: string | string[];
+  apiKey?: string;
+  apiKeyEnvVar?: string;
+  useChatCompletions?: boolean;
+}): CustomProvider {
+  const modelIds = Array.isArray(config.modelIds)
+    ? config.modelIds
+    : parseModelIds(config.modelIds);
+
+  if (modelIds.length === 0) {
+    throw new Error("At least one model ID is required");
+  }
+
+  if (!config.name || config.name.includes("/")) {
+    throw new Error("Provider name is required and cannot contain '/'");
+  }
+
+  if (!config.baseUrl) {
+    throw new Error("Base URL is required");
+  }
+
+  return {
+    name: config.name,
+    protocol: config.protocol,
+    baseUrl: config.baseUrl,
+    modelIds,
+    ...(config.apiKey && { apiKey: config.apiKey }),
+    ...(config.apiKeyEnvVar && { apiKeyEnvVar: config.apiKeyEnvVar }),
+    ...(config.useChatCompletions && {
+      useChatCompletions: config.useChatCompletions,
+    }),
+  };
+}
+
+/**
+ * Preset configurations for common OpenAI-compatible providers.
+ * Users can use these as starting points and customize as needed.
+ */
+export const PROVIDER_PRESETS = {
+  /** LiteLLM proxy - requires useChatCompletions */
+  litellm: (
+    baseUrl = "http://localhost:4000",
+    modelIds: string[]
+  ): CustomProvider => ({
+    name: "litellm",
+    protocol: "openai-compatible",
+    baseUrl,
+    modelIds,
+    apiKeyEnvVar: "LITELLM_API_KEY",
+    useChatCompletions: true,
+  }),
+} as const;
+
+// =============================================================================
+// Org-resolved provider config builder
+//
+// Used by the inspector's local BYOK runtime: after calling /stream/org/resolve
+// and receiving a local-runtime response, the inspector builds the AI SDK model
+// here rather than forwarding the request to Convex.
+// =============================================================================
+
+/**
+ * Resolved provider config as returned by /stream/org/resolve for local providers.
+ * Cloud providers do not send apiKey — only local providers include credentials.
+ */
+export interface OrgProviderResolvedConfig {
+  providerKey: string;
+  /** Present only for local-runtime providers. */
+  apiKey?: string;
+  baseUrl?: string;
+  protocol?: "openai-compatible" | "anthropic-compatible";
+  modelIds?: string[];
+  displayName?: string;
+  selectedModels?: string[];
+}
+
+export class OrgProviderConfigError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+    this.name = "OrgProviderConfigError";
+  }
+}
+
+function requireOrgSecret(
+  config: OrgProviderResolvedConfig,
+  label: string
+): string {
+  if (!config.apiKey) {
+    throw new OrgProviderConfigError(
+      "provider_not_configured",
+      `${label} provider has no API key configured for this organization`
+    );
+  }
+  return config.apiKey;
+}
+
+function requireOrgBaseUrl(
+  config: OrgProviderResolvedConfig,
+  label: string
+): string {
+  if (!config.baseUrl) {
+    throw new OrgProviderConfigError(
+      "provider_not_configured",
+      `${label} provider has no base URL configured for this organization`
+    );
+  }
+  return config.baseUrl;
+}
+
+function resolveOrgModelId(
+  config: OrgProviderResolvedConfig,
+  modelId: string
+): string {
+  if (!config.providerKey.startsWith("custom:")) return modelId;
+  const prefix = `${config.providerKey}:`;
+  return modelId.startsWith(prefix) ? modelId.slice(prefix.length) : modelId;
+}
+
+/**
+ * Build an AI SDK LanguageModel from an org-resolved provider config.
+ *
+ * Mirrors convex/stream/buildOrgModel.ts — kept in sync so local and cloud
+ * execution use the same provider dispatch logic.
+ *
+ * Throws OrgProviderConfigError('provider_not_configured', ...) when a
+ * required apiKey or baseUrl is missing.
+ */
+export function buildOrgModelFromResolvedConfig(
+  config: OrgProviderResolvedConfig,
+  modelId: string
+): LanguageModel {
+  const { providerKey } = config;
+  // Strip the "providerKey/" prefix that UI model IDs include for built-in
+  // providers (e.g. "openai/gpt-5-mini" → "gpt-5-mini" for the OpenAI SDK).
+  const builtinPfx = `${providerKey}/`;
+  const m =
+    !providerKey.startsWith("custom:") && modelId.startsWith(builtinPfx)
+      ? modelId.slice(builtinPfx.length)
+      : modelId;
+
+  if (providerKey === "openai") {
+    return createOpenAI({ apiKey: requireOrgSecret(config, "OpenAI") })(m);
+  }
+  if (providerKey === "anthropic") {
+    return createAnthropic({
+      apiKey: requireOrgSecret(config, "Anthropic"),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "google") {
+    return createGoogleGenerativeAI({
+      apiKey: requireOrgSecret(config, "Google"),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "deepseek") {
+    return createDeepSeek({
+      apiKey: requireOrgSecret(config, "DeepSeek"),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "mistral") {
+    return createMistral({
+      apiKey: requireOrgSecret(config, "Mistral"),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "xai") {
+    return createXai({ apiKey: requireOrgSecret(config, "xAI") })(
+      m
+    ) as unknown as LanguageModel;
+  }
+  if (providerKey === "azure") {
+    const apiKey = requireOrgSecret(config, "Azure OpenAI");
+    const baseUrl = requireOrgBaseUrl(config, "Azure OpenAI");
+    const resourceMatch = baseUrl.match(
+      /https?:\/\/([^.]+)\.(openai|cognitiveservices)\.azure\.com/i
+    );
+    const resourceName = resourceMatch?.[1];
+    return createAzure({
+      apiKey,
+      ...(resourceName ? { resourceName } : { baseURL: baseUrl }),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "openrouter") {
+    return createOpenRouter({
+      apiKey: requireOrgSecret(config, "OpenRouter"),
+      headers: {
+        "HTTP-Referer": "https://www.mcpjam.com/",
+        "X-Title": "MCPJam",
+      },
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "bedrock") {
+    return createAmazonBedrock({
+      apiKey: requireOrgSecret(config, "Amazon Bedrock"),
+      baseURL: requireOrgBaseUrl(config, "Amazon Bedrock"),
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey === "ollama") {
+    const raw = requireOrgBaseUrl(config, "Ollama");
+    const normalized = /\/api\/?$/.test(raw)
+      ? raw
+      : `${raw.replace(/\/+$/, "")}/api`;
+    return createOllama({
+      baseURL: normalized,
+    })(m) as unknown as LanguageModel;
+  }
+  if (providerKey.startsWith("custom:")) {
+    const baseUrl = requireOrgBaseUrl(config, providerKey);
+    const apiKey = config.apiKey ?? "";
+    const resolvedModelId = resolveOrgModelId(config, modelId);
+    if (config.protocol === "anthropic-compatible") {
+      return createAnthropic({
+        apiKey,
+        baseURL: baseUrl,
+      })(resolvedModelId) as unknown as LanguageModel;
+    }
+    const openai = createOpenAI({ apiKey, baseURL: baseUrl });
+    return openai.chat(resolvedModelId);
+  }
+
+  throw new OrgProviderConfigError(
+    "provider_not_supported",
+    `Provider ${providerKey} is not supported`
+  );
+}
+
+/**
+ * Validate that the requested model is in the org's allowlist for the provider.
+ * For OpenRouter and Amazon Bedrock this is selectedModels; for custom
+ * providers it is modelIds. Built-in providers are pass-through (the upstream
+ * provider rejects unknown ids).
+ *
+ * Throws OrgProviderConfigError('model_not_allowed', ...) on rejection.
+ */
+export function assertOrgModelAllowed(
+  config: OrgProviderResolvedConfig,
+  modelId: string
+): void {
+  if (config.providerKey === "openrouter") {
+    if (config.selectedModels && config.selectedModels.length > 0) {
+      if (!config.selectedModels.includes(modelId)) {
+        throw new OrgProviderConfigError(
+          "model_not_allowed",
+          `Model ${modelId} is not in this organization's OpenRouter allowlist`
+        );
+      }
+    }
+    return;
+  }
+  if (config.providerKey === "bedrock") {
+    if (config.selectedModels && config.selectedModels.length > 0) {
+      if (!config.selectedModels.includes(modelId)) {
+        throw new OrgProviderConfigError(
+          "model_not_allowed",
+          `Model ${modelId} is not in this organization's Amazon Bedrock allowlist`
+        );
+      }
+    }
+    return;
+  }
+  if (config.providerKey.startsWith("custom:")) {
+    const resolvedModelId = resolveOrgModelId(config, modelId);
+    if (config.modelIds && config.modelIds.length > 0) {
+      if (!config.modelIds.includes(resolvedModelId)) {
+        throw new OrgProviderConfigError(
+          "model_not_allowed",
+          `Model ${resolvedModelId} is not configured for custom provider ${config.providerKey}`
+        );
+      }
+    }
+  }
+}

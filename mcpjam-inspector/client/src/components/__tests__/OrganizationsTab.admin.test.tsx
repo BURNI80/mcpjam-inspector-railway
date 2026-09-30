@@ -1,0 +1,928 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast as sonnerToast } from "sonner";
+import { OrganizationsTab } from "../OrganizationsTab";
+import { ImageUploadError } from "@/lib/image-upload";
+
+const mockUseAuth = vi.fn();
+const mockUseConvexAuth = vi.fn();
+const mockUseOrganizationQueries = vi.fn();
+const mockUseOrganizationMembers = vi.fn();
+const mockUseOrganizationBilling = vi.fn();
+
+const mockUpdateOrganization = vi.fn();
+const mockDeleteOrganization = vi.fn();
+const mockAddMember = vi.fn();
+const mockChangeMemberRole = vi.fn();
+const mockTransferOrganizationOwnership = vi.fn();
+const mockRemoveMember = vi.fn();
+const mockUploadImage = vi.fn();
+
+vi.mock("@workos-inc/authkit-react", () => ({
+  useAuth: (...args: unknown[]) => mockUseAuth(...args),
+}));
+
+vi.mock("convex/react", () => ({
+  useConvexAuth: (...args: unknown[]) => mockUseConvexAuth(...args),
+  // `SettingsNav` reaches `useGithubChecksAvailability`, which queries Convex.
+  // Without this the mock is missing an export the tree now needs.
+  useQuery: () => undefined,
+  useMutation: () => vi.fn(),
+  useAction: () => vi.fn(),
+}));
+
+// SettingsNav (rendered inside the members admin area) resolves GitHub
+// Checks tab availability itself via a hook that calls convex/react's
+// useQuery — which the blanket mock above doesn't provide. This suite
+// doesn't exercise that tab, so a stubbed "not available yet" is enough.
+vi.mock("@/hooks/useGithubChecksSettings", () => ({
+  useGithubChecksAvailability: () => undefined,
+}));
+
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
+}));
+
+// SettingsNav asks the backend for GitHub Checks availability on every settings
+// surface, including this one. Stubbed to keep that query out of these tests.
+vi.mock("@/hooks/useGithubChecksSettings", () => ({
+  useGithubChecksAvailability: () => undefined,
+}));
+
+vi.mock("@/hooks/useOrganizations", async () => {
+  const actual = await vi.importActual<
+    typeof import("@/hooks/useOrganizations")
+  >("@/hooks/useOrganizations");
+
+  return {
+    ...actual,
+    useOrganizationQueries: (...args: unknown[]) =>
+      mockUseOrganizationQueries(...args),
+    useOrganizationMembers: (...args: unknown[]) =>
+      mockUseOrganizationMembers(...args),
+    useOrganizationMutations: () => ({
+      updateOrganization: mockUpdateOrganization,
+      deleteOrganization: mockDeleteOrganization,
+      addMember: mockAddMember,
+      changeMemberRole: mockChangeMemberRole,
+      transferOrganizationOwnership: mockTransferOrganizationOwnership,
+      removeMember: mockRemoveMember,
+    }),
+  };
+});
+
+vi.mock("@/hooks/useImageUpload", () => ({
+  useImageUpload: () => mockUploadImage,
+}));
+
+vi.mock("../organization/OrganizationAuditLog", () => ({
+  OrganizationAuditLog: () => (
+    <div data-testid="organization-audit-log">Audit Log</div>
+  ),
+}));
+
+vi.mock("@/hooks/useOrgSharePolicy", () => ({
+  useOrgSharePolicy: () => ({
+    policy: {
+      maxShareMode: "anyone_with_link",
+      inviteAudience: "anyone",
+      updatedAt: null,
+    },
+    isLoading: false,
+    error: null,
+    isSaving: false,
+    setPolicy: vi.fn(),
+  }),
+  useEffectiveSharePolicy: () => ({ policy: undefined, isLoading: false }),
+}));
+
+vi.mock("../organization/OrganizationMemberRow", () => ({
+  OrganizationMemberRow: ({
+    member,
+    role,
+    isPending,
+    onRoleChange,
+    onTransferOwnership,
+    onRemove,
+  }: any) => {
+    const effectiveRole =
+      role ?? member.role ?? (member.isOwner ? "owner" : "member");
+
+    return (
+      <div data-testid={`member-row-${member.email}`}>
+        <span>{member.email}</span>
+        <span>{effectiveRole}</span>
+        {isPending ? <span>pending</span> : null}
+        {onRoleChange ? (
+          <button
+            onClick={() =>
+              onRoleChange(effectiveRole === "member" ? "admin" : "member")
+            }
+          >
+            change-role-{member.email}
+          </button>
+        ) : null}
+        {onTransferOwnership ? (
+          <button onClick={onTransferOwnership}>transfer-{member.email}</button>
+        ) : null}
+        {onRemove ? (
+          <button onClick={onRemove}>remove-{member.email}</button>
+        ) : null}
+      </div>
+    );
+  },
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("@/hooks/useOrganizationBilling", () => ({
+  useOrganizationBilling: (...args: unknown[]) =>
+    mockUseOrganizationBilling(...args),
+  isPaidPlan: (plan: string) => plan !== "free",
+}));
+
+const organization = {
+  _id: "org-1",
+  name: "Acme Org",
+  createdBy: "user-owner",
+  createdAt: 1,
+  updatedAt: 1,
+  myRole: "owner" as const,
+};
+
+function createMember({
+  email,
+  role,
+  isOwner = false,
+  userId = "user-id",
+}: {
+  email: string;
+  role: "owner" | "admin" | "member";
+  isOwner?: boolean;
+  userId?: string;
+}) {
+  return {
+    _id: `member-${email}`,
+    organizationId: "org-1",
+    userId,
+    email,
+    role,
+    isOwner,
+    addedBy: "user-owner",
+    addedAt: 1,
+    user: {
+      name: email,
+      email,
+      imageUrl: "",
+    },
+  };
+}
+
+describe("OrganizationsTab member management", () => {
+  it("renders Data management instead of falling back to General", () => {
+    render(
+      <OrganizationsTab organizationId="org-1" section="data-management" />,
+    );
+    expect(
+      screen.getByRole("heading", { name: "Data management" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Contact us" })).toHaveAttribute(
+      "href",
+      "https://www.mcpjam.com/contact",
+    );
+    expect(
+      screen.queryByRole("heading", { name: "General" }),
+    ).not.toBeInTheDocument();
+  });
+  let currentUserEmail = "owner@example.com";
+  let activeMembers = [
+    createMember({ email: "owner@example.com", role: "owner", isOwner: true }),
+    createMember({ email: "admin@example.com", role: "admin" }),
+    createMember({ email: "member@example.com", role: "member" }),
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    currentUserEmail = "owner@example.com";
+    activeMembers = [
+      createMember({
+        email: "owner@example.com",
+        role: "owner",
+        isOwner: true,
+      }),
+      createMember({ email: "admin@example.com", role: "admin" }),
+      createMember({ email: "member@example.com", role: "member" }),
+    ];
+
+    mockUseConvexAuth.mockReturnValue({ isAuthenticated: true });
+    mockUseAuth.mockImplementation(() => ({
+      user: { email: currentUserEmail },
+      signIn: vi.fn(),
+    }));
+    mockUseOrganizationQueries.mockReturnValue({
+      sortedOrganizations: [organization],
+      isLoading: false,
+    });
+    mockUseOrganizationMembers.mockImplementation(() => ({
+      activeMembers,
+      pendingMembers: [],
+      isLoading: false,
+    }));
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "free",
+        effectivePlan: "free",
+        source: "free",
+        billingInterval: null,
+        billingConfigured: true,
+        subscriptionStatus: null,
+        canManageBilling: true,
+        isOwner: true,
+        hasCustomer: false,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: null,
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: null,
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isFinishingSeatPayment: false,
+      isCancelingSeatPayment: false,
+      isHandlingSeatPayment: false,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment: vi.fn(),
+      cancelSeatPayment: vi.fn(),
+    });
+
+    mockUpdateOrganization.mockResolvedValue(undefined);
+    mockDeleteOrganization.mockResolvedValue(undefined);
+    mockAddMember.mockResolvedValue({ isPending: false });
+    mockChangeMemberRole.mockResolvedValue({ success: true, changed: true });
+    mockTransferOrganizationOwnership.mockResolvedValue({
+      success: true,
+      changed: true,
+    });
+    mockRemoveMember.mockResolvedValue({ success: true });
+    mockUploadImage.mockResolvedValue({ url: "https://files.example/logo" });
+  });
+
+  function chooseLogo(container: HTMLElement, file: File) {
+    const input = container.querySelector('input[type="file"]')!;
+    expect(input).toHaveAttribute(
+      "accept",
+      "image/png,image/jpeg,image/gif,image/webp",
+    );
+    fireEvent.change(input, { target: { files: [file] } });
+  }
+
+  function expectErrorToast(text: string) {
+    expect(sonnerToast.error).toHaveBeenCalledWith(
+      expect.objectContaining({ props: expect.objectContaining({ text }) }),
+      expect.anything(),
+    );
+  }
+
+  it("uploads a logo through the upload route", async () => {
+    const { container } = render(<OrganizationsTab organizationId="org-1" />);
+    const logo = new File(["png"], "logo.png", { type: "image/png" });
+
+    chooseLogo(container, logo);
+
+    await waitFor(() =>
+      expect(mockUploadImage).toHaveBeenCalledWith(
+        { kind: "organization-logo", organizationId: "org-1" },
+        logo,
+      ),
+    );
+    expect(sonnerToast.error).not.toHaveBeenCalled();
+  });
+
+  it("refuses an SVG logo before uploading it", () => {
+    const { container } = render(<OrganizationsTab organizationId="org-1" />);
+
+    chooseLogo(
+      container,
+      new File(["<svg/>"], "logo.svg", { type: "image/svg+xml" }),
+    );
+
+    expect(mockUploadImage).not.toHaveBeenCalled();
+    expectErrorToast("Choose a PNG, JPEG, GIF, or WebP image.");
+  });
+
+  it("shows the server's reason when it refuses a logo", async () => {
+    mockUploadImage.mockRejectedValueOnce(
+      new ImageUploadError(
+        "Only organization owners and admins can change the logo.",
+        403,
+        "FORBIDDEN",
+      ),
+    );
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { container } = render(<OrganizationsTab organizationId="org-1" />);
+      chooseLogo(
+        container,
+        new File(["png"], "logo.png", { type: "image/png" }),
+      );
+      await waitFor(() =>
+        expectErrorToast(
+          "Only organization owners and admins can change the logo.",
+        ),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("preserves organization branding and separates General from Members", () => {
+    render(<OrganizationsTab organizationId="org-1" />);
+    expect(
+      screen.getByRole("button", { name: "Upload organization logo" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Danger Zone")).toBeInTheDocument();
+    expect(screen.queryByText("Members")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("navigation", {
+        name: "Organization settings sections",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the sharing URL as an alias for members and sharing", () => {
+    render(<OrganizationsTab organizationId="org-1" section="sharing" />);
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Members & sharing" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("org-sharing-policy-card")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Sharing" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows members section for owners and allows role changes", async () => {
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Members & sharing" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("textbox", { name: "Invite with email" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("change-role-member@example.com"));
+
+    await waitFor(() => {
+      expect(mockChangeMemberRole).toHaveBeenCalledWith({
+        organizationId: "org-1",
+        email: "member@example.com",
+        role: "admin",
+      });
+    });
+  });
+
+  it("allows ownership transfer for owners", async () => {
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    fireEvent.click(screen.getByText("transfer-member@example.com"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Transfer ownership" }));
+
+    await waitFor(() => {
+      expect(mockTransferOrganizationOwnership).toHaveBeenCalledWith({
+        organizationId: "org-1",
+        newOwnerEmail: "member@example.com",
+      });
+    });
+  });
+
+  it("requires confirmation before removing a member and supports canceling", async () => {
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+    fireEvent.click(screen.getByText("remove-member@example.com"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(
+      "member@example.com",
+    );
+    expect(mockRemoveMember).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Cancel", exact: true }),
+    );
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mockRemoveMember).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("remove-member@example.com"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove member", exact: true }),
+    );
+    await waitFor(() =>
+      expect(mockRemoveMember).toHaveBeenCalledWith({
+        organizationId: "org-1",
+        email: "member@example.com",
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps a failed removal open for retry and blocks repeated submissions", async () => {
+    let rejectRemoval!: (error: Error) => void;
+    mockRemoveMember.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectRemoval = reject;
+        }),
+    );
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+    fireEvent.click(screen.getByText("remove-member@example.com"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove member", exact: true }),
+    );
+    expect(screen.getByRole("button", { name: "Removing…" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Cancel", exact: true }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Removing…" }));
+    expect(mockRemoveMember).toHaveBeenCalledTimes(1);
+    rejectRemoval(new Error("Network unavailable"));
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove member", exact: true }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    expect(mockRemoveMember).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows members section for admins with read-only membership controls", () => {
+    currentUserEmail = "admin@example.com";
+    mockUseOrganizationQueries.mockReturnValue({
+      sortedOrganizations: [{ ...organization, myRole: "admin" }],
+      isLoading: false,
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Members & sharing" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("change-role-member@example.com"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("transfer-member@example.com"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows members section for non-admin members without admin controls", () => {
+    currentUserEmail = "member@example.com";
+    mockUseOrganizationQueries.mockReturnValue({
+      sortedOrganizations: [{ ...organization, myRole: "member" }],
+      isLoading: false,
+    });
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "free",
+        effectivePlan: "free",
+        source: "free",
+        billingInterval: null,
+        billingConfigured: true,
+        subscriptionStatus: null,
+        canManageBilling: false,
+        isOwner: false,
+        hasCustomer: false,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: null,
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: null,
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isFinishingSeatPayment: false,
+      isCancelingSeatPayment: false,
+      isHandlingSeatPayment: false,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment: vi.fn(),
+      cancelSeatPayment: vi.fn(),
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(screen.getByText("Access restricted")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "You don't have permission to view organization settings. Contact an admin or owner for access.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Go to Servers" }),
+    ).toBeInTheDocument();
+    expect(document.getElementById("settings-content")).toBeInTheDocument();
+  });
+
+  it("lets a non-admin member leave from the access restricted screen", async () => {
+    currentUserEmail = "member@example.com";
+    mockUseOrganizationQueries.mockReturnValue({
+      sortedOrganizations: [{ ...organization, myRole: "member" }],
+      isLoading: false,
+    });
+
+    render(<OrganizationsTab organizationId="org-1" />);
+
+    // The subtle "Leave organization" link is visible on the restricted screen.
+    fireEvent.click(screen.getByRole("button", { name: "Leave organization" }));
+
+    // Confirming in the dialog removes the current user by their own email.
+    fireEvent.click(screen.getByRole("button", { name: "Leave Organization" }));
+
+    await waitFor(() => {
+      expect(mockRemoveMember).toHaveBeenCalledWith({
+        organizationId: "org-1",
+        email: "member@example.com",
+      });
+    });
+  });
+
+  it("shows the sign-in prompt instead of mounting organization billing while Convex auth is unavailable", () => {
+    const signIn = vi.fn();
+
+    mockUseConvexAuth.mockReturnValue({
+      isAuthenticated: false,
+      isLoading: false,
+    });
+    mockUseAuth.mockReturnValue({
+      user: { email: "owner@example.com" },
+      signIn,
+    });
+    mockUseOrganizationQueries.mockReturnValue({
+      sortedOrganizations: [organization],
+      isLoading: false,
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="billing" />);
+
+    expect(
+      screen.getByText("Sign in to manage organizations"),
+    ).toBeInTheDocument();
+    expect(mockUseOrganizationBilling).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(signIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows pending seat payment only inside the members admin area", async () => {
+    const finishSeatPayment = vi
+      .fn()
+      .mockResolvedValue({ status: "paid", seatQuantity: 4 });
+    const cancelSeatPayment = vi.fn().mockResolvedValue(undefined);
+
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "team",
+        effectivePlan: "team",
+        source: "subscription",
+        billingInterval: "monthly",
+        billingConfigured: true,
+        subscriptionStatus: "active",
+        canManageBilling: true,
+        isOwner: true,
+        hasCustomer: true,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: "price_team_monthly",
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: {
+        _id: "seat-payment-1",
+        organizationId: "org-1",
+        userId: "user-new",
+        email: "new@example.com",
+        role: "member",
+        source: "organization",
+        status: "requires_action",
+        targetSeatQuantity: 4,
+        stripeInvoiceId: "in_123",
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isHandlingSeatPayment: false,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment,
+      cancelSeatPayment,
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(screen.getByTestId("pending-seat-payment-notice")).toHaveTextContent(
+      "Finish payment to add new@example.com",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Finish payment" }));
+    await waitFor(() =>
+      expect(finishSeatPayment).toHaveBeenCalledWith(undefined),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(cancelSeatPayment).toHaveBeenCalledWith());
+  });
+
+  it("keeps pending seat cancel available while finish payment is loading", async () => {
+    const cancelSeatPayment = vi.fn().mockResolvedValue(undefined);
+
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "team",
+        effectivePlan: "team",
+        source: "subscription",
+        billingInterval: "monthly",
+        billingConfigured: true,
+        subscriptionStatus: "active",
+        canManageBilling: true,
+        isOwner: true,
+        hasCustomer: true,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: "price_team_monthly",
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: {
+        _id: "seat-payment-1",
+        organizationId: "org-1",
+        userId: "user-new",
+        email: "new@example.com",
+        role: "member",
+        source: "organization",
+        status: "requires_action",
+        targetSeatQuantity: 4,
+        stripeInvoiceId: "in_123",
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isFinishingSeatPayment: true,
+      isCancelingSeatPayment: false,
+      isHandlingSeatPayment: true,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment: vi.fn(),
+      cancelSeatPayment,
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(
+      screen.getByRole("button", { name: "Finish payment" }),
+    ).toBeDisabled();
+    const cancelButton = screen.getByRole("button", { name: "Cancel" });
+    expect(cancelButton).toBeEnabled();
+
+    fireEvent.click(cancelButton);
+    await waitFor(() => expect(cancelSeatPayment).toHaveBeenCalledWith());
+  });
+
+  it("disables pending seat cancel while payment completion is in progress", () => {
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "team",
+        effectivePlan: "team",
+        source: "subscription",
+        billingInterval: "monthly",
+        billingConfigured: true,
+        subscriptionStatus: "active",
+        canManageBilling: true,
+        isOwner: true,
+        hasCustomer: true,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: "price_team_monthly",
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: {
+        _id: "seat-payment-1",
+        organizationId: "org-1",
+        userId: "user-new",
+        email: "new@example.com",
+        role: "member",
+        source: "organization",
+        status: "requires_action",
+        targetSeatQuantity: 4,
+        stripeInvoiceId: "in_123",
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isFinishingSeatPayment: true,
+      isCompletingSeatPayment: true,
+      isCancelingSeatPayment: false,
+      isHandlingSeatPayment: true,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment: vi.fn(),
+      cancelSeatPayment: vi.fn(),
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  });
+
+  it("starts seat payment from the direct admin add-member action", async () => {
+    const finishSeatPayment = vi
+      .fn()
+      .mockResolvedValue({ status: "paid", seatQuantity: 4 });
+    mockAddMember.mockResolvedValue({
+      needsSeatPayment: true,
+      seatPaymentIntentId: "seat-payment-2",
+    });
+    mockUseOrganizationBilling.mockReturnValue({
+      billingStatus: {
+        organizationId: "org-1",
+        organizationName: "Acme Org",
+        plan: "team",
+        effectivePlan: "team",
+        source: "subscription",
+        billingInterval: "monthly",
+        billingConfigured: true,
+        subscriptionStatus: "active",
+        canManageBilling: true,
+        isOwner: true,
+        hasCustomer: true,
+        stripeScheduledPlan: null,
+        stripeScheduledBillingInterval: null,
+        stripeScheduledPriceId: null,
+        stripeScheduledEffectiveAt: null,
+        stripeCancelAtPeriodEnd: false,
+        stripeCancelAt: null,
+        stripeCanceledAt: null,
+        stripeCurrentPeriodEnd: null,
+        stripePriceId: "price_team_monthly",
+        trialStatus: "none",
+        trialPlan: null,
+        trialStartedAt: null,
+        trialEndsAt: null,
+        trialDaysRemaining: null,
+        decisionRequired: false,
+        trialDecision: null,
+      },
+      organizationPremiumness: undefined,
+      activeSeatPaymentIntent: null,
+      isLoadingBilling: false,
+      isStartingPlanChange: false,
+      pendingPlanChangeTarget: null,
+      isOpeningPortal: false,
+      isCancelingScheduledBillingChange: false,
+      isHandlingSeatPayment: false,
+      error: null,
+      startPlanChange: vi.fn(),
+      openPortal: vi.fn(),
+      openIntervalChangePortal: vi.fn(),
+      cancelScheduledBillingChange: vi.fn(),
+      selectFreeAfterTrial: vi.fn(),
+      finishSeatPayment,
+      cancelSeatPayment: vi.fn(),
+    });
+
+    render(<OrganizationsTab organizationId="org-1" section="members" />);
+
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Invite with email" }),
+      {
+        target: { value: "new@example.com" },
+      },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Invite" }));
+
+    await waitFor(() => {
+      expect(mockAddMember).toHaveBeenCalledWith({
+        organizationId: "org-1",
+        email: "new@example.com",
+      });
+    });
+    await waitFor(() => {
+      expect(finishSeatPayment).toHaveBeenCalledWith("seat-payment-2");
+    });
+  });
+});

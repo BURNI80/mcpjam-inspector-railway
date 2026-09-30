@@ -1,0 +1,711 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
+import { PromptsTab } from "../PromptsTab";
+import type { MCPServerConfig } from "@mcpjam/sdk/browser";
+
+const { mockJsonEditor } = vi.hoisted(() => ({
+  mockJsonEditor: vi.fn((props: any) => (
+    <div data-testid="json-editor">{JSON.stringify(props.value)}</div>
+  )),
+}));
+
+// Mock APIs
+const mockListPrompts = vi.fn();
+const mockGetPrompt = vi.fn();
+
+vi.mock("@/lib/apis/mcp-prompts-api", () => ({
+  listPrompts: (...args: unknown[]) => mockListPrompts(...args),
+  getPrompt: (...args: unknown[]) => mockGetPrompt(...args),
+}));
+
+// Mock ResizablePanelGroup to simplify rendering
+vi.mock("../ui/resizable", () => ({
+  ResizablePanelGroup: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="resizable-panel-group">{children}</div>
+  ),
+  ResizablePanel: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="resizable-panel">{children}</div>
+  ),
+  ResizableHandle: () => <div data-testid="resizable-handle" />,
+}));
+
+// Mock LoggerView
+vi.mock("../logger-view", () => ({
+  LoggerView: () => <div data-testid="logger-view">Logger</div>,
+}));
+
+// Mock ScrollArea
+vi.mock("@mcpjam/design-system/scroll-area", () => ({
+  ScrollArea: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="scroll-area">{children}</div>
+  ),
+}));
+
+vi.mock("@/components/ui/json-editor", () => ({
+  JsonEditor: (props: any) => mockJsonEditor(props),
+}));
+
+describe("PromptsTab", () => {
+  const createServerConfig = (): MCPServerConfig =>
+    ({
+      transportType: "stdio",
+      command: "node",
+      args: ["server.js"],
+    }) as MCPServerConfig;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockJsonEditor.mockClear();
+    mockListPrompts.mockResolvedValue([]);
+    mockGetPrompt.mockResolvedValue({ content: null });
+  });
+
+  describe("empty state", () => {
+    it("shows empty state when no server config provided", () => {
+      render(<PromptsTab />);
+
+      expect(screen.getByText("No Server Selected")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Connect to an MCP server to explore and test its available prompts.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("shows empty state when serverConfig is undefined", () => {
+      render(<PromptsTab serverConfig={undefined} serverName="test-server" />);
+
+      expect(screen.getByText("No Server Selected")).toBeInTheDocument();
+    });
+  });
+
+  describe("prompt fetching", () => {
+    it("fetches prompts when server is configured", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "greeting", description: "A greeting prompt" },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(mockListPrompts).toHaveBeenCalledWith("test-server", {
+          refresh: false,
+        });
+      });
+    });
+
+    it("does not fetch prompts when the server is disconnected", () => {
+      const serverConfig = createServerConfig();
+
+      render(
+        <PromptsTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      expect(mockListPrompts).not.toHaveBeenCalled();
+      expect(
+        screen.getByText("Connect this server to load prompts."),
+      ).toBeInTheDocument();
+    });
+
+    it("clears loaded prompts when the selected server disconnects", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "greeting", description: "A greeting prompt" },
+      ]);
+
+      const { rerender } = render(
+        <PromptsTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="connected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("greeting")).toBeInTheDocument();
+      });
+      expect(mockListPrompts).toHaveBeenCalledTimes(1);
+
+      rerender(
+        <PromptsTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByText("greeting")).not.toBeInTheDocument();
+      });
+      expect(
+        screen.getByText("Connect this server to load prompts."),
+      ).toBeInTheDocument();
+      expect(mockListPrompts).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores a stale prompts response after the selected server disconnects", async () => {
+      const serverConfig = createServerConfig();
+      let resolvePrompts!: (value: Array<Record<string, unknown>>) => void;
+      mockListPrompts.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePrompts = resolve;
+        }),
+      );
+
+      const { rerender } = render(
+        <PromptsTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="connected"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockListPrompts).toHaveBeenCalledTimes(1);
+      });
+
+      rerender(
+        <PromptsTab
+          serverConfig={serverConfig}
+          serverName="test-server"
+          serverConnectionStatus="disconnected"
+        />,
+      );
+
+      await act(async () => {
+        resolvePrompts([{ name: "late-prompt" }]);
+      });
+
+      expect(screen.queryByText("late-prompt")).not.toBeInTheDocument();
+      expect(
+        screen.getByText("Connect this server to load prompts."),
+      ).toBeInTheDocument();
+    });
+
+    it("displays prompts after fetching", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "greeting", description: "A greeting prompt" },
+        { name: "farewell", description: "A farewell prompt" },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Prompts should be displayed in the list view
+      await waitFor(() => {
+        expect(screen.getByText("greeting")).toBeInTheDocument();
+        expect(screen.getByText("farewell")).toBeInTheDocument();
+      });
+    });
+
+    it("displays prompt count", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "prompt1" },
+        { name: "prompt2" },
+        { name: "prompt3" },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Count should be displayed in the header in list view
+      await waitFor(() => {
+        expect(screen.getByText("3")).toBeInTheDocument();
+      });
+    });
+
+    it("shows no prompts message when list is empty", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("No prompts available")).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("prompt selection", () => {
+    it("shows list view by default (no auto-selection)", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "first-prompt", description: "First prompt" },
+        { name: "second-prompt", description: "Second prompt" },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Both prompts should be visible in the list
+      await waitFor(() => {
+        expect(screen.getByText("first-prompt")).toBeInTheDocument();
+        expect(screen.getByText("second-prompt")).toBeInTheDocument();
+      });
+    });
+
+    it("selects prompt when clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "prompt-a", description: "Prompt A" },
+        { name: "prompt-b", description: "Prompt B" },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list to load
+      await waitFor(() => {
+        expect(screen.getByText("prompt-b")).toBeInTheDocument();
+      });
+
+      // Click prompt-b in the list
+      fireEvent.click(screen.getByText("prompt-b"));
+
+      // After selection, the SelectedToolHeader shows a switch-tool control
+      await waitFor(() => {
+        expect(screen.getByTitle("Switch tool")).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("prompt switching via list selection", () => {
+    it("auto-runs zero-arg prompt when selected from the list", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        { name: "prompt-a", arguments: [{ name: "x", required: true }] },
+        { name: "prompt-b", arguments: [] },
+      ]);
+
+      mockGetPrompt.mockResolvedValue({ content: "Result from prompt-b" });
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list to load
+      await waitFor(() => {
+        expect(screen.getByText("prompt-b")).toBeInTheDocument();
+      });
+
+      // Click prompt-b (zero args) — should auto-run
+      fireEvent.click(screen.getByText("prompt-b"));
+
+      await waitFor(() => {
+        expect(mockGetPrompt).toHaveBeenCalledWith(
+          "test-server",
+          "prompt-b",
+          {},
+        );
+      });
+    });
+  });
+
+  describe("getting prompts", () => {
+    it("gets prompt when Run button is clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "greeting", arguments: [] }]);
+
+      mockGetPrompt.mockResolvedValue({
+        content: [{ role: "user", content: { type: "text", text: "Hello!" } }],
+      });
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list to load and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("greeting")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("greeting"));
+
+      // Wait for selection and click Run
+      await waitFor(() => {
+        expect(
+          screen.getByRole("button", { name: /run/i }),
+        ).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /run/i }));
+
+      await waitFor(() => {
+        expect(mockGetPrompt).toHaveBeenCalledWith(
+          "test-server",
+          "greeting",
+          {},
+        );
+      });
+    });
+
+    it("displays error when get prompt fails", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "failing-prompt" }]);
+
+      mockGetPrompt.mockRejectedValue(new Error("Prompt not found"));
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list to load and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("failing-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("failing-prompt"));
+
+      // Wait for selection and click Run
+      await waitFor(() => {
+        expect(
+          screen.getByRole("button", { name: /run/i }),
+        ).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /run/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Prompt not found")).toBeInTheDocument();
+      });
+    });
+
+    it("renders JSON string responses with JsonEditor", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "json-prompt" }]);
+      mockGetPrompt.mockResolvedValue({
+        content: '{"users":[{"id":"1"}],"hasNextPage":false}',
+      });
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("json-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("json-prompt"));
+
+      await waitFor(() => {
+        expect(mockJsonEditor).toHaveBeenCalled();
+      });
+
+      expect(mockJsonEditor.mock.calls.at(-1)?.[0]).toMatchObject({
+        value: { users: [{ id: "1" }], hasNextPage: false },
+      });
+    });
+
+    it("keeps plain text prompt responses as text", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "text-prompt" }]);
+      mockGetPrompt.mockResolvedValue({ content: "Hello from prompt" });
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("text-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("text-prompt"));
+
+      await waitFor(() => {
+        expect(screen.getByText("Hello from prompt")).toBeInTheDocument();
+      });
+
+      expect(screen.queryByTestId("json-editor")).not.toBeInTheDocument();
+    });
+
+    it("preserves whitespace-only prompt responses as text", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "blank-prompt" }]);
+      mockGetPrompt.mockResolvedValue({ content: "   \n\n" });
+
+      const { container } = render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("blank-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("blank-prompt"));
+
+      await waitFor(() => {
+        const pre = container.querySelector("pre");
+        expect(pre).not.toBeNull();
+        expect(pre?.textContent).toBe("   \n\n");
+      });
+
+      expect(screen.queryByTestId("json-editor")).not.toBeInTheDocument();
+    });
+
+    it("preserves empty-string prompt responses as text", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "empty-prompt" }]);
+      mockGetPrompt.mockResolvedValue({ content: "" });
+
+      const { container } = render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("empty-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("empty-prompt"));
+
+      await waitFor(() => {
+        const pre = container.querySelector("pre");
+        expect(pre).not.toBeNull();
+        expect(pre?.textContent).toBe("");
+      });
+
+      expect(screen.queryByTestId("json-editor")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("prompt arguments", () => {
+    it("displays parameter form when prompt has arguments", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        {
+          name: "greet",
+          arguments: [
+            { name: "name", description: "Person to greet", required: true },
+            { name: "language", description: "Greeting language" },
+          ],
+        },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("greet")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("greet"));
+
+      // Now parameters should be visible
+      await waitFor(() => {
+        expect(screen.getByText("name")).toBeInTheDocument();
+        expect(screen.getByText("language")).toBeInTheDocument();
+      });
+    });
+
+    it("shows no parameters message when prompt has no arguments", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([{ name: "simple-prompt" }]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("simple-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("simple-prompt"));
+
+      await waitFor(() => {
+        expect(screen.getByText("No parameters required")).toBeInTheDocument();
+      });
+    });
+
+    it("sends argument values when getting prompt", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        {
+          name: "greet",
+          arguments: [{ name: "name", required: true }],
+        },
+      ]);
+
+      mockGetPrompt.mockResolvedValue({ content: "Hello!" });
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("greet")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("greet"));
+
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText("Enter name")).toBeInTheDocument();
+      });
+
+      // Enter a value
+      fireEvent.change(screen.getByPlaceholderText("Enter name"), {
+        target: { value: "Alice" },
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /run/i }));
+
+      await waitFor(() => {
+        expect(mockGetPrompt).toHaveBeenCalledWith("test-server", "greet", {
+          name: "Alice",
+        });
+      });
+    });
+  });
+
+  describe("prompt descriptions", () => {
+    it("displays prompt description when available", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        {
+          name: "analyze",
+          description: "Analyze code for potential issues",
+        },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Description may appear in both list and detail panel
+      await waitFor(() => {
+        const descriptions = screen.getAllByText(
+          "Analyze code for potential issues",
+        );
+        expect(descriptions.length).toBeGreaterThanOrEqual(1);
+      });
+    });
+
+    it("displays prompt title when available", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        {
+          name: "code_review",
+          title: "Code Review Assistant",
+          description: "Reviews code",
+        },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Title should be visible in the list view
+      await waitFor(() => {
+        expect(screen.getByText("Code Review Assistant")).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("refresh functionality", () => {
+    it("refreshes prompts when refresh button is clicked", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      await waitFor(() => {
+        expect(mockListPrompts).toHaveBeenCalledTimes(1);
+      });
+
+      // Find and click refresh button
+      const buttons = screen.getAllByRole("button");
+      const refreshButton = buttons.find((btn) =>
+        btn.querySelector(".lucide-refresh-cw"),
+      );
+
+      if (refreshButton) {
+        fireEvent.click(refreshButton);
+
+        await waitFor(() => {
+          expect(mockListPrompts).toHaveBeenCalledTimes(2);
+        });
+      }
+    });
+  });
+
+  describe("required fields", () => {
+    it("marks required fields visually", async () => {
+      const serverConfig = createServerConfig();
+
+      mockListPrompts.mockResolvedValue([
+        {
+          name: "test-prompt",
+          arguments: [
+            { name: "required_field", required: true },
+            { name: "optional_field", required: false },
+          ],
+        },
+      ]);
+
+      render(
+        <PromptsTab serverConfig={serverConfig} serverName="test-server" />,
+      );
+
+      // Wait for list and click the prompt
+      await waitFor(() => {
+        expect(screen.getByText("test-prompt")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByText("test-prompt"));
+
+      await waitFor(() => {
+        expect(screen.getByText("required_field")).toBeInTheDocument();
+        expect(screen.getByText("optional_field")).toBeInTheDocument();
+      });
+
+      // Required field should have a "required" badge
+      const requiredBadge = screen.getByText("required");
+      expect(requiredBadge).toBeInTheDocument();
+    });
+  });
+});

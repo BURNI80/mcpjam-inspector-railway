@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@/shared/*": ["../shared/*"],
+      "@repo/assets/*": ["./src/assets/*"],
+      "@mcpjam/sdk": ["../../sdk/src/index.ts"],
+      "@mcpjam/sdk/browser": ["../../sdk/src/browser.ts"],
+      "@mcpjam/sdk/*": ["../../sdk/src/*"],
+      "@mcpjam/chat-ui": ["../../chat-ui/src/index.ts"],
+      "@mcpjam/chat-ui/json-tokens": ["../../chat-ui/src/json-tokens.ts"],
+      "@mcpjam/chat-ui/thread-helpers": [
+        "../../chat-ui/src/thread-helpers.ts"
+      ],
+      "@mcpjam/chat-ui/trace": ["../../chat-ui/src/trace.ts"],
+      "@mcpjam/widget-react": ["../../widget-react/src/index.ts"]
+    }
+  },
+  "include": ["src", "../shared/**/*.ts"],
+  "references": [
+    {
+      "path": "./tsconfig.node.json"
+    }
+  ]
+}

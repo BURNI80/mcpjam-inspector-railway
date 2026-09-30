@@ -1,0 +1,1192 @@
+#!/usr/bin/env node
+
+import { resolve, dirname } from "path";
+import { spawn } from "child_process";
+import { fileURLToPath, pathToFileURL } from "url";
+import { createServer, createConnection } from "net";
+import { execSync } from "child_process";
+import { existsSync, readFileSync } from "fs";
+import open from "open";
+import {
+  createLaunchToken,
+  shouldPrintAccessLink,
+  createAccessLink,
+  networkAccessLinks,
+} from "./access-link.mjs";
+import { launchWorkspaceCandidate } from "./launch-workspace.mjs";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Banner split into MCP (white) and JAM (primary orange) parts
+const MCP_BANNER_LINES = [
+  ["███╗   ███╗ ██████╗██████╗", "     ██╗ █████╗ ███╗   ███╗"],
+  ["████╗ ████║██╔════╝██╔══██╗", "    ██║██╔══██╗████╗ ████║"],
+  ["██╔████╔██║██║     ██████╔╝", "    ██║███████║██╔████╔██║"],
+  ["██║╚██╔╝██║██║     ██╔═══╝", "██   ██║██╔══██║██║╚██╔╝██║"],
+  ["██║ ╚═╝ ██║╚██████╗██║    ", "╚█████╔╝██║  ██║██║ ╚═╝ ██║"],
+  ["╚═╝     ╚═╝ ╚═════╝╚═╝     ", "╚════╝ ╚═╝  ╚═╝╚═╝     ╚═╝"],
+];
+
+// ANSI color codes
+// Theme colors from index.css (oklch converted to RGB)
+const colors = {
+  reset: "\x1b[0m",
+  bright: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+  primary: "\x1b[38;2;207;115;69m", // oklch(0.6832 0.1382 38.744) - orange
+  default: "\x1b[39m", // Default foreground - adapts to terminal theme
+  bgRed: "\x1b[41m",
+  bgGreen: "\x1b[42m",
+  bgYellow: "\x1b[43m",
+  bgBlue: "\x1b[44m",
+  bgMagenta: "\x1b[45m",
+  bgCyan: "\x1b[46m",
+};
+
+// Utility functions for beautiful output
+function log(message, color = colors.reset) {
+  console.log(`${color}${message}${colors.reset}`);
+}
+
+function printBanner() {
+  console.log();
+  for (const [mcp, jam] of MCP_BANNER_LINES) {
+    console.log(
+      `${colors.default}${mcp}${colors.primary}${jam}${colors.reset}`,
+    );
+  }
+  console.log();
+}
+
+function logSuccess(message) {
+  log(`✅ ${message}`, colors.green);
+}
+
+function logInfo(message) {
+  log(`ℹ️  ${message}`, colors.blue);
+}
+
+function logWarning(message) {
+  log(`⚠️  ${message}`, colors.yellow);
+}
+
+function logError(message) {
+  log(`❌ ${message}`, colors.red);
+}
+
+function logStep(step, message) {
+  log(
+    `\n${colors.cyan}${colors.bright}[${step}]${colors.reset} ${message}`,
+    colors.white,
+  );
+}
+
+function logProgress(message) {
+  log(`⏳ ${message}`, colors.magenta);
+}
+
+function logDivider() {
+  log("─".repeat(80), colors.dim);
+}
+
+function logBox(content, title = null) {
+  const lines = content.split("\n");
+  const maxLength = Math.max(...lines.map((line) => line.length));
+  const width = maxLength + 4;
+
+  log("┌" + "─".repeat(width) + "┐", colors.primary);
+  if (title) {
+    const titlePadding = Math.floor((width - title.length - 2) / 2);
+    log(
+      "│" +
+        " ".repeat(titlePadding) +
+        title +
+        " ".repeat(width - title.length - titlePadding) +
+        "│",
+      colors.primary,
+    );
+    log("├" + "─".repeat(width) + "┤", colors.primary);
+  }
+
+  lines.forEach((line) => {
+    const padding = width - line.length - 2;
+    log("│ " + line + " ".repeat(padding) + " │", colors.primary);
+  });
+
+  log("└" + "─".repeat(width) + "┘", colors.primary);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms, true));
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = createServer();
+
+    server.listen(port, "127.0.0.1", () => {
+      server.close(() => {
+        resolve(true);
+      });
+    });
+
+    server.on("error", () => {
+      // Port is not available
+      resolve(false);
+    });
+  });
+}
+
+function waitForServerReady(port, host, timeoutMs = 30000, signal = null) {
+  const intervalMs = 200;
+  const startTime = Date.now();
+
+  return new Promise((resolve) => {
+    let done = false;
+    let activeSocket = null;
+    let retryTimer = null;
+
+    function finish(ready) {
+      if (done) return;
+      done = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+      }
+      if (activeSocket) {
+        activeSocket.destroy();
+      }
+      signal?.removeEventListener("abort", onAbort);
+      resolve(ready);
+    }
+
+    function onAbort() {
+      finish(false);
+    }
+
+    function retry() {
+      if (done) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        attempt();
+      }, intervalMs);
+    }
+
+    function attempt() {
+      if (done) {
+        return;
+      }
+
+      if (Date.now() - startTime >= timeoutMs) {
+        finish(false);
+        return;
+      }
+
+      const socket = createConnection({ port, host });
+      activeSocket = socket;
+      let settled = false;
+
+      function cleanup() {
+        if (settled) return;
+        settled = true;
+        if (activeSocket === socket) {
+          activeSocket = null;
+        }
+        socket.removeAllListeners();
+        socket.destroy();
+      }
+
+      socket.once("connect", () => {
+        cleanup();
+        finish(true);
+      });
+
+      socket.once("error", () => {
+        cleanup();
+        retry();
+      });
+
+      socket.setTimeout(1000);
+      socket.once("timeout", () => {
+        cleanup();
+        retry();
+      });
+    }
+
+    if (signal?.aborted) {
+      finish(false);
+      return;
+    }
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    attempt();
+  });
+}
+
+function spawnPromise(command, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: options.echoOutput ? "inherit" : "pipe",
+      shell: false, // Explicitly disable shell to prevent command injection
+      ...options,
+    });
+
+    if (options.signal) {
+      options.signal.addEventListener("abort", () => {
+        child.kill("SIGTERM");
+      });
+    }
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(code);
+      } else {
+        reject(new Error(`Process exited with code ${code}`));
+      }
+    });
+
+    child.on("error", reject);
+  });
+}
+
+async function checkOllamaInstalled() {
+  try {
+    await spawnPromise("ollama", ["--version"], { echoOutput: false });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function normalizeBrowserBaseUrl(value) {
+  if (!value || typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(value.trim());
+    parsed.hash = "";
+    parsed.search = "";
+    return parsed.href.replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+async function resolveBrowserBaseUrl(apiBaseUrl) {
+  const explicitFrontendUrl =
+    normalizeBrowserBaseUrl(process.env.MCPJAM_INSPECTOR_FRONTEND_URL) ||
+    normalizeBrowserBaseUrl(process.env.FRONTEND_URL);
+  if (explicitFrontendUrl) {
+    return explicitFrontendUrl;
+  }
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/health`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (response.ok) {
+      const body = await response.json();
+      const healthFrontendUrl = normalizeBrowserBaseUrl(body?.frontend);
+      if (healthFrontendUrl) {
+        return healthFrontendUrl;
+      }
+    }
+  } catch {}
+
+  return apiBaseUrl;
+}
+
+function getTerminalCommand() {
+  const platform = process.platform;
+
+  if (platform === "darwin") {
+    // macOS
+    return ["open", "-a", "Terminal"];
+  } else if (platform === "win32") {
+    // Windows
+    return ["cmd", "/c", "start", "cmd", "/k"];
+  } else {
+    // Linux and other Unix-like systems
+    // Try common terminal emulators in order of preference
+    const terminals = [
+      "gnome-terminal",
+      "konsole",
+      "xterm",
+      "x-terminal-emulator",
+    ];
+    for (const terminal of terminals) {
+      try {
+        execSync(`which ${terminal}`, {
+          stdio: "ignore",
+        });
+        if (terminal === "gnome-terminal") {
+          return ["gnome-terminal", "--"];
+        } else if (terminal === "konsole") {
+          return ["konsole", "-e"];
+        } else {
+          return [terminal, "-e"];
+        }
+      } catch (e) {
+        // Terminal not found, try next
+      }
+    }
+    // Fallback
+    return ["xterm", "-e"];
+  }
+}
+
+async function openTerminalWithMultipleCommands(commands, title) {
+  const platform = process.platform;
+  const terminalCmd = getTerminalCommand();
+
+  if (platform === "darwin") {
+    // macOS: Chain commands with && separator
+    const chainedCommand = commands.join(" && ");
+    const script = `tell application "Terminal"
+      activate
+      do script "${chainedCommand}"
+    end tell`;
+
+    await spawnPromise("osascript", ["-e", script], { echoOutput: false });
+  } else if (platform === "win32") {
+    // Windows: Chain commands with && separator
+    const chainedCommand = commands.join(" && ");
+    const fullCommand = `${chainedCommand} && pause`;
+    await spawnPromise("cmd", ["/c", "start", "cmd", "/k", fullCommand], {
+      echoOutput: false,
+    });
+  } else {
+    // Linux and other Unix-like systems: Chain commands with && separator
+    const chainedCommand = commands.join(" && ");
+    const fullCommand = `${chainedCommand}; read -p "Press Enter to close..."`;
+    await spawnPromise(
+      terminalCmd[0],
+      [...terminalCmd.slice(1), "bash", "-c", fullCommand],
+      { echoOutput: false },
+    );
+  }
+}
+
+async function setupOllamaInSingleTerminal(model) {
+  logStep("Ollama", `Opening terminal to pull model ${model} and start server`);
+  logInfo("Both pull and serve commands will run in the same terminal window");
+
+  try {
+    const commands = [`ollama pull ${model}`, `ollama serve`];
+
+    await openTerminalWithMultipleCommands(
+      commands,
+      `Ollama: Pull ${model} & Serve`,
+    );
+    logSuccess("Ollama pull and serve started in same terminal");
+    logProgress(
+      "Waiting for model download to complete and server to start...",
+    );
+
+    // Wait a bit for the model pull to start
+    await delay(3000);
+
+    // Check if model was pulled successfully and server is ready
+    let setupReady = false;
+    for (let i = 0; i < 60; i++) {
+      // Wait up to 10 minutes for pull + server start
+      try {
+        // First check if server is responding
+        await spawnPromise("ollama", ["list"], { echoOutput: false });
+
+        // Then check if our model is available
+        try {
+          await spawnPromise("ollama", ["show", model], { echoOutput: false });
+          setupReady = true;
+          break;
+        } catch (e) {
+          // Model not ready yet, but server is responding
+        }
+      } catch (e) {
+        // Server not ready yet
+      }
+
+      await delay(10000); // Wait 10 seconds between checks
+      if (i % 3 === 0) {
+        logProgress(
+          `Still waiting for model ${model} to be ready and server to start...`,
+        );
+      }
+    }
+
+    if (setupReady) {
+      logSuccess(`Model ${model} is ready and Ollama server is running`);
+    } else {
+      logWarning(
+        `Setup may still be in progress. Please check the terminal window.`,
+      );
+    }
+  } catch (error) {
+    logError(`Failed to setup Ollama: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * `mcpjam-inspector harness install` — download and verify the local-harness
+ * runtime pack, then exit.
+ *
+ * A subcommand rather than a flag on the server, and handled before the server
+ * spawn, because installing a 515 MB agent runtime is a thing somebody asks
+ * for and watches finish. Nothing about starting the Inspector installs it.
+ */
+async function runHarnessSubcommand(args) {
+  const action = args[1];
+  if (action !== "install" && action !== "status") {
+    logError("usage: mcpjam-inspector harness <install|status>");
+    return 2;
+  }
+
+  // A dedicated bundle: importing the server entry would start a server.
+  const cliEntry = resolve(__dirname, "../dist/server/harness-install-cli.js");
+  if (!existsSync(cliEntry)) {
+    logError(
+      "the Inspector server build is missing; run `npm run build` first",
+    );
+    return 1;
+  }
+  // `pathToFileURL`, not a hand-built `file://` — a Windows path is
+  // `C:\\…`, and `file://C:/…` parses `C` as the URL's HOST.
+  let mod;
+  try {
+    mod = await import(pathToFileURL(cliEntry).href);
+  } catch (error) {
+    // The import FAILED; that is a different thing from a build that loaded
+    // and lacks the export, and reporting it as the latter sends the reader
+    // looking for the wrong problem.
+    logError(
+      `could not load the local harness runtime installer: ${
+        error?.message ?? error
+      }`,
+    );
+    return 1;
+  }
+  const install = mod?.harnessInstall;
+  const status = mod?.harnessStatus;
+  if (typeof install !== "function" || typeof status !== "function") {
+    logError(
+      "this Inspector build does not expose the local harness runtime " +
+        "installer",
+    );
+    return 1;
+  }
+
+  if (action === "status") {
+    const current = await status();
+    log(JSON.stringify(current, null, 2));
+    return current.state === "ready" ? 0 : 1;
+  }
+
+  logStep("1", "Installing the local Claude Code runtime pack");
+  let lastPercent = -1;
+  const result = await install((progress) => {
+    if (progress.state === "downloading" && progress.percent !== lastPercent) {
+      lastPercent = progress.percent;
+      process.stdout.write(`\r  downloading ${progress.percent}%   `);
+    } else if (progress.state === "verifying") {
+      process.stdout.write("\r  verifying…            ");
+    }
+  });
+  process.stdout.write("\r");
+  if (result.state === "ready") {
+    logSuccess(`Runtime pack ${result.packVersion} installed and verified`);
+    return 0;
+  }
+  // The reason, where the installer could establish one. Each of these sends a
+  // reader somewhere different — retry the network, free some disk, report a
+  // bad artifact — so collapsing them into "it failed" is what makes an
+  // installer message useless.
+  const REASONS = {
+    network: "the runtime could not be downloaded",
+    verification:
+      "the downloaded runtime did not match what this Inspector expected, " +
+      "so it was not installed",
+    disk: "the runtime could not be written to its install location",
+    unknown: "the install did not complete",
+  };
+  if (result.state === "failed") {
+    logError(
+      `${REASONS[result.reason] ?? REASONS.unknown}` +
+        (result.message ? `: ${result.message}` : ""),
+    );
+    logInfo("Run `mcpjam-inspector harness install` again to retry.");
+    return 1;
+  }
+  if (result.state === "interrupted") {
+    logError("Setup was interrupted before it finished.");
+    logInfo("Run `mcpjam-inspector harness install` again to continue.");
+    return 1;
+  }
+  logError(
+    `Runtime pack not installed (${result.state})` +
+      (result.message ? `: ${result.message}` : ""),
+  );
+  return 1;
+}
+
+async function main() {
+  // Subcommands run before the banner and before anything spawns a server.
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs[0] === "harness") {
+    return runHarnessSubcommand(rawArgs);
+  }
+
+  // Show MCP banner at startup
+  console.clear();
+  printBanner();
+
+  // Parse command line arguments
+  const args = process.argv.slice(2);
+  const envVars = {};
+  let parsingFlags = true;
+  let ollamaModel = null;
+  let mcpServerCommand = null;
+  let mcpServerArgs = [];
+  let mcpConfigFile = null;
+  let mcpServerName = null;
+  let rebuildRequested = false;
+
+  // New HTTP transport flags
+  let httpUrl = null;
+  let serverDisplayName = null;
+  let initialTab = null;
+  let bearerToken = null;
+  let useOAuth = false;
+  let openBrowser = process.env.MCPJAM_INSPECTOR_SUPPRESS_AUTO_OPEN !== "1";
+  const customHeaders = [];
+  let verboseLogs = false;
+
+  // First pass: check for --verbose flag before processing other args
+  for (const arg of args) {
+    if (arg === "--verbose" || arg === "-v") {
+      verboseLogs = true;
+      break;
+    }
+  }
+
+  // Conditional logging functions (only log when verbose)
+  const verboseInfo = (message) => verboseLogs && logInfo(message);
+  const verboseSuccess = (message) => verboseLogs && logSuccess(message);
+  const verboseStep = (step, message) => verboseLogs && logStep(step, message);
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (parsingFlags && arg === "--") {
+      parsingFlags = false;
+      continue;
+    }
+
+    if (parsingFlags && arg === "--ollama" && i + 1 < args.length) {
+      ollamaModel = args[++i];
+      continue;
+    }
+
+    if (parsingFlags && arg === "--port" && i + 1 < args.length) {
+      const port = args[++i];
+      envVars.PORT = port;
+      // Default: localhost in development, 127.0.0.1 in production
+      const defaultHost =
+        process.env.ENVIRONMENT === "dev" ? "localhost" : "127.0.0.1";
+      const baseHost = process.env.HOST || defaultHost;
+      envVars.BASE_URL = `http://${baseHost}:${port}`;
+      continue;
+    }
+
+    if (parsingFlags && arg === "--config" && i + 1 < args.length) {
+      mcpConfigFile = args[++i];
+      continue;
+    }
+
+    if (parsingFlags && arg === "--server" && i + 1 < args.length) {
+      mcpServerName = args[++i];
+      continue;
+    }
+
+    if (parsingFlags && (arg === "--rebuild" || arg === "--force-rebuild")) {
+      rebuildRequested = true;
+      continue;
+    }
+
+    // New: --url for HTTP transport
+    if (parsingFlags && arg === "--url" && i + 1 < args.length) {
+      httpUrl = args[++i];
+      continue;
+    }
+
+    // New: --name for server display name
+    if (
+      parsingFlags &&
+      (arg === "--name" || arg === "--server-name") &&
+      i + 1 < args.length
+    ) {
+      serverDisplayName = args[++i];
+      continue;
+    }
+
+    // New: --tab for initial tab navigation
+    if (
+      parsingFlags &&
+      (arg === "--tab" || arg === "--view") &&
+      i + 1 < args.length
+    ) {
+      initialTab = args[++i];
+      continue;
+    }
+
+    // New: --bearer for Bearer token auth
+    if (parsingFlags && arg === "--bearer" && i + 1 < args.length) {
+      bearerToken = args[++i];
+      continue;
+    }
+
+    // New: --oauth flag to trigger OAuth flow
+    if (parsingFlags && arg === "--oauth") {
+      useOAuth = true;
+      continue;
+    }
+
+    if (parsingFlags && (arg === "--no-open" || arg === "--no-browser")) {
+      openBrowser = false;
+      continue;
+    }
+
+    // New: --verbose flag to enable HTTP request logs in production
+    if (parsingFlags && (arg === "--verbose" || arg === "-v")) {
+      verboseLogs = true;
+      continue;
+    }
+
+    // New: --header for custom headers (repeatable)
+    if (
+      parsingFlags &&
+      (arg === "--header" || arg === "-H") &&
+      i + 1 < args.length
+    ) {
+      const headerValue = args[++i];
+      const equalsIndex = headerValue.indexOf("=");
+      if (equalsIndex !== -1) {
+        const key = headerValue.substring(0, equalsIndex);
+        const value = headerValue.substring(equalsIndex + 1);
+        customHeaders.push({ key, value });
+      } else {
+        logWarning(
+          `Invalid header format: ${headerValue}. Use "Key=Value" format.`,
+        );
+      }
+      continue;
+    }
+
+    if (parsingFlags && arg === "-e" && i + 1 < args.length) {
+      const envVar = args[++i];
+      const equalsIndex = envVar.indexOf("=");
+
+      if (equalsIndex !== -1) {
+        const key = envVar.substring(0, equalsIndex);
+        const value = envVar.substring(equalsIndex + 1);
+        envVars[key] = value;
+      } else {
+        envVars[envVar] = "";
+      }
+      continue;
+    }
+
+    // If we encounter a non-flag argument, treat it as MCP server command
+    if (parsingFlags && !arg.startsWith("-")) {
+      mcpServerCommand = arg;
+      // Collect all remaining arguments as server arguments
+      mcpServerArgs = args.slice(i + 1);
+      break;
+    }
+  }
+
+  // Allow environment variables to request rebuild as well
+  const truthyEnv = new Set(["1", "true", "yes", "on"]);
+  const forceRebuildEnv = (process.env.FORCE_REBUILD || "").toLowerCase();
+  const rebuildEnv = (process.env.REBUILD || "").toLowerCase();
+  if (truthyEnv.has(forceRebuildEnv) || truthyEnv.has(rebuildEnv)) {
+    rebuildRequested = true;
+  }
+
+  // Handle MCP config file if provided
+  if (mcpConfigFile) {
+    logStep("MCP Server", `Configuring auto-connection to: ${mcpConfigFile}`);
+
+    try {
+      const configPath = resolve(mcpConfigFile);
+      if (!existsSync(configPath)) {
+        logError(`MCP config file not found: ${configPath}`);
+        process.exit(1);
+      }
+
+      const configContent = readFileSync(configPath, "utf-8");
+      const configData = JSON.parse(configContent);
+
+      if (
+        !configData.mcpServers ||
+        Object.keys(configData.mcpServers).length === 0
+      ) {
+        logWarning("No MCP servers found in config file");
+      } else {
+        // If --server flag is provided, validate it exists but don't filter config
+        if (mcpServerName) {
+          if (!configData.mcpServers[mcpServerName]) {
+            logError(
+              `Server '${mcpServerName}' not found in config file. Available servers: ${Object.keys(
+                configData.mcpServers,
+              ).join(", ")}`,
+            );
+            process.exit(1);
+          }
+          logInfo(`Auto-connecting only to server: ${mcpServerName}`);
+          // Pass the server filter separately
+          envVars.MCP_AUTO_CONNECT_SERVER = mcpServerName;
+        }
+
+        // Pass the full config (all servers will show in UI)
+        envVars.MCP_CONFIG_DATA = JSON.stringify(configData);
+        const serverCount = Object.keys(configData.mcpServers).length;
+        const serverNames = Object.keys(configData.mcpServers).join(", ");
+        logSuccess(
+          `MCP config loaded with ${serverCount} server(s) - showing all in UI`,
+        );
+        logInfo(`Servers: ${serverNames}`);
+        if (mcpServerName) {
+          logInfo(`Will auto-connect only to: ${mcpServerName}`);
+        } else {
+          logInfo(`Will auto-connect to all servers`);
+        }
+      }
+    } catch (error) {
+      logError(`Failed to read MCP config file: ${error.message}`);
+      process.exit(1);
+    }
+  } else if (httpUrl) {
+    // Handle HTTP URL mode (for Vite plugin integration, etc.)
+    const displayName = serverDisplayName || "HTTP Server";
+    verboseStep("MCP Server", `Configuring HTTP server: ${displayName}`);
+    verboseInfo(`URL: ${httpUrl}`);
+
+    // Validate the URL
+    try {
+      new URL(httpUrl);
+    } catch (err) {
+      logError(`Invalid URL format: ${httpUrl}`);
+      process.exit(1);
+    }
+
+    // Build headers object
+    const headers = {};
+    if (bearerToken) {
+      headers["Authorization"] = `Bearer ${bearerToken}`;
+      verboseInfo("Auth: Bearer token configured");
+    }
+    for (const { key, value } of customHeaders) {
+      headers[key] = value;
+      verboseInfo(`Header: ${key}=${value}`);
+    }
+
+    // Create a synthetic MCP config for the HTTP server
+    const httpServerConfig = {
+      mcpServers: {
+        [displayName]: {
+          url: httpUrl,
+          ...(Object.keys(headers).length > 0 && { headers }),
+          ...(useOAuth && { useOAuth: true }),
+        },
+      },
+    };
+
+    envVars.MCP_CONFIG_DATA = JSON.stringify(httpServerConfig);
+    envVars.MCP_AUTO_CONNECT_SERVER = displayName;
+    if (useOAuth) {
+      verboseInfo("OAuth: Will trigger OAuth flow on connect");
+    }
+    verboseSuccess(`HTTP server "${displayName}" configured for auto-connect`);
+  } else if (mcpServerCommand) {
+    // Handle single MCP server command if provided (legacy mode)
+    logStep(
+      "MCP Server",
+      `Configuring auto-connection to: ${mcpServerCommand} ${mcpServerArgs.join(
+        " ",
+      )}`,
+    );
+
+    // Pass MCP server config via environment variables
+    envVars.MCP_SERVER_COMMAND = mcpServerCommand;
+    if (mcpServerArgs.length > 0) {
+      envVars.MCP_SERVER_ARGS = JSON.stringify(mcpServerArgs);
+    }
+
+    logSuccess(`MCP server will auto-connect on startup`);
+  }
+
+  // Pass global options (applicable to all modes)
+  if (initialTab) {
+    envVars.MCP_INITIAL_TAB = initialTab;
+    verboseInfo(`Initial tab: ${initialTab}`);
+  }
+
+  // Handle Ollama setup if requested
+  if (ollamaModel) {
+    logStep("Setup", "Configuring Ollama integration");
+
+    const isOllamaInstalled = await checkOllamaInstalled();
+    if (!isOllamaInstalled) {
+      logError("Ollama is not installed. Please install Ollama first:");
+      logInfo(
+        "Visit https://ollama.ai/download to download and install Ollama",
+      );
+      process.exit(1);
+    }
+
+    logSuccess("Ollama is installed");
+
+    try {
+      await setupOllamaInSingleTerminal(ollamaModel);
+
+      logDivider();
+      logSuccess(`Ollama setup complete with model: ${ollamaModel}`);
+      logInfo("Ollama server is running and ready for MCP connections");
+      logDivider();
+    } catch (error) {
+      logError("Failed to setup Ollama");
+      process.exit(1);
+    }
+  }
+
+  const projectRoot = resolve(__dirname, "..");
+
+  // Apply parsed environment variables to process.env first
+  Object.assign(process.env, envVars);
+
+  // Port configuration (fixed default to 6274)
+  const requestedPortValue = envVars.PORT || "6274";
+  const requestedPort = Number(requestedPortValue);
+  let PORT;
+
+  try {
+    if (
+      !/^\d+$/.test(requestedPortValue) ||
+      !Number.isInteger(requestedPort) ||
+      requestedPort < 1 ||
+      requestedPort > 65535
+    ) {
+      logError(`Invalid port: ${requestedPortValue}`);
+      throw new Error(`Invalid port: ${requestedPortValue}`);
+    }
+
+    // Check if user explicitly set a port via --port flag
+    const hasExplicitPort = envVars.PORT !== undefined;
+
+    if (hasExplicitPort) {
+      if (await isPortAvailable(requestedPort)) {
+        PORT = requestedPort.toString();
+      } else {
+        logError(`Explicitly requested port ${requestedPort} is not available`);
+        logInfo(
+          "Use a different port with --port <number> or let the system find one automatically",
+        );
+        throw new Error(`Port ${requestedPort} is already in use`);
+      }
+    } else {
+      // Fixed port policy: use default port 6274 and fail fast if unavailable
+      if (await isPortAvailable(requestedPort)) {
+        PORT = requestedPort.toString();
+      } else {
+        logError(
+          `Default port ${requestedPort} is already in use. Please free the port`,
+        );
+        throw new Error(`Port ${requestedPort} is already in use`);
+      }
+    }
+
+    // Update environment variables with the final port
+    envVars.PORT = PORT;
+    envVars.SERVER_PORT = PORT;
+    // Default: localhost in development, 127.0.0.1 in production
+    const defaultHost =
+      process.env.ENVIRONMENT === "dev" ? "localhost" : "127.0.0.1";
+    const baseHost = process.env.HOST || defaultHost;
+    envVars.BASE_URL = `http://${baseHost}:${PORT}`;
+    Object.assign(process.env, envVars);
+  } catch (error) {
+    logError(`Port configuration failed: ${error.message}`);
+    throw error;
+  }
+
+  const abort = new AbortController();
+  const initialParentPid = process.ppid;
+  let parentWatcher = null;
+  const orphanCheckDisabled =
+    process.env.MCPJAM_INSPECTOR_DISABLE_ORPHAN_CHECK === "1";
+
+  let cancelled = false;
+  function stopParentWatcher() {
+    if (parentWatcher) {
+      clearInterval(parentWatcher);
+      parentWatcher = null;
+    }
+  }
+
+  function requestShutdown() {
+    if (cancelled) {
+      return;
+    }
+
+    cancelled = true;
+    stopParentWatcher();
+    abort.abort();
+    logDivider();
+    logWarning("Shutdown signal received...");
+    logProgress("Stopping MCP Inspector server");
+    logInfo("Cleaning up resources...");
+  }
+
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, requestShutdown);
+  }
+
+  if (!orphanCheckDisabled && initialParentPid > 1) {
+    parentWatcher = setInterval(() => {
+      if (process.ppid !== initialParentPid) {
+        requestShutdown();
+      }
+    }, 1000);
+    parentWatcher.unref?.();
+  }
+
+  try {
+    const distServerPath = resolve(projectRoot, "dist", "server", "index.js");
+
+    // Production start behavior:
+    // - Do NOT auto-build by default.
+    // - If --rebuild (or env) is passed, run a rebuild before starting.
+    // - If dist is missing and no rebuild requested, fail fast with guidance.
+    const distExists = existsSync(distServerPath);
+
+    if (rebuildRequested) {
+      logStep("Build", "Rebuild requested; running production build");
+      await spawnPromise("npm", ["run", "build"], {
+        env: process.env,
+        cwd: projectRoot,
+        signal: abort.signal,
+        echoOutput: false,
+      });
+      logSuccess("Build completed successfully");
+      await delay(500);
+    } else if (!distExists) {
+      logError(
+        `Production build not found at ${distServerPath}. Build artifacts are required to start.`,
+      );
+      logInfo(
+        "Run this command with --rebuild or build in CI/CD before starting.",
+      );
+      process.exit(1);
+    } else {
+      // Small delay to let logs flush before starting
+      await delay(500);
+    }
+
+    if (cancelled) {
+      return 0;
+    }
+
+    // Spawn the server process but don't wait for it to exit
+    // The invocation folder travels EXPLICITLY, because `cwd` below is about
+    // to become the installed package's root and the server would otherwise
+    // have no way back to where the user actually was.
+    const launchWorkspace = launchWorkspaceCandidate({ projectRoot });
+    const launchToken = createLaunchToken();
+    const serverProcess = spawn("node", [distServerPath], {
+      env: {
+        ...process.env,
+        ...(launchToken ? { MCPJAM_SESSION_TOKEN: launchToken } : {}),
+        MCPJAM_INSPECTOR_PARENT_PID: process.pid.toString(),
+        NODE_ENV: "production",
+        PORT: PORT,
+        ...(launchWorkspace
+          ? { MCPJAM_LAUNCH_WORKSPACE: launchWorkspace }
+          : {}),
+        ...(verboseLogs && { VERBOSE_LOGS: "true" }),
+      },
+      cwd: projectRoot,
+      stdio: "inherit",
+    });
+
+    let serverProcessClosed = false;
+    let forceKillTimer = null;
+
+    function clearForceKillTimer() {
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = null;
+      }
+    }
+
+    const serverExit = new Promise((resolve, reject) => {
+      serverProcess.on("close", (code, signal) => {
+        serverProcessClosed = true;
+        clearForceKillTimer();
+        if (code === 0 || cancelled) {
+          resolve({ code, signal });
+        } else {
+          reject(
+            new Error(
+              signal
+                ? `Server process exited from signal ${signal}`
+                : `Server process exited with code ${code}`,
+            ),
+          );
+        }
+      });
+    });
+
+    function killServerProcess() {
+      if (serverProcessClosed) {
+        return;
+      }
+
+      serverProcess.kill("SIGTERM");
+      if (!forceKillTimer) {
+        forceKillTimer = setTimeout(() => {
+          if (!serverProcessClosed) {
+            logWarning(
+              "Server did not exit after SIGTERM; forcing shutdown...",
+            );
+            serverProcess.kill("SIGKILL");
+          }
+        }, 5000);
+        forceKillTimer.unref?.();
+      }
+    }
+
+    process.once("exit", killServerProcess);
+
+    // Handle server process errors
+    serverProcess.on("error", (error) => {
+      if (!cancelled) {
+        logError(`Failed to start server: ${error.message}`);
+        process.exit(1);
+      }
+    });
+
+    // Handle abort signal
+    abort.signal.addEventListener("abort", killServerProcess, { once: true });
+
+    if (!cancelled) {
+      // Default: localhost in development, 127.0.0.1 in production
+      const defaultHost =
+        process.env.ENVIRONMENT === "dev" ? "localhost" : "127.0.0.1";
+      const host = process.env.HOST || defaultHost;
+      const apiBaseUrl = process.env.BASE_URL || `http://${host}:${PORT}`;
+
+      // Wait until the server is actually accepting connections
+      const ready = await waitForServerReady(
+        parseInt(PORT, 10),
+        host,
+        30000,
+        abort.signal,
+      );
+
+      if (!ready && !cancelled) {
+        logWarning(
+          `Server did not become ready within 30s. Please visit ${apiBaseUrl} manually.`,
+        );
+      } else if (!cancelled) {
+        const base = await resolveBrowserBaseUrl(apiBaseUrl);
+        const url = createAccessLink(base, launchToken, initialTab);
+        const docker = process.env.DOCKER_CONTAINER === "true";
+        let opened = false;
+        if (openBrowser && !docker) {
+          try {
+            await open(url);
+            opened = true;
+          } catch {
+            logWarning("Could not open your browser automatically.");
+          }
+        }
+        if (shouldPrintAccessLink(launchToken)) {
+          logSuccess("MCPJam Inspector is ready");
+          log("");
+          const printLink = (label, link) => {
+            log(`  ${colors.green}➜ ${colors.bright}${label}${colors.reset}`);
+            log(link, colors.primary);
+          };
+          printLink(docker ? "Open MCPJam" : "Local", url);
+          for (const link of networkAccessLinks(
+            base,
+            launchToken,
+            process.env.MCPJAM_ALLOWED_HOSTS,
+            initialTab,
+          ))
+            printLink("Network", link);
+          log("");
+          log(
+            opened
+              ? "Opened in your browser. Keep this link private: it signs a browser in."
+              : "Open this link in your browser. Keep it private: it signs a browser in.",
+          );
+          if (docker)
+            log(
+              "Using another port or computer? Keep the #token=… part and change the address.",
+            );
+        }
+      }
+    }
+
+    // Wait for the server process to exit
+    const result = await serverExit;
+    if (cancelled) {
+      if (result.signal === "SIGKILL") {
+        logWarning("Server process was force-killed after shutdown timeout");
+      } else {
+        logSuccess("Server stopped gracefully");
+      }
+      logDivider();
+    }
+  } catch (e) {
+    if (!cancelled || process.env.DEBUG) {
+      logDivider();
+      logError("Failed to start MCP Inspector");
+      logError(`Error: ${e.message}`);
+      logDivider();
+      throw e;
+    }
+  } finally {
+    stopParentWatcher();
+  }
+
+  return 0;
+}
+
+main()
+  .then((code) => {
+    // A subcommand's exit code is its ANSWER: `harness status` returns 1 when
+    // no pack is installed, and a script that branches on it was reading 0.
+    // Set rather than exited on, so the JSON it just printed finishes draining
+    // — `process.exit` truncates a pending write to a pipe. Nothing is left
+    // holding the loop open on that path, so the process still ends here.
+    if (typeof code === "number") {
+      process.exitCode = code;
+      return;
+    }
+    process.exit(0);
+  })
+  .catch((e) => {
+    logError("Fatal error occurred");
+    logError(e.stack || e.message);
+    process.exit(1);
+  });

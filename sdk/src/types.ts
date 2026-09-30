@@ -1,0 +1,144 @@
+/**
+ * Core types for SDK evals functionality
+ */
+
+// Re-export AI SDK message types for users
+import type {
+  ModelMessage,
+  UserModelMessage,
+  AssistantModelMessage,
+  ToolModelMessage,
+} from "ai";
+import type {
+  EvalWidgetSnapshotInput,
+  EvalTraceSpanInput,
+} from "./eval-reporting-types.js";
+
+export type {
+  ModelMessage,
+  UserModelMessage,
+  AssistantModelMessage,
+  ToolModelMessage,
+};
+
+// Backwards compatibility aliases for AI SDK 5.x users
+export type CoreMessage = ModelMessage;
+export type CoreUserMessage = UserModelMessage;
+export type CoreAssistantMessage = AssistantModelMessage;
+export type CoreToolMessage = ToolModelMessage;
+
+/**
+ * Built-in LLM providers with native SDK support
+ */
+export type LLMProvider =
+  | "anthropic"
+  | "openai"
+  | "azure"
+  | "bedrock"
+  | "deepseek"
+  | "google"
+  | "ollama"
+  | "mistral"
+  | "openrouter"
+  | "xai"
+  // Not a vendor: MCPJam-hosted inference, billed to your organization's
+  // credits. `mcpjam/anthropic/claude-sonnet-4.5` names the vendor model
+  // AFTER the prefix, and the only credential it needs is `MCPJAM_API_KEY`.
+  // See `mcpjam-model-lease.ts`.
+  | "mcpjam";
+
+/**
+ * Compatible API protocols for custom providers
+ */
+export type CompatibleProtocol = "openai-compatible" | "anthropic-compatible";
+
+/**
+ * Configuration for a custom provider (user-defined)
+ */
+export interface CustomProvider {
+  /** Unique name for this provider (used in model strings, e.g., "groq/llama-3") */
+  name: string;
+  /** API protocol this provider is compatible with */
+  protocol: CompatibleProtocol;
+  /** Base URL for the API endpoint */
+  baseUrl: string;
+  /** List of available model IDs */
+  modelIds: string[];
+  /** Optional API key (can also be provided at runtime) */
+  apiKey?: string;
+  /** Environment variable name to read API key from (fallback) */
+  apiKeyEnvVar?: string;
+  /**
+   * Use Chat Completions API (.chat()) instead of default.
+   * Required for some OpenAI-compatible providers like LiteLLM.
+   * Only applies to openai-compatible protocol.
+   */
+  useChatCompletions?: boolean;
+}
+
+/**
+ * Configuration for an LLM
+ */
+export interface LLMConfig {
+  provider: LLMProvider;
+  model: string;
+  apiKey: string;
+}
+
+/**
+ * Represents a tool call made by the LLM
+ */
+export type { ToolCall } from "@mcpjam/evaluators/internal/types";
+import type { ToolCall } from "@mcpjam/evaluators/internal/types";
+
+/**
+ * Token usage statistics
+ */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/**
+ * Latency breakdown for prompt execution
+ */
+export interface LatencyBreakdown {
+  /** Total wall-clock time in milliseconds */
+  e2eMs: number;
+  /** LLM API time in milliseconds */
+  llmMs: number;
+  /** MCP tool execution time in milliseconds */
+  mcpMs: number;
+}
+
+/**
+ * Raw prompt result data (used internally)
+ */
+export interface PromptResultData {
+  /** Model-visible catalog and runtime settings captured at execution time. */
+  recordedContext?: {
+    toolDefinitions: unknown;
+    systemPrompt: string;
+    model: string;
+    temperature?: number;
+    unavailable?: string[];
+  };
+  /** The original prompt/query that was sent */
+  prompt: string;
+  /** The full conversation history (user, assistant, tool messages) */
+  messages: ModelMessage[];
+  text: string;
+  toolCalls: ToolCall[];
+  usage: TokenUsage;
+  latency: LatencyBreakdown;
+  error?: string;
+  /** LLM provider name (e.g., "openai", "anthropic") */
+  provider?: string;
+  /** LLM model name (e.g., "gpt-4o", "claude-3-5-sonnet-20241022") */
+  model?: string;
+  /** Persisted widget snapshots captured during MCP App tool execution */
+  widgetSnapshots?: EvalWidgetSnapshotInput[];
+  /** Timeline spans for eval trace visualization (relative to prompt start) */
+  spans?: EvalTraceSpanInput[];
+}

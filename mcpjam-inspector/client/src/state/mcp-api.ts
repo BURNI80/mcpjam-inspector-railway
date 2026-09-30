@@ -1,0 +1,495 @@
+import { serverCheckQueue, isServerCheckQueueError } from "@/lib/server-check-queue";
+import { observeDesktopOperation } from "@/lib/desktop-diagnostics";
+import type {
+  HttpServerConfig,
+  MCPServerConfig,
+  NormalizedError,
+} from "@mcpjam/sdk/browser";
+import type { LoggingLevel } from "@modelcontextprotocol/client";
+import { authFetch } from "@/lib/session-token";
+import { HOSTED_MODE } from "@/lib/config";
+import { WebApiError } from "@/lib/apis/web/base";
+import {
+  validateHostedServer,
+  type HostedServerValidateContext,
+  type HostedServerValidateResponse,
+} from "@/lib/apis/web/servers-api";
+import {
+  getHostedScenarioAccessVersion,
+  getHostedScenarioId,
+  getHostedOAuthToken,
+} from "@/lib/apis/web/context";
+import { BootstrapNotReadyError } from "@/lib/app-ready";
+import {
+  readCredentialRefusal,
+  withCredentialRefusal,
+} from "@/lib/credential-refusal";
+import type { ConnectionDefaults } from "@/shared/connection-defaults";
+
+
+/**
+ * Extracts an OAuth access token from an HttpServerConfig's Authorization header.
+ * Returns undefined if the config isn't an HTTP config or has no Bearer token.
+ */
+function extractOAuthToken(serverConfig: MCPServerConfig): string | undefined {
+  const httpConfig = serverConfig as HttpServerConfig;
+  const authHeader = (
+    httpConfig?.requestInit?.headers as Record<string, string>
+  )?.["Authorization"];
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice("Bearer ".length);
+  }
+  return undefined;
+}
+
+function normalizeHostedValidationError(error: unknown): string {
+  if (error instanceof BootstrapNotReadyError) {
+    return "Hosted project is still loading. Please try again in a moment.";
+  }
+
+  if (
+    error instanceof Error &&
+    error.message.startsWith("Hosted server not found")
+  ) {
+    return "Hosted server metadata is still syncing. Please retry.";
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return "Hosted validation failed";
+}
+
+function buildHostedValidationContext(
+  serverId: string,
+  options?: {
+    projectId?: string;
+    serverName?: string;
+    connectionDefaults?: ConnectionDefaults;
+    queueSignal?: AbortSignal;
+  },
+): HostedServerValidateContext | undefined {
+  if (!options?.projectId) return undefined;
+
+  const scenarioId = getHostedScenarioId();
+  return {
+    projectId: options.projectId,
+    serverId,
+    ...(options.queueSignal ? { queueSignal: options.queueSignal } : {}),
+    ...(options.serverName ? { serverName: options.serverName } : {}),
+    ...(scenarioId ? { accessScope: "chat_v2" } : {}),
+    ...(scenarioId ? { scenarioId } : {}),
+    ...(scenarioId ? { accessVersion: getHostedScenarioAccessVersion() } : {}),
+    // Surface the resolver-path `mcpProfile.initialize.*` pins to the
+    // hosted validate request. Without this the hosted branch dropped
+    // them silently: `connectionDefaults` was computed by
+    // `buildResolverConnectionDefaults` in `use-server-state.ts` and
+    // passed through `testConnection`/`reconnectServer`, but only the
+    // local-resolver path forwarded it (`buildResolverBody`). Hosted
+    // connects therefore always initialized with SDK defaults even
+    // when the active host profile pinned an explicit clientInfo /
+    // supportedProtocolVersions.
+    ...(options.connectionDefaults?.clientInfo
+      ? { clientInfo: options.connectionDefaults.clientInfo }
+      : {}),
+    ...(options.connectionDefaults?.supportedProtocolVersions &&
+    options.connectionDefaults.supportedProtocolVersions.length > 0
+      ? {
+          supportedProtocolVersions:
+            options.connectionDefaults.supportedProtocolVersions,
+        }
+      : {}),
+    // mcpProtocolVersion — same drop-on-the-floor bug as clientInfo /
+    // supportedProtocolVersions had before being plumbed here. Without
+    // this, hosted connects ignored the client-level Stateless toggle
+    // and always initialized via the legacy upstream Client.
+    ...(options.connectionDefaults?.mcpProtocolVersion
+      ? { mcpProtocolVersion: options.connectionDefaults.mcpProtocolVersion }
+      : {}),
+    // SEP-2243 mirroring knob — same plumb-or-drop-silently hazard as the
+    // three above. Only `false` is ever set (see `ConnectionDefaults`).
+    ...(options.connectionDefaults?.mirrorToolParamHeaders === false
+      ? { mirrorToolParamHeaders: false }
+      : {}),
+    // Sibling conformance knobs — same plumb-or-drop-silently hazard.
+    ...(options.connectionDefaults?.firstPageOnly === true
+      ? { firstPageOnly: true }
+      : {}),
+    ...(options.connectionDefaults?.supportsMrtr === false
+      ? { supportsMrtr: false }
+      : {}),
+    ...(options.connectionDefaults?.suppressListenChannel === true
+      ? { suppressListenChannel: true }
+      : {}),
+    ...(options.connectionDefaults?.dropToolListChanged === true
+      ? { dropToolListChanged: true }
+      : {}),
+    ...(options.connectionDefaults?.toolCallCancellation
+      ? { toolCallCancellation: options.connectionDefaults.toolCallCancellation }
+      : {}),
+  };
+}
+
+async function safeValidateHostedServer(
+  serverId: string,
+  serverConfig: MCPServerConfig,
+  hostedContext?: HostedServerValidateContext,
+): Promise<
+  HostedServerValidateResponse & {
+    error?: string;
+    normalized?: NormalizedError;
+  }
+> {
+  try {
+    const oauthToken =
+      extractOAuthToken(serverConfig) ?? getHostedOAuthToken(serverId);
+    return await validateHostedServer(
+        serverId,
+        oauthToken,
+        serverConfig.capabilities as Record<string, unknown> | undefined,
+        hostedContext,
+      );
+  } catch (error) {
+    if (hostedContext?.queueSignal?.aborted) throw hostedContext.queueSignal.reason;
+    if (hostedContext?.queueSignal && isServerCheckQueueError(error)) throw error;
+    // Preserve the server-attached `normalized` block when the wrapped
+    // error is a WebApiError. The string form (kept for back-compat) is
+    // populated from the existing normalizer; the rich block flows to
+    // the ErrorCard via `lastNormalizedError` on the server reducer.
+    const normalized =
+      error instanceof WebApiError ? error.normalized : undefined;
+    // Thread the tagged-401 escalation flag through so the hosted connect
+    // path can detect "needs interactive OAuth" structurally, matching the
+    // local envelope's top-level `oauthRequired`.
+    const oauthRequired =
+      error instanceof WebApiError &&
+      error.details?.oauthRequired === true;
+    // Same threading for a saved credential the backend refused to release
+    // (a moved server, or the org's export policy).
+    const credentialRefusal =
+      error instanceof WebApiError
+        ? readCredentialRefusal(error.details)
+        : null;
+    return {
+      success: false,
+      error: normalizeHostedValidationError(error),
+      ...(normalized ? { normalized } : {}),
+      ...(oauthRequired ? { oauthRequired: true } : {}),
+      ...(credentialRefusal ? { credentialRefusal } : {}),
+    };
+  }
+}
+
+// Helper to add timeout to authFetch requests
+async function authFetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number = 10000,
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () =>
+      controller.abort(
+        new DOMException(
+          `Connection attempt timed out after ${timeoutMs / 1000} seconds. The server may not exist or is not responding.`,
+          "TimeoutError",
+        ),
+      ),
+    timeoutMs,
+  );
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  try {
+    return await authFetch(url, { ...options, signal });
+  } catch (error) {
+    if (signal.aborted) throw signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function buildResolverBody(
+  serverId: string,
+  options: {
+    projectId: string;
+    serverName?: string;
+    connectionDefaults?: ConnectionDefaults;
+    queueSignal?: AbortSignal;
+  },
+): Record<string, unknown> {
+  return {
+    projectId: options.projectId,
+    serverId,
+    ...(options.serverName ? { serverName: options.serverName } : {}),
+    ...(options.connectionDefaults
+      ? { connectionDefaults: options.connectionDefaults }
+      : {}),
+  };
+}
+
+// Only the network attempt owns a browser slot; OAuth interaction happens in
+// the caller before entering this function or after it has settled.
+async function localConnectionRequest(
+  url: string,
+  body: Record<string, unknown>,
+  queueSignal: AbortSignal | undefined,
+  setStatus: (status: number) => void,
+) {
+  const execute = async (signal: AbortSignal) => {
+    const metadata = serverCheckQueue.attemptMetadata(signal) ?? {
+      requestId: crypto.randomUUID(),
+      intent: "manual" as const,
+    };
+    const done = new AbortController();
+    const promotionSignal = AbortSignal.any([signal, done.signal]);
+    const detach = serverCheckQueue.bindPromotion(signal, async () => {
+      try {
+        while (!promotionSignal.aborted) {
+          const response = await authFetch("/api/mcp/servers/checks/promote", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requestId: metadata.requestId }),
+            signal: promotionSignal,
+          });
+          if (!response.ok)
+            throw new Error("Could not prioritize this connection");
+          const result = await response.json();
+          if (result.state !== "expired") return;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      } catch (error) {
+        if (!done.signal.aborted) throw error;
+      }
+    });
+    try {
+      const response = await authFetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, _serverCheck: metadata }),
+          signal,
+        },
+        50_000,
+      );
+      setStatus(response.status);
+      const result = await response.json();
+      if (!response.ok) {
+        const error = new WebApiError(
+          response.status,
+          result.code ?? null,
+          result.error ?? "Connection failed",
+          result.normalized,
+          result.details,
+        );
+        error.retryAfterMs =
+          Number(response.headers?.get("Retry-After") ?? 2) * 1000;
+        if (isServerCheckQueueError(error)) throw error;
+      }
+      return result;
+    } finally {
+      done.abort();
+      detach();
+    }
+  };
+  if (queueSignal) return execute(queueSignal);
+  return serverCheckQueue.run(
+    {
+      projectId: String(body.projectId),
+      serverName: String(body.serverName ?? body.serverId),
+      identity: JSON.stringify(body.connectionDefaults ?? {}),
+    },
+    execute,
+  );
+}
+
+export async function testConnection(
+  serverConfig: MCPServerConfig,
+  serverId: string,
+  options?: {
+    projectId?: string;
+    serverName?: string;
+    connectionDefaults?: ConnectionDefaults;
+    queueSignal?: AbortSignal;
+  },
+) {
+  return observeDesktopOperation("connect", async (setStatus) => {
+    if (HOSTED_MODE) {
+      return withCredentialRefusal(
+        await safeValidateHostedServer(
+          serverId,
+          serverConfig,
+          buildHostedValidationContext(serverId, options),
+        ),
+        options?.serverName,
+      );
+    }
+
+    if (!options?.projectId) {
+      throw new Error(
+        "projectId is required for testConnection in local mode (server must be synced to Convex first)",
+      );
+    }
+
+    const body = buildResolverBody(serverId, {
+      projectId: options.projectId,
+      serverName: options.serverName,
+      connectionDefaults: options.connectionDefaults,
+    });
+
+    return withCredentialRefusal(
+      await localConnectionRequest("/api/mcp/connect", body, options.queueSignal, setStatus),
+      options.serverName,
+    );
+  });
+}
+
+export async function deleteServer(serverId: string) {
+  if (HOSTED_MODE) {
+    void serverId;
+    return { success: true };
+  }
+
+  const res = await authFetch(
+    `/api/mcp/servers/${encodeURIComponent(serverId)}`,
+    {
+      method: "DELETE",
+    },
+  );
+  return res.json();
+}
+
+export async function disconnectAllRuntimeServers() {
+  if (HOSTED_MODE) {
+    return { success: true, servers: [] };
+  }
+
+  const result = await listServers();
+  if (!result?.success || !Array.isArray(result.servers)) {
+    return result;
+  }
+
+  const listedServers = result.servers as Array<{
+    id?: unknown;
+    name?: unknown;
+  }>;
+  const serverIds: string[] = listedServers.reduce(
+    (ids: string[], server) => {
+      if (typeof server.id === "string" && server.id) {
+        ids.push(server.id);
+      } else if (typeof server.name === "string" && server.name) {
+        ids.push(server.name);
+      }
+      return ids;
+    },
+    [] as string[],
+  );
+
+  const disconnectResults = await Promise.allSettled(
+    serverIds.map((serverId) => deleteServer(serverId)),
+  );
+  const failures = disconnectResults.filter((disconnectResult) => {
+    if (disconnectResult.status === "rejected") {
+      return true;
+    }
+    return disconnectResult.value?.success === false;
+  });
+
+  return {
+    success: failures.length === 0,
+    servers: result.servers,
+    ...(failures.length > 0
+      ? { error: `Failed to disconnect ${failures.length} server(s)` }
+      : {}),
+  };
+}
+
+export async function listServers() {
+  if (HOSTED_MODE) {
+    return { success: true, servers: [] };
+  }
+
+  const res = await authFetch("/api/mcp/servers");
+  return res.json();
+}
+
+export async function reconnectServer(
+  serverId: string,
+  serverConfig: MCPServerConfig,
+  options?: {
+    projectId?: string;
+    serverName?: string;
+    connectionDefaults?: ConnectionDefaults;
+    queueSignal?: AbortSignal;
+  },
+) {
+  return observeDesktopOperation("reconnect", async (setStatus) => {
+    if (HOSTED_MODE) {
+      return withCredentialRefusal(
+        await safeValidateHostedServer(
+          serverId,
+          serverConfig,
+          buildHostedValidationContext(serverId, options),
+        ),
+        options?.serverName,
+      );
+    }
+
+    if (!options?.projectId) {
+      throw new Error(
+        "projectId is required for reconnectServer in local mode (server must be synced to Convex first)",
+      );
+    }
+
+    const body = buildResolverBody(serverId, {
+      projectId: options.projectId,
+      serverName: options.serverName,
+      connectionDefaults: options.connectionDefaults,
+    });
+
+    return withCredentialRefusal(
+      await localConnectionRequest("/api/mcp/servers/reconnect", body, options.queueSignal, setStatus),
+      options.serverName,
+    );
+  });
+}
+
+export async function getInitializationInfo(serverId: string) {
+  if (HOSTED_MODE) {
+    // In hosted mode, init info is returned inline from /validate.
+    // This fallback only runs if the validate response lacked initInfo.
+    return { success: true, initInfo: null };
+  }
+
+  const res = await authFetch(
+    `/api/mcp/servers/init-info/${encodeURIComponent(serverId)}`,
+  );
+  return res.json();
+}
+
+export async function setServerLoggingLevel(
+  serverId: string,
+  // `null` opts out of the modern per-request mechanism (absent `_meta` key
+  // on the wire). Not meaningful for the legacy `logging/setLevel`
+  // mechanism — the server route rejects it there.
+  level: LoggingLevel | null,
+) {
+  if (HOSTED_MODE) {
+    void serverId;
+    void level;
+    return {
+      success: false,
+      error: "Changing the server logging level isn’t available in MCPJam’s hosted web app. To use it, run npx @mcpjam/inspector@latest on your computer or use the MCPJam desktop app.",
+    };
+  }
+
+  const res = await authFetch("/api/mcp/log-level", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serverId, level }),
+  });
+  return res.json();
+}

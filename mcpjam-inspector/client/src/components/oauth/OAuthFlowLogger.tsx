@@ -1,0 +1,1062 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Alert, AlertDescription } from "@mcpjam/design-system/alert";
+import { Badge } from "@mcpjam/design-system/badge";
+import { Button } from "@mcpjam/design-system/button";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@mcpjam/design-system/tabs";
+import { HTTPHistoryEntry } from "@/components/oauth/HTTPHistoryEntry";
+import { InfoLogEntry } from "@/components/oauth/InfoLogEntry";
+import {
+  getStepInfo,
+  getStepIndex,
+  isUnauthenticatedProbeChallenge,
+  type HttpHistoryEntry,
+  type OAuthFlowState,
+  type OAuthFlowStep,
+} from "@mcpjam/sdk/browser";
+import { cn } from "@/lib/utils";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  CheckCircle2,
+  Circle,
+  Copy,
+  AlertTriangle,
+  Pencil,
+  Plus,
+  RotateCcw,
+} from "lucide-react";
+import { generateGuideText, generateRawText } from "@/lib/oauth/log-formatters";
+import { copyToClipboard } from "@/lib/clipboard";
+import { getOAuthReceivedStepForRequest } from "@/lib/oauth/step-pairing";
+import {
+  splitHttpEntriesForDisplay,
+  type HttpEntryView,
+} from "@/lib/http-entry-views";
+
+// The unauthenticated probe answered with an auth challenge — what the flow
+// expects, so the exchange is not an error. A 403 carrying a Bearer challenge
+// counts: the flow continues from it and reports the status violation as a
+// warning, and a red step card would contradict that.
+const isExpectedProbeChallenge = (entry: HttpHistoryEntry): boolean =>
+  isUnauthenticatedProbeChallenge({
+    step: entry.step,
+    status: entry.response?.status,
+    statusText: entry.response?.statusText,
+    wwwAuthenticateHeader: entry.response?.headers?.["www-authenticate"],
+  });
+
+interface OAuthFlowLoggerProps {
+  oauthFlowState: OAuthFlowState;
+  onClearLogs: () => void;
+  onClearHttpHistory: () => void;
+  activeStep?: OAuthFlowStep | null;
+  onFocusStep?: (step: OAuthFlowStep) => void;
+  hasProfile?: boolean;
+  summary?: {
+    label: string;
+    description: string;
+    protocol?: string;
+    registration?: string;
+    step?: OAuthFlowStep;
+    serverUrl?: string;
+    scopes?: string;
+    clientId?: string;
+    customHeadersCount?: number;
+  };
+  actions?: {
+    onConfigure?: () => void;
+    /** Open the profile modal blank to add a new target. */
+    onAddServer?: () => void;
+    onReset?: () => void;
+    onContinue?: () => void;
+    continueLabel?: string;
+    continueDisabled?: boolean;
+    /**
+     * The advance is in flight. Matches the sibling Connect/Refresh buttons'
+     * convention ("Connecting..."/"Refreshing..."): without it, Continue looked
+     * inert for the whole round trip and users clicked it again — the single
+     * biggest rageclick hotspot on this surface.
+     */
+    continuePending?: boolean;
+    resetDisabled?: boolean;
+    onConnectServer?: () => void;
+    onRefreshTokens?: () => void;
+    isApplyingTokens?: boolean;
+  };
+}
+
+export function OAuthFlowLogger({
+  oauthFlowState,
+  onClearLogs: _onClearLogs,
+  onClearHttpHistory: _onClearHttpHistory,
+  activeStep,
+  onFocusStep,
+  hasProfile = true,
+  summary,
+  actions,
+}: OAuthFlowLoggerProps) {
+  const guideScrollRef = useRef<HTMLDivElement | null>(null);
+  const rawScrollRef = useRef<HTMLDivElement | null>(null);
+  const [deletedInfoLogs] = useState<Set<string>>(new Set());
+  const [activeTab, setActiveTab] = useState<"guide" | "raw">("guide");
+  const [copySuccess, setCopySuccess] = useState(false);
+  const [copiedStep, setCopiedStep] = useState<OAuthFlowStep | null>(null);
+  const [copyStepError, setCopyStepError] = useState<OAuthFlowStep | null>(
+    null
+  );
+  const copyStepTimerRef = useRef<number | null>(null);
+
+  const currentStepIndex = getStepIndex(oauthFlowState.currentStep);
+
+  // Flow-level HTTP+SSE detection: the deprecated-transport 4xx suppression
+  // must keep working when the split renders the 4xx response on a different
+  // card than the transport info log.
+  const hasDeprecatedTransportFlow = useMemo(
+    () =>
+      (oauthFlowState.infoLogs || []).some(
+        (log) =>
+          log.label?.includes("HTTP+SSE Transport Detected") ||
+          log.id === "http-sse-detected"
+      ),
+    [oauthFlowState.infoLogs]
+  );
+
+  const groups = useMemo(() => {
+    type StepEntry =
+      | { type: "info"; log: NonNullable<OAuthFlowState["infoLogs"]>[number] }
+      | {
+          type: "http";
+          entry: NonNullable<OAuthFlowState["httpHistory"]>[number];
+          /** Which half of the exchange this item renders (see
+           * splitHttpEntriesForDisplay); the entry itself is unmodified. */
+          view: HttpEntryView;
+          /** Display timestamp: response items sort at arrival time. */
+          timestamp: number;
+        };
+
+    const map = new Map<
+      OAuthFlowStep,
+      {
+        step: OAuthFlowStep;
+        entries: StepEntry[];
+        firstTimestamp: number;
+      }
+    >();
+
+    const ensureGroup = (step: OAuthFlowStep) => {
+      if (!map.has(step)) {
+        map.set(step, {
+          step,
+          entries: [],
+          firstTimestamp: Number.POSITIVE_INFINITY,
+        });
+      }
+      return map.get(step)!;
+    };
+
+    (oauthFlowState.infoLogs || [])
+      .filter((log) => !deletedInfoLogs.has(log.id))
+      .forEach((log) => {
+        const group = ensureGroup(log.step);
+        group.entries.push({ type: "info", log });
+        group.firstTimestamp = Math.min(group.firstTimestamp, log.timestamp);
+      });
+
+    // Each completed exchange's request half renders under its request step
+    // and the response half under the paired received step immediately; the
+    // received card can still be the next step. Failed or unpaired exchanges
+    // stay whole on their own card.
+    splitHttpEntriesForDisplay<
+      OAuthFlowStep,
+      NonNullable<OAuthFlowState["httpHistory"]>[number]
+    >({
+      entries: oauthFlowState.httpHistory || [],
+      pairedReceivedStep: getOAuthReceivedStepForRequest,
+    }).forEach((item) => {
+      const group = ensureGroup(item.step);
+      group.entries.push({
+        type: "http",
+        entry: item.entry,
+        view: item.view,
+        timestamp: item.timestamp,
+      });
+      group.firstTimestamp = Math.min(group.firstTimestamp, item.timestamp);
+    });
+
+    const ordered = Array.from(map.values());
+
+    ordered.forEach((group) => {
+      group.entries.sort((a, b) => {
+        const timeA = a.type === "info" ? a.log.timestamp : a.timestamp;
+        const timeB = b.type === "info" ? b.log.timestamp : b.timestamp;
+        return timeA - timeB;
+      });
+    });
+
+    ordered.sort((a, b) => {
+      const diff = getStepIndex(a.step) - getStepIndex(b.step);
+      if (diff !== 0) return diff;
+      return a.firstTimestamp - b.firstTimestamp;
+    });
+
+    return ordered;
+  }, [
+    oauthFlowState.infoLogs,
+    oauthFlowState.httpHistory,
+    deletedInfoLogs,
+    currentStepIndex,
+  ]);
+  const focusStep = activeStep ?? oauthFlowState.currentStep;
+  const formatTimestamp = (timestamp: number) =>
+    new Date(timestamp).toLocaleTimeString();
+  const totalEntries = useMemo(
+    () =>
+      groups.reduce((sum, group) => {
+        return sum + group.entries.length;
+      }, 0),
+    [groups]
+  );
+
+  const timelineEntries = useMemo(() => {
+    type TimelineEntry =
+      | {
+          type: "info";
+          timestamp: number;
+          log: NonNullable<OAuthFlowState["infoLogs"]>[number];
+          key: string;
+        }
+      | {
+          type: "http";
+          timestamp: number;
+          entry: NonNullable<OAuthFlowState["httpHistory"]>[number];
+          step: OAuthFlowStep;
+          view: HttpEntryView;
+          key: string;
+        };
+
+    const items: TimelineEntry[] = [];
+
+    (oauthFlowState.infoLogs || [])
+      .filter((log) => !deletedInfoLogs.has(log.id))
+      .forEach((log) => {
+        items.push({
+          type: "info",
+          timestamp: log.timestamp,
+          log,
+          key: `info-${log.id}`,
+        });
+      });
+
+    splitHttpEntriesForDisplay<
+      OAuthFlowStep,
+      NonNullable<OAuthFlowState["httpHistory"]>[number]
+    >({
+      entries: oauthFlowState.httpHistory || [],
+      pairedReceivedStep: getOAuthReceivedStepForRequest,
+    }).forEach((item, index) => {
+      items.push({
+        type: "http",
+        timestamp: item.timestamp,
+        entry: item.entry,
+        step: item.step,
+        view: item.view,
+        key: `http-${item.entry.timestamp}-${item.step}-${item.view}-${index}`,
+      });
+    });
+
+    items.sort((a, b) => {
+      if (a.timestamp === b.timestamp) {
+        return a.key.localeCompare(b.key);
+      }
+      return a.timestamp - b.timestamp;
+    });
+
+    return items;
+  }, [oauthFlowState.infoLogs, oauthFlowState.httpHistory, deletedInfoLogs]);
+
+  const totalTimelineEntries = timelineEntries.length;
+
+  useEffect(() => {
+    const container =
+      activeTab === "raw" ? rawScrollRef.current : guideScrollRef.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  }, [activeTab, totalEntries, totalTimelineEntries, oauthFlowState.error]);
+
+  // Track which steps are expanded (auto-expand current step)
+  const [expandedSteps, setExpandedSteps] = useState<Set<OAuthFlowStep>>(
+    new Set()
+  );
+
+  // Auto-expand current step
+  useEffect(() => {
+    setExpandedSteps(new Set([oauthFlowState.currentStep]));
+  }, [oauthFlowState.currentStep]);
+
+  const toggleStep = (step: OAuthFlowStep) => {
+    setExpandedSteps((prev) => {
+      const next = new Set(prev);
+      if (next.has(step)) {
+        next.delete(step);
+      } else {
+        next.add(step);
+      }
+      return next;
+    });
+  };
+
+  const getStatusIcon = (step: OAuthFlowStep) => {
+    const index = getStepIndex(step);
+
+    if (index === Number.MAX_SAFE_INTEGER) {
+      return {
+        icon: Circle,
+        className: "h-4 w-4 text-muted-foreground",
+        label: "Pending",
+      };
+    }
+
+    if (index < currentStepIndex) {
+      return {
+        icon: CheckCircle2,
+        className: "h-4 w-4 text-green-600 dark:text-green-400",
+        label: "Complete",
+      };
+    }
+
+    if (index === currentStepIndex) {
+      return {
+        icon: CheckCircle2,
+        className: "h-4 w-4 text-green-600 dark:text-green-400",
+        label: "Complete",
+      };
+    }
+
+    return {
+      icon: Circle,
+      className: "h-4 w-4 text-muted-foreground",
+      label: "Pending",
+    };
+  };
+
+  const handleCopyLogs = async () => {
+    try {
+      const text =
+        activeTab === "guide"
+          ? generateGuideText(oauthFlowState, groups)
+          : generateRawText(oauthFlowState, timelineEntries);
+      await navigator.clipboard.writeText(text);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy logs:", err);
+    }
+  };
+
+  const handleCopyStep = async (step: OAuthFlowStep) => {
+    setCopyStepError(null);
+    if (copyStepTimerRef.current !== null) {
+      window.clearTimeout(copyStepTimerRef.current);
+      copyStepTimerRef.current = null;
+    }
+
+    const text =
+      activeTab === "guide"
+        ? generateGuideText(oauthFlowState, groups, { step })
+        : generateRawText(oauthFlowState, timelineEntries, { step });
+
+    const success = await copyToClipboard(text);
+    if (!success) {
+      setCopiedStep(null);
+      setCopyStepError(step);
+      return;
+    }
+
+    setCopyStepError(null);
+    setCopiedStep(step);
+    copyStepTimerRef.current = window.setTimeout(() => {
+      setCopiedStep(null);
+      copyStepTimerRef.current = null;
+    }, 2000);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (copyStepTimerRef.current !== null) {
+        window.clearTimeout(copyStepTimerRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="h-full border-l border-border flex flex-col">
+      <div className="bg-muted/30 border-b border-border px-4 py-3 space-y-3">
+        {summary && hasProfile && (
+          <>
+            {/* Top row: Server URL with Edit, and Reset/Continue on right */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={actions?.onConfigure}
+                disabled={!actions?.onConfigure}
+                className="min-w-0 flex-1 flex items-center gap-2 text-left border border-border hover:border-foreground/30 bg-background rounded-md px-3 py-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed group"
+              >
+                <p className="text-sm font-medium text-foreground break-all flex-1">
+                  {summary.serverUrl || summary.description}
+                </p>
+                <span className="flex items-center gap-1 text-xs text-muted-foreground group-hover:text-foreground shrink-0">
+                  <Pencil className="h-3 w-3" />
+                  Edit
+                </span>
+              </button>
+              <div className="flex items-center gap-1 shrink-0">
+                {actions?.onAddServer && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={actions.onAddServer}
+                    className="h-7"
+                  >
+                    <Plus className="h-3 w-3 mr-1" />
+                    Add
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={actions?.onReset}
+                  disabled={actions?.resetDisabled || !actions?.onReset}
+                  className="h-7"
+                >
+                  <RotateCcw className="h-3 w-3 mr-1" />
+                  Reset
+                </Button>
+                {actions?.onConnectServer && (
+                  <Button
+                    size="sm"
+                    onClick={actions.onConnectServer}
+                    disabled={actions.isApplyingTokens}
+                    className="h-7"
+                  >
+                    {actions.isApplyingTokens
+                      ? "Connecting..."
+                      : "Connect Server"}
+                  </Button>
+                )}
+                {actions?.onRefreshTokens && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={actions.onRefreshTokens}
+                    disabled={actions.isApplyingTokens}
+                    className="h-7"
+                  >
+                    {actions.isApplyingTokens
+                      ? "Refreshing..."
+                      : "Refresh Tokens"}
+                  </Button>
+                )}
+                {actions?.onContinue && (
+                  <Button
+                    size="sm"
+                    onClick={actions.onContinue}
+                    disabled={
+                      actions.continueDisabled || actions.continuePending
+                    }
+                    aria-busy={actions.continuePending || undefined}
+                    className="h-7"
+                  >
+                    {actions.continuePending
+                      ? "Continuing..."
+                      : actions.continueLabel || "Continue"}
+                  </Button>
+                )}
+                {!actions?.onContinue && actions?.continueLabel && (
+                  <Button size="sm" disabled={true} className="h-7">
+                    {actions.continueLabel}
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            {/* Configuration badges */}
+            <div className="flex flex-wrap gap-1.5">
+              {summary.protocol && (
+                <Badge
+                  variant="secondary"
+                  className="text-xs cursor-pointer hover:bg-secondary/80"
+                  onClick={actions?.onConfigure}
+                >
+                  {summary.protocol}
+                </Badge>
+              )}
+              {summary.registration && (
+                <Badge
+                  variant="secondary"
+                  className="text-xs cursor-pointer hover:bg-secondary/80"
+                  onClick={actions?.onConfigure}
+                >
+                  {summary.registration}
+                </Badge>
+              )}
+              {summary.scopes && (
+                <Badge variant="outline" className="text-xs">
+                  {summary.scopes}
+                </Badge>
+              )}
+              {summary.clientId && (
+                <Badge variant="outline" className="text-xs">
+                  Client ID set
+                </Badge>
+              )}
+            </div>
+          </>
+        )}
+
+        {summary && !hasProfile && (
+          <div className="flex items-center justify-between gap-3 text-xs">
+            <p className="text-sm text-muted-foreground">
+              {summary.description}
+            </p>
+            <Button
+              size="sm"
+              onClick={actions?.onConfigure}
+              disabled={!actions?.onConfigure}
+            >
+              Configure Target
+            </Button>
+          </div>
+        )}
+      </div>
+
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => setActiveTab(value as "guide" | "raw")}
+        className="flex-1 overflow-hidden"
+      >
+        <div className="px-4 pt-2 flex items-center justify-between gap-3">
+          <TabsList>
+            <TabsTrigger value="guide">Guide</TabsTrigger>
+            <TabsTrigger value="raw">Raw</TabsTrigger>
+          </TabsList>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleCopyLogs}
+            className="h-8"
+          >
+            {copySuccess ? "Copied!" : "Copy"}
+          </Button>
+        </div>
+
+        <TabsContent value="guide" className="flex-1 overflow-hidden">
+          <div
+            ref={guideScrollRef}
+            className="h-full bg-muted/30 overflow-auto"
+          >
+            <div className="p-6 space-y-1">
+              {oauthFlowState.error && (
+                <Alert variant="destructive" className="py-2 mb-4">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription className="text-xs">
+                    {oauthFlowState.error}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {groups.length === 0 ? (
+                !hasProfile ? (
+                  <div className="bg-background border border-border rounded-lg p-6">
+                    <h3 className="text-base font-semibold mb-2">
+                      Welcome to the OAuth Debugger
+                    </h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      This tool helps you debug MCP OAuth authentication flows
+                      step-by-step, showing you exactly what happens at each
+                      stage.
+                    </p>
+                    <div className="space-y-3 mb-6">
+                      <p className="text-sm font-medium">To get started:</p>
+                      <ol className="list-decimal list-inside text-sm text-muted-foreground space-y-2">
+                        <li>Configure your target MCP server URL</li>
+                        <li>
+                          Click <span className="font-medium">"Continue"</span>{" "}
+                          to advance through each step
+                        </li>
+                        <li>
+                          Watch the sequence diagram and logs to see what's
+                          happening
+                        </li>
+                      </ol>
+                    </div>
+                    {actions?.onConfigure && (
+                      <Button onClick={actions.onConfigure}>
+                        Configure Target
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-center py-8 text-muted-foreground text-sm">
+                    No activity yet. Click "Continue" to start the OAuth flow.
+                  </div>
+                )
+              ) : (
+                groups.map((group, groupIndex) => {
+                  const info = getStepInfo(group.step);
+                  const isActive = focusStep === group.step;
+                  const stepNumber = groupIndex + 1;
+                  const isExpanded = expandedSteps.has(group.step);
+                  const isLastStep = groupIndex === groups.length - 1;
+
+                  const infoEntries = group.entries.filter(
+                    (entry) => entry.type === "info"
+                  );
+                  // The raw authorization-metadata response is authoritative.
+                  // CIMD support is the one derived conclusion (including the
+                  // omitted-field default), so place that note after the response.
+                  const derivedResponseInfoEntries = infoEntries.filter(
+                    ({ log }) => log.id === "cimd-support"
+                  );
+                  const regularInfoEntries = infoEntries.filter(
+                    ({ log }) => log.id !== "cimd-support"
+                  );
+                  const httpEntries = group.entries.filter(
+                    (entry) => entry.type === "http"
+                  );
+                  const totalEntries = infoEntries.length + httpEntries.length;
+
+                  // Check for deprecated transport detection (HTTP+SSE)
+                  const hasDeprecatedTransport = infoEntries.some(
+                    ({ log }) =>
+                      log.label?.includes("HTTP+SSE Transport Detected") ||
+                      log.id === "http-sse-detected"
+                  );
+
+                  const errorInfoCount = infoEntries.filter(
+                    ({ log }) => log.level === "error"
+                  ).length;
+                  const httpErrorCount = httpEntries.filter((item) => {
+                    const { entry } = item;
+                    if (entry.error) return true;
+                    // A request-view item's response (and its status) renders
+                    // under the paired received card — count it there.
+                    if (item.view === "request") return false;
+                    const status = entry.response?.status;
+                    // Don't treat the probe's auth challenge as an error
+                    if (isExpectedProbeChallenge(entry)) {
+                      return false;
+                    }
+                    // Don't treat 4xx on authenticated_mcp_request as error if deprecated transport was detected
+                    // (the 4xx triggers the GET fallback for backwards compatibility)
+                    if (
+                      entry.step === "authenticated_mcp_request" &&
+                      hasDeprecatedTransportFlow &&
+                      status &&
+                      status >= 400 &&
+                      status < 500
+                    ) {
+                      return false;
+                    }
+                    return typeof status === "number" && status >= 400;
+                  }).length;
+                  const errorCount = errorInfoCount + httpErrorCount;
+                  const hasError = errorCount > 0;
+                  const firstErrorMessage =
+                    infoEntries.find(({ log }) => log.level === "error")?.log
+                      .error?.message ||
+                    httpEntries.find(({ entry }) => entry.error)?.entry.error
+                      ?.message ||
+                    httpEntries.find((item) => {
+                      if (item.view === "request") return false;
+                      const status = item.entry.response?.status;
+                      if (isExpectedProbeChallenge(item.entry)) {
+                        return false;
+                      }
+                      return (
+                        typeof status === "number" &&
+                        status >= 400 &&
+                        !!item.entry.response?.statusText
+                      );
+                    })?.entry.response?.statusText;
+                  const statusInfo = getStatusIcon(group.step);
+                  const StatusIcon = statusInfo.icon;
+
+                  return (
+                    <div key={group.step} className="relative">
+                      {/* Timeline connector line */}
+                      {!isLastStep && (
+                        <div className="absolute left-[11px] top-[32px] bottom-0 w-[2px] bg-border" />
+                      )}
+
+                      {/* Step card */}
+                      <div
+                        className={cn(
+                          "relative bg-background border rounded-lg transition-all",
+                          hasError
+                            ? "border-red-400 ring-1 ring-red-400/20 shadow-md"
+                            : hasDeprecatedTransport
+                            ? "border-yellow-400 ring-1 ring-yellow-400/20 shadow-md"
+                            : isActive
+                            ? "border-blue-400 shadow-md ring-1 ring-blue-400/20"
+                            : "border-border shadow-sm hover:shadow-md"
+                        )}
+                      >
+                        {/* Step header - clickable */}
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          aria-expanded={isExpanded}
+                          onClick={() => toggleStep(group.step)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              toggleStep(group.step);
+                            }
+                          }}
+                          className="w-full px-4 py-3 flex items-start gap-3 hover:bg-muted/30 transition-colors rounded-t-lg cursor-pointer"
+                        >
+                          {/* Status icon */}
+                          <div className="flex-shrink-0 mt-0.5">
+                            {hasError ? (
+                              <AlertCircle className="h-4 w-4 text-red-500" />
+                            ) : hasDeprecatedTransport ? (
+                              <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
+                            ) : (
+                              <StatusIcon className={statusInfo.className} />
+                            )}
+                          </div>
+
+                          {/* Step info */}
+                          <div className="flex-1 min-w-0 text-left">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-sm font-semibold text-foreground">
+                                {stepNumber}. {info.title}
+                              </span>
+                              {totalEntries > 0 && (
+                                <Badge
+                                  variant="secondary"
+                                  className="text-[10px] h-4 px-1.5"
+                                >
+                                  {totalEntries}
+                                </Badge>
+                              )}
+                              {hasError && (
+                                <Badge
+                                  variant="destructive"
+                                  className="text-[10px] h-4 px-1.5"
+                                >
+                                  {errorCount} error{errorCount > 1 ? "s" : ""}
+                                </Badge>
+                              )}
+                              {hasDeprecatedTransport && !hasError && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] h-4 px-1.5 border-yellow-400 text-yellow-700 dark:text-yellow-400 bg-yellow-50 dark:bg-yellow-950/30"
+                                >
+                                  HTTP+SSE transport
+                                </Badge>
+                              )}
+                            </div>
+                            <p
+                              className={cn(
+                                "text-xs text-muted-foreground",
+                                !isExpanded && "line-clamp-2"
+                              )}
+                            >
+                              {info.summary}
+                            </p>
+                            {hasError && firstErrorMessage && (
+                              <p className="text-xs text-red-600 dark:text-red-400 mt-1 line-clamp-1">
+                                {firstErrorMessage}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Right side actions */}
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            {/* Show in diagram button */}
+                            {onFocusStep && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onFocusStep(group.step);
+                                }}
+                                className="h-7 px-2 text-xs"
+                              >
+                                Show in diagram
+                              </Button>
+                            )}
+
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleCopyStep(group.step);
+                              }}
+                              className="h-7 px-2 text-xs"
+                            >
+                              <Copy className="h-3 w-3 mr-1" />
+                              {copyStepError === group.step
+                                ? "Copy failed"
+                                : copiedStep === group.step
+                                ? "Copied!"
+                                : "Copy step"}
+                            </Button>
+
+                            {/* Expand/collapse chevron */}
+                            {isExpanded ? (
+                              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Collapsible content */}
+                        {isExpanded && (
+                          <div className="px-4 pb-4 pt-2 space-y-3 border-t">
+                            {/* Educational content */}
+                            {(info.teachableMoments || info.tips) && (
+                              <div className="space-y-2">
+                                {info.teachableMoments &&
+                                  info.teachableMoments.length > 0 && (
+                                    <div className="rounded-md border border-border bg-muted/10 p-3">
+                                      <p className="text-xs font-semibold text-muted-foreground mb-2">
+                                        What to pay attention to
+                                      </p>
+                                      <ul className="list-disc pl-5 space-y-1">
+                                        {info.teachableMoments.map((item) => (
+                                          <li
+                                            key={item}
+                                            className="text-xs text-muted-foreground"
+                                          >
+                                            {item}
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                {info.tips && info.tips.length > 0 && (
+                                  <div className="rounded-md border border-border bg-muted/10 p-3">
+                                    <p className="text-xs font-semibold text-muted-foreground mb-2">
+                                      Tips
+                                    </p>
+                                    <ul className="list-disc pl-5 space-y-1">
+                                      {info.tips.map((tip) => (
+                                        <li
+                                          key={tip}
+                                          className="text-xs text-muted-foreground"
+                                        >
+                                          {tip}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Info logs */}
+                            {regularInfoEntries.map(({ log }) => (
+                              <InfoLogEntry
+                                key={log.id}
+                                label={log.label}
+                                timestamp={log.timestamp}
+                                data={log.data}
+                                level={log.level ?? "info"}
+                                error={log.error}
+                              />
+                            ))}
+
+                            {/* HTTP requests */}
+                            {httpEntries.map(({ entry, view }) => (
+                              <HTTPHistoryEntry
+                                key={`http-${entry.timestamp}-${view}`}
+                                method={entry.request.method}
+                                url={entry.request.url}
+                                status={entry.response?.status}
+                                statusText={entry.response?.statusText}
+                                duration={entry.duration}
+                                requestHeaders={entry.request.headers}
+                                requestBody={entry.request.body}
+                                responseHeaders={entry.response?.headers}
+                                responseBody={entry.response?.body}
+                                error={entry.error}
+                                step={entry.step}
+                                view={view}
+                              />
+                            ))}
+
+                            {derivedResponseInfoEntries.map(({ log }) => (
+                              <InfoLogEntry
+                                key={log.id}
+                                label={log.label}
+                                timestamp={log.timestamp}
+                                data={log.data}
+                                level={log.level ?? "info"}
+                                error={log.error}
+                              />
+                            ))}
+
+                            {/* Empty state */}
+                            {infoEntries.length === 0 &&
+                              httpEntries.length === 0 && (
+                                <div className="text-center text-xs text-muted-foreground py-4">
+                                  No activity recorded for this step yet.
+                                </div>
+                              )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="raw" className="flex-1 overflow-hidden">
+          <div ref={rawScrollRef} className="h-full bg-muted/30 overflow-auto">
+            <div className="p-6 space-y-3">
+              {timelineEntries.length === 0 ? (
+                <div className="text-center py-8 text-muted-foreground text-sm">
+                  No activity yet.
+                </div>
+              ) : (
+                timelineEntries.map((entry) => {
+                  if (entry.type === "info") {
+                    const { log } = entry;
+                    const level = log.level ?? "info";
+                    const levelBadgeVariant =
+                      level === "error"
+                        ? "destructive"
+                        : level === "warning"
+                        ? "outline"
+                        : "secondary";
+
+                    return (
+                      <div key={entry.key} className="space-y-1">
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                          <span className="font-mono">{log.step}</span>
+                          <span>{formatTimestamp(log.timestamp)}</span>
+                          <Badge
+                            variant={levelBadgeVariant}
+                            className="uppercase tracking-tight"
+                          >
+                            {level}
+                          </Badge>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void handleCopyStep(log.step)}
+                            className="ml-auto h-7 px-2 text-xs"
+                          >
+                            <Copy className="h-3 w-3 mr-1" />
+                            {copyStepError === log.step
+                              ? "Copy failed"
+                              : copiedStep === log.step
+                              ? "Copied!"
+                              : "Copy step"}
+                          </Button>
+                        </div>
+                        <InfoLogEntry
+                          label={log.label}
+                          timestamp={log.timestamp}
+                          data={log.data}
+                          level={level}
+                          error={log.error}
+                        />
+                      </div>
+                    );
+                  }
+
+                  const httpEntry: HttpHistoryEntry = entry.entry;
+                  const view = entry.view;
+                  const displayStep = entry.step ?? httpEntry.step;
+                  const status = httpEntry.response?.status;
+                  const isExpectedAuthChallenge =
+                    isExpectedProbeChallenge(httpEntry);
+                  const isHttpError =
+                    Boolean(httpEntry.error) ||
+                    (typeof status === "number" &&
+                      status >= 400 &&
+                      !isExpectedAuthChallenge);
+                  const statusLabel =
+                    view === "request" && status !== undefined
+                      ? "request sent"
+                      : status !== undefined
+                      ? `${status}${
+                          httpEntry.response?.statusText
+                            ? ` ${httpEntry.response?.statusText}`
+                            : ""
+                        }`
+                      : "pending";
+
+                  return (
+                    <div key={entry.key} className="space-y-1">
+                      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                        <span className="font-mono">{displayStep}</span>
+                        <span>{formatTimestamp(entry.timestamp)}</span>
+                        <Badge
+                          variant="outline"
+                          className="font-mono uppercase"
+                        >
+                          {httpEntry.request.method}
+                        </Badge>
+                        <Badge
+                          variant={isHttpError ? "destructive" : "secondary"}
+                          className="font-mono"
+                        >
+                          {statusLabel}
+                        </Badge>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => void handleCopyStep(displayStep)}
+                          className="ml-auto h-7 px-2 text-xs"
+                        >
+                          <Copy className="h-3 w-3 mr-1" />
+                          {copyStepError === displayStep
+                            ? "Copy failed"
+                            : copiedStep === displayStep
+                            ? "Copied!"
+                            : "Copy step"}
+                        </Button>
+                      </div>
+                      <HTTPHistoryEntry
+                        method={httpEntry.request.method}
+                        url={httpEntry.request.url}
+                        status={httpEntry.response?.status}
+                        statusText={httpEntry.response?.statusText}
+                        duration={httpEntry.duration}
+                        requestHeaders={httpEntry.request.headers}
+                        requestBody={httpEntry.request.body}
+                        responseHeaders={httpEntry.response?.headers}
+                        responseBody={httpEntry.response?.body}
+                        error={httpEntry.error}
+                        step={httpEntry.step}
+                        view={view}
+                      />
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}

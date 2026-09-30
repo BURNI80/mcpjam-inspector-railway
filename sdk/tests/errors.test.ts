@@ -1,0 +1,371 @@
+import {
+  MCPError,
+  MCPAuthError,
+  isMCPAuthError,
+  isAuthError,
+  isUnauthorized401,
+} from "../src/mcp-client-manager/errors";
+import { EvalReportingError, SdkError } from "../src/errors";
+
+describe("MCPError", () => {
+  it("should create an error with message and code", () => {
+    const error = new MCPError("Something went wrong", "SOME_ERROR");
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(MCPError);
+    expect(error.message).toBe("Something went wrong");
+    expect(error.code).toBe("SOME_ERROR");
+    expect(error.name).toBe("MCPError");
+  });
+
+  it("should support cause option", () => {
+    const cause = new Error("Original error");
+    const error = new MCPError("Wrapped error", "WRAP_ERROR", { cause });
+
+    expect(error.cause).toBe(cause);
+  });
+
+  it("should maintain prototype chain for instanceof checks", () => {
+    const error = new MCPError("Test", "TEST");
+
+    expect(error instanceof Error).toBe(true);
+    expect(error instanceof MCPError).toBe(true);
+  });
+});
+
+describe("MCPAuthError", () => {
+  it("should create an auth error with message and status code", () => {
+    const error = new MCPAuthError("Unauthorized access", 401);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(MCPError);
+    expect(error).toBeInstanceOf(MCPAuthError);
+    expect(error.message).toBe("Unauthorized access");
+    expect(error.code).toBe("AUTH_ERROR");
+    expect(error.statusCode).toBe(401);
+    expect(error.name).toBe("MCPAuthError");
+  });
+
+  it("should work without status code", () => {
+    const error = new MCPAuthError("Auth failed");
+
+    expect(error.statusCode).toBeUndefined();
+    expect(error.code).toBe("AUTH_ERROR");
+  });
+
+  it("should support cause option", () => {
+    const cause = new Error("Token expired");
+    const error = new MCPAuthError("Authentication failed", 401, { cause });
+
+    expect(error.cause).toBe(cause);
+  });
+
+  it("should work with 403 status code", () => {
+    const error = new MCPAuthError("Forbidden", 403);
+
+    expect(error.statusCode).toBe(403);
+  });
+});
+
+describe("isMCPAuthError", () => {
+  it("should return true for MCPAuthError instances", () => {
+    const error = new MCPAuthError("Auth error", 401);
+
+    expect(isMCPAuthError(error)).toBe(true);
+  });
+
+  it("should return false for regular Error instances", () => {
+    const error = new Error("Regular error");
+
+    expect(isMCPAuthError(error)).toBe(false);
+  });
+
+  it("should return false for MCPError instances", () => {
+    const error = new MCPError("MCP error", "SOME_CODE");
+
+    expect(isMCPAuthError(error)).toBe(false);
+  });
+
+  it("should return false for null", () => {
+    expect(isMCPAuthError(null)).toBe(false);
+  });
+
+  it("should return false for undefined", () => {
+    expect(isMCPAuthError(undefined)).toBe(false);
+  });
+
+  it("should return false for non-error objects", () => {
+    expect(isMCPAuthError({ message: "fake error" })).toBe(false);
+  });
+});
+
+describe("isAuthError", () => {
+  describe("non-Error values", () => {
+    it("should return { isAuth: false } for null", () => {
+      expect(isAuthError(null)).toEqual({ isAuth: false });
+    });
+
+    it("should return { isAuth: false } for undefined", () => {
+      expect(isAuthError(undefined)).toEqual({ isAuth: false });
+    });
+
+    it("should return { isAuth: false } for strings", () => {
+      expect(isAuthError("unauthorized")).toEqual({ isAuth: false });
+    });
+
+    it("should return { isAuth: false } for plain objects", () => {
+      expect(isAuthError({ message: "unauthorized" })).toEqual({
+        isAuth: false,
+      });
+    });
+  });
+
+  describe("UnauthorizedError by name", () => {
+    it("should detect UnauthorizedError by class name", () => {
+      const error = new Error("Access denied");
+      error.name = "UnauthorizedError";
+
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 401 });
+    });
+  });
+
+  describe("OAuthResponseError by name", () => {
+    // Shape built by `parseErrorResponse` in `oauth/browser-auth.ts`: the
+    // message is the authorization server's `error_description` verbatim and
+    // `code` is the OAuth error string, NOT an HTTP status.
+    const oauthResponseError = (message: string, code?: string) => {
+      const error = new Error(message) as Error & { code?: string };
+      error.name = "OAuthResponseError";
+      error.code = code;
+      return error;
+    };
+
+    const INCIDENT_MESSAGE =
+      "Request context not available — authentication or export lookup failed";
+
+    it("should detect an OAuth error response whose prose says nothing about auth", () => {
+      // The production sentence from the 2026-08-24 incident. It carries no
+      // word the message-pattern fallback looks for — "authentication" appears
+      // only inside "authentication or export lookup failed", which is not the
+      // "authentication failed" pattern — so before this branch existed it fell
+      // through to the inspector's 500 INTERNAL_ERROR catch-all and was
+      // reported as an MCPJam outage.
+      const error = oauthResponseError(INCIDENT_MESSAGE, "invalid_grant");
+
+      expect(isAuthError(error)).toEqual({ isAuth: true });
+    });
+
+    it("should not read the OAuth error code as an HTTP status", () => {
+      const error = oauthResponseError("Bad things", "invalid_client");
+
+      expect(isAuthError(error)).toEqual({ isAuth: true });
+    });
+
+    it("should detect it even with no OAuth error code at all", () => {
+      const error = oauthResponseError("Nope");
+
+      expect(isAuthError(error)).toEqual({ isAuth: true });
+    });
+
+    it("should not classify the same prose as auth without the class name", () => {
+      // The other half of the branch above: the verdict comes from the response
+      // SHAPE, not from the words. A plain Error carrying the identical
+      // sentence is still not an auth error — which is why the message-pattern
+      // fallback could never have caught the incident, and why widening that
+      // pattern list would have been the wrong fix.
+      expect(isAuthError(new Error(INCIDENT_MESSAGE))).toEqual({
+        isAuth: false,
+      });
+    });
+  });
+
+  describe("errors with numeric code property", () => {
+    it("should detect 401 status code", () => {
+      const error = new Error("HTTP error") as Error & { code: number };
+      error.code = 401;
+
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 401 });
+    });
+
+    it("should detect 403 status code", () => {
+      const error = new Error("HTTP error") as Error & { code: number };
+      error.code = 403;
+
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 403 });
+    });
+
+    it("should not detect non-auth status codes", () => {
+      const error = new Error("HTTP error") as Error & { code: number };
+      error.code = 500;
+
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+
+    it("should not detect 404 as auth error", () => {
+      const error = new Error("Not found") as Error & { code: number };
+      error.code = 404;
+
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+  });
+
+  describe("auth patterns in error messages", () => {
+    const authMessages = [
+      "Unauthorized access",
+      "User is UNAUTHORIZED",
+      "invalid_token received",
+      "Invalid token provided",
+      "Your token expired",
+      "The token has expired",
+      "Access denied to resource",
+      "Authentication failed for user",
+      "Authentication required",
+      "User is not authenticated",
+      "Request forbidden",
+    ];
+
+    authMessages.forEach((message) => {
+      it(`should detect auth error from message: "${message}"`, () => {
+        const error = new Error(message);
+        expect(isAuthError(error).isAuth).toBe(true);
+      });
+    });
+
+    it("should be case-insensitive for pattern matching", () => {
+      const error = new Error("UNAUTHORIZED ACCESS");
+      expect(isAuthError(error)).toEqual({ isAuth: true });
+    });
+  });
+
+  describe("HTTP status codes in error messages", () => {
+    it("should detect 401 in message with status prefix", () => {
+      const error = new Error("Request failed with status: 401");
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 401 });
+    });
+
+    it("should detect HTTP 401 in message", () => {
+      const error = new Error("Server returned HTTP 401");
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 401 });
+    });
+
+    it("should detect 403 in message with status prefix", () => {
+      const error = new Error("Request failed with status: 403");
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 403 });
+    });
+
+    it("should detect HTTP 403 in message", () => {
+      const error = new Error("Server returned HTTP 403");
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 403 });
+    });
+
+    it("should detect standalone 401 in message", () => {
+      const error = new Error("Error code 401 from server");
+      expect(isAuthError(error)).toEqual({ isAuth: true, statusCode: 401 });
+    });
+  });
+
+  describe("non-auth errors", () => {
+    it("should return { isAuth: false } for regular errors", () => {
+      const error = new Error("Something went wrong");
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+
+    it("should return { isAuth: false } for network errors", () => {
+      const error = new Error("Network connection failed");
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+
+    it("should return { isAuth: false } for timeout errors", () => {
+      const error = new Error("Request timed out after 30000ms");
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+
+    it("should not false-positive on 500 errors", () => {
+      const error = new Error("Server returned HTTP 500");
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+
+    it("should not false-positive on numbers that contain 401", () => {
+      const error = new Error("Invoice #14012 not found");
+      // The regex uses word boundary so this should not match
+      expect(isAuthError(error)).toEqual({ isAuth: false });
+    });
+  });
+});
+
+describe("isUnauthorized401", () => {
+  it("detects strict 401 errors", () => {
+    expect(isUnauthorized401(new MCPAuthError("Unauthorized", 401))).toBe(true);
+    expect(isUnauthorized401(Object.assign(new Error("nope"), { code: 401 }))).toBe(
+      true
+    );
+    expect(
+      isUnauthorized401(Object.assign(new Error("nope"), { statusCode: 401 }))
+    ).toBe(true);
+    expect(isUnauthorized401(new Error("Server returned HTTP 401"))).toBe(true);
+  });
+
+  it("does not treat 403 as refreshable", () => {
+    expect(isUnauthorized401(new MCPAuthError("Forbidden", 403))).toBe(false);
+    expect(isUnauthorized401(Object.assign(new Error("nope"), { code: 403 }))).toBe(
+      false
+    );
+    expect(
+      isUnauthorized401(
+        Object.assign(new Error("Forbidden"), {
+          name: "UnauthorizedError",
+          statusCode: 403,
+        })
+      )
+    ).toBe(false);
+    expect(isUnauthorized401(new Error("Server returned HTTP 403"))).toBe(false);
+  });
+
+  it("does not treat generic auth-looking messages as refreshable", () => {
+    expect(isUnauthorized401(new Error("invalid_token received"))).toBe(false);
+    expect(isUnauthorized401(new Error("unauthorized"))).toBe(false);
+    expect(isUnauthorized401(new Error("tool returned 401 records"))).toBe(
+      false
+    );
+  });
+});
+
+describe("SdkError", () => {
+  it("creates an SDK error with message and code", () => {
+    const error = new SdkError("SDK failure", "SDK_FAILURE");
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(SdkError);
+    expect(error.message).toBe("SDK failure");
+    expect(error.code).toBe("SDK_FAILURE");
+  });
+});
+
+describe("EvalReportingError", () => {
+  it("stores statusCode, endpoint, and attemptCount", () => {
+    const cause = new Error("Original failure");
+    const error = new EvalReportingError("Eval request failed", {
+      attemptCount: 3,
+      cause,
+      endpoint: "/sdk/v1/evals/report",
+      statusCode: 404,
+    });
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(SdkError);
+    expect(error).toBeInstanceOf(EvalReportingError);
+    expect(error.cause).toBe(cause);
+    expect(error.code).toBe("EVAL_REPORTING_ERROR");
+    expect(error.endpoint).toBe("/sdk/v1/evals/report");
+    expect(error.statusCode).toBe(404);
+    expect(error.attemptCount).toBe(3);
+  });
+
+  it("preserves instanceof checks", () => {
+    const error = new EvalReportingError("Eval request failed");
+
+    expect(error instanceof Error).toBe(true);
+    expect(error instanceof SdkError).toBe(true);
+    expect(error instanceof EvalReportingError).toBe(true);
+  });
+});

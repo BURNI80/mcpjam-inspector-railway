@@ -1,0 +1,716 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@mcpjam/design-system/button";
+import { Input } from "@mcpjam/design-system/input";
+import { Switch } from "@mcpjam/design-system/switch";
+import { Textarea } from "@mcpjam/design-system/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@mcpjam/design-system/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@mcpjam/design-system/dialog";
+import { Label } from "@mcpjam/design-system/label";
+import {
+  getDefaultRegistrationStrategy,
+  getSupportedRegistrationStrategies,
+  MCP_PROTOCOL_VERSIONS,
+  protocolVersionLabel,
+  type OAuthProtocolVersion,
+} from "@mcpjam/sdk/browser";
+import type {
+  OAuthRegistrationStrategy,
+  OAuthTestProfile,
+} from "@/lib/oauth/profile";
+import type { ServerFormData } from "@/shared/types.js";
+import type { ServerWithName } from "@/hooks/use-app-state";
+import { deriveOAuthProfileFromServer } from "./utils";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@mcpjam/design-system/accordion";
+
+/**
+ * Prefill an agent command may seed the form with when it opens. Deliberately
+ * cannot carry credentials — there are no clientId/clientSecret fields here;
+ * the human types those. Overlays the server-derived seed on open.
+ */
+export interface OAuthProfileAgentSeed {
+  serverName?: string;
+  serverUrl?: string;
+  registrationStrategy?: OAuthRegistrationStrategy;
+}
+
+interface OAuthProfileModalProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  server?: ServerWithName;
+  existingServerNames: string[];
+  agentSeed?: OAuthProfileAgentSeed | null;
+  onSave: (payload: {
+    formData: ServerFormData;
+    profile: OAuthTestProfile;
+  }) => void | Promise<void>;
+}
+
+/**
+ * Every revision the debugger can drive a flow against, oldest-first, with
+ * the labels the host protocol picker and the Connect page use. Derived so a
+ * new revision cannot leave this dropdown claiming an older one is Latest.
+ */
+const PROTOCOL_OPTIONS: Array<{
+  value: OAuthProtocolVersion;
+  label: string;
+}> = MCP_PROTOCOL_VERSIONS.map((version) => ({
+  value: version,
+  label: protocolVersionLabel(version),
+}));
+
+interface HeaderRow {
+  id: string;
+  key: string;
+  value: string;
+}
+
+const createHeaderRow = (initial?: Partial<HeaderRow>): HeaderRow => {
+  const randomId =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random()}`;
+
+  return {
+    id: randomId,
+    key: initial?.key ?? "",
+    value: initial?.value ?? "",
+  };
+};
+
+/**
+ * Named so the Registration dropdown can retract exactly this error and leave
+ * every other one standing — see `handleRegistrationChange`.
+ */
+const PREREGISTERED_CLIENT_ID_ERROR =
+  "Client ID is required for pre-registered registration. Add one under " +
+  "Advanced settings, or switch Registration to Dynamic (DCR).";
+
+const describeRegistrationStrategy = (strategy: string): string => {
+  if (strategy === "cimd") return "CIMD (URL-based)";
+  if (strategy === "dcr") return "Dynamic (DCR)";
+  return "Pre-registered";
+};
+
+export function OAuthProfileModal({
+  open,
+  onOpenChange,
+  server,
+  existingServerNames,
+  agentSeed,
+  onSave,
+}: OAuthProfileModalProps) {
+  const derivedProfile = useMemo(
+    () => deriveOAuthProfileFromServer(server),
+    [server],
+  );
+  const [serverName, setServerName] = useState("");
+  const [draft, setDraft] = useState(derivedProfile);
+  const [headerRows, setHeaderRows] = useState<HeaderRow[]>(() =>
+    derivedProfile.customHeaders.length
+      ? derivedProfile.customHeaders.map((header) => createHeaderRow(header))
+      : [createHeaderRow()],
+  );
+  // Top-level server field, not part of the OAuth test profile: only flat
+  // server columns round-trip through a save, so a nested profile key would be
+  // silently dropped and the switch would read back off.
+  const [allowPathScopedIssuer, setAllowPathScopedIssuer] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  // Controlled so the pre-registered guard below can reveal the section that
+  // holds the Client ID. "" is the collapsed state for a single-type Accordion.
+  const [advancedOpen, setAdvancedOpen] = useState("");
+  const supportedStrategies = useMemo(
+    () => getSupportedRegistrationStrategies(draft.protocolVersion),
+    [draft.protocolVersion],
+  );
+
+  const generateDefaultName = useCallback(() => {
+    const baseName = server?.name || "oauth-flow-target";
+    return baseName;
+  }, [server?.name, existingServerNames]);
+
+  // Seeding is an event — the modal opening, or a fresh agent prefill — not a
+  // re-render. `derivedProfile` and `generateDefaultName` change identity every
+  // time the parent's server record ticks (connection status, tokens), and
+  // reseeding on that would wipe whatever the user has typed into an open
+  // dialog. These two refs make the effect body run once per such event.
+  const seededWhileOpenRef = useRef(false);
+  const seededAgentSeedRef = useRef<OAuthProfileAgentSeed | null | undefined>(
+    undefined,
+  );
+
+  useEffect(() => {
+    if (!open) {
+      seededWhileOpenRef.current = false;
+      return;
+    }
+    // An agent command can re-target an already-open modal, so a new seed must
+    // still reseed; anything else while open is parent churn to ignore.
+    if (seededWhileOpenRef.current && seededAgentSeedRef.current === agentSeed) {
+      return;
+    }
+    seededWhileOpenRef.current = true;
+    seededAgentSeedRef.current = agentSeed;
+
+    // The agent seed overlays the server-derived values; anything it omits
+    // keeps the derived default. It never carries credentials (see the
+    // OAuthProfileAgentSeed type).
+    setServerName(agentSeed?.serverName ?? generateDefaultName());
+    const nextDraft = {
+      ...derivedProfile,
+      ...(agentSeed?.serverUrl ? { serverUrl: agentSeed.serverUrl } : {}),
+      ...(agentSeed?.registrationStrategy
+        ? { registrationStrategy: agentSeed.registrationStrategy }
+        : {}),
+    };
+    setDraft(nextDraft);
+    // Derived from `nextDraft`, not `draft`: the setDraft above has not landed
+    // yet, so reading state here would reveal (or hide) the section based on
+    // the previously configured server.
+    setAdvancedOpen(
+      nextDraft.registrationStrategy === "preregistered" ? "advanced" : "",
+    );
+    setHeaderRows(
+      derivedProfile.customHeaders.length
+        ? derivedProfile.customHeaders.map((header) => createHeaderRow(header))
+        : [createHeaderRow()],
+    );
+    setAllowPathScopedIssuer(server?.oauthAllowPathScopedIssuer === true);
+    setError(null);
+  }, [
+    open,
+    derivedProfile,
+    generateDefaultName,
+    agentSeed,
+    server?.oauthAllowPathScopedIssuer,
+  ]);
+
+  // The Client ID input lives inside "Advanced settings (optional)", which is
+  // collapsed by default, while Registration is a top-level dropdown. Picking
+  // "Pre-registered" hid the one field that strategy cannot run without, and
+  // the flow only failed later at the registration step. Reveal the section
+  // whenever that strategy is chosen; a manual collapse afterwards sticks.
+  const handleRegistrationChange = (value: OAuthRegistrationStrategy) => {
+    setDraft((prev) => ({ ...prev, registrationStrategy: value }));
+    // That error names switching to DCR as one of its two remedies, so it must
+    // not outlive the user doing exactly that. Retract only that message: no
+    // other field clears the banner on edit, and a duplicate name or a bad URL
+    // survives a strategy change untouched.
+    setError((prev) => (prev === PREREGISTERED_CLIENT_ID_ERROR ? null : prev));
+    if (value === "preregistered") {
+      setAdvancedOpen("advanced");
+    }
+  };
+
+  const normalizedHeaders = useMemo(
+    () =>
+      headerRows
+        .map((row) => ({
+          key: row.key.trim(),
+          value: row.value.trim(),
+        }))
+        .filter((row) => row.key.length > 0),
+    [headerRows],
+  );
+
+  const getValidatedProfileValues = () => {
+    const trimmedUrl = draft.serverUrl.trim();
+
+    if (!trimmedUrl) {
+      setError("Server URL is required");
+      return null;
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(trimmedUrl);
+    } catch (err) {
+      console.error("Invalid OAuth target URL", err);
+      setError("Enter a valid MCP base URL (e.g., https://example.com)");
+      return null;
+    }
+
+    const trimmedClientId = draft.clientId.trim();
+
+    // A pre-registered flow has no way to obtain a client id: DCR is skipped,
+    // so an empty field means the flow dies at the registration step with
+    // "Pre-registered client ID is required". Reject the save instead.
+    //
+    // There is deliberately no exemption for a client id left over in
+    // `mcp-client-<name>` from an earlier DCR run: saving with an empty field
+    // removes that record (`saveOAuthConfigToLocalStorage`), so honouring it
+    // here would delete the very credential the flow would fall back to.
+    if (draft.registrationStrategy === "preregistered" && !trimmedClientId) {
+      setAdvancedOpen("advanced");
+      setError(PREREGISTERED_CLIENT_ID_ERROR);
+      return null;
+    }
+
+    // Preserve the exact typed secret — only whether there's a real value is
+    // trim-based (whitespace-only counts as none). Trimming the value itself
+    // would silently corrupt a secret with legitimate surrounding whitespace.
+    const trimmedClientSecret = draft.clientSecret.trim()
+      ? draft.clientSecret
+      : "";
+    setError(null);
+
+    return {
+      trimmedUrl,
+      trimmedClientId,
+      trimmedClientSecret,
+      parsedUrl,
+    };
+  };
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const validated = getValidatedProfileValues();
+    if (!validated) return;
+    const trimmedName = serverName.trim();
+    if (!trimmedName) {
+      setError("Server name is required");
+      return;
+    }
+    // Add mode has no `server`, so every collision is rejected; edit mode
+    // exempts only the row being edited from its own name. Without this the
+    // save handler treats an add-onto-existing-name as a plain save and
+    // overwrites that server (the hook's guard only covers renames).
+    if (
+      existingServerNames.some(
+        (name) => name === trimmedName && name !== server?.name,
+      )
+    ) {
+      setError(`A server named "${trimmedName}" already exists.`);
+      return;
+    }
+
+    const headerMap = normalizedHeaders.reduce(
+      (acc, header) => {
+        acc[header.key] = header.value;
+        return acc;
+      },
+      {} as Record<string, string>,
+    );
+
+    const scopesArray = draft.scopes
+      .split(/\s+/)
+      .map((scope) => scope.trim())
+      .filter((scope) => scope.length > 0);
+
+    const formData: ServerFormData = {
+      name: trimmedName,
+      type: "http",
+      url: validated.trimmedUrl,
+      headers: Object.keys(headerMap).length ? headerMap : undefined,
+      useOAuth: true,
+      // Carry the chosen OAuth protocol version onto the connection form so
+      // `toMCPConfig` stamps the sessionless 2026 wire era on the saved/synced
+      // server config. Without this, hosted chat/eval/backend connects — which
+      // forward host/per-server MCP pins, not the OAuth profile — fall back to
+      // the 2025 initialize path for a 2026-only server.
+      oauthProtocolMode: draft.protocolVersion,
+      oauthScopes: scopesArray,
+      clientId: validated.trimmedClientId || undefined,
+      clientSecret: validated.trimmedClientSecret || undefined,
+      oauthAllowPathScopedIssuer: allowPathScopedIssuer,
+    };
+
+    // Await so a rejected save keeps the modal open with the entered values
+    // instead of closing over a server that was never written. `saving` blocks
+    // the resubmits that awaiting now makes possible. Mirrors XAAServerModal.
+    setSaving(true);
+    try {
+      await onSave({
+        formData,
+        profile: {
+          serverUrl: validated.trimmedUrl,
+          clientId: validated.trimmedClientId,
+          clientSecret: validated.trimmedClientSecret,
+          scopes: draft.scopes.trim(),
+          customHeaders: normalizedHeaders,
+          protocolVersion: draft.protocolVersion,
+          registrationStrategy: draft.registrationStrategy,
+        },
+      });
+      onOpenChange(false);
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Could not save the server. Please try again.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleProtocolChange = (value: OAuthProtocolVersion) => {
+    setDraft((prev) => {
+      const supported = getSupportedRegistrationStrategies(value);
+      const nextRegistration = supported.includes(prev.registrationStrategy)
+        ? prev.registrationStrategy
+        : (getDefaultRegistrationStrategy(value) as OAuthRegistrationStrategy);
+
+      return {
+        ...prev,
+        protocolVersion: value,
+        registrationStrategy: nextRegistration,
+      };
+    });
+  };
+
+  const updateHeaderRow = (
+    id: string,
+    field: "key" | "value",
+    value: string,
+  ) => {
+    setHeaderRows((rows) =>
+      rows.map((row) =>
+        row.id === id
+          ? {
+              ...row,
+              [field]: value,
+            }
+          : row,
+      ),
+    );
+  };
+
+  const removeHeaderRow = (id: string) => {
+    setHeaderRows((rows) => {
+      const updated = rows.filter((row) => row.id !== id);
+      return updated.length ? updated : [createHeaderRow()];
+    });
+  };
+
+  const addHeaderRow = () => {
+    setHeaderRows((rows) => [...rows, createHeaderRow()]);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Configure Server to Test</DialogTitle>
+        </DialogHeader>
+
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="space-y-2">
+            <Label
+              htmlFor="oauth-profile-name"
+              className="text-xs font-semibold text-muted-foreground"
+            >
+              Server Name
+            </Label>
+            <Input
+              id="oauth-profile-name"
+              value={serverName}
+              onChange={(event) => setServerName(event.target.value)}
+              placeholder="oauth-flow-target"
+              required
+            />
+          </div>
+          <div className="space-y-6 max-h-[65vh] overflow-y-auto px-1 pb-4">
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label
+                  htmlFor="oauth-profile-server-url"
+                  className="text-xs font-semibold text-muted-foreground"
+                >
+                  Server URL
+                </Label>
+                <Input
+                  id="oauth-profile-server-url"
+                  value={draft.serverUrl}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      serverUrl: event.target.value,
+                    }))
+                  }
+                  placeholder="https://example.com"
+                  autoFocus
+                  spellCheck={false}
+                  autoComplete="off"
+                  required
+                />
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label
+                    htmlFor="oauth-profile-protocol"
+                    className="text-xs font-semibold text-muted-foreground"
+                  >
+                    Protocol
+                  </Label>
+                  <Select
+                    value={draft.protocolVersion}
+                    onValueChange={(value) =>
+                      handleProtocolChange(value as OAuthProtocolVersion)
+                    }
+                  >
+                    <SelectTrigger
+                      id="oauth-profile-protocol"
+                      className="h-9 text-sm"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PROTOCOL_OPTIONS.map((option) => (
+                        <SelectItem
+                          key={option.value}
+                          value={option.value}
+                          className="text-xs"
+                        >
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label
+                    htmlFor="oauth-profile-registration"
+                    className="text-xs font-semibold text-muted-foreground"
+                  >
+                    Registration
+                  </Label>
+                  <Select
+                    value={draft.registrationStrategy}
+                    onValueChange={(value) =>
+                      handleRegistrationChange(
+                        value as OAuthRegistrationStrategy,
+                      )
+                    }
+                  >
+                    <SelectTrigger
+                      id="oauth-profile-registration"
+                      className="h-9 text-sm"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {supportedStrategies.map((strategy) => (
+                        <SelectItem
+                          key={strategy}
+                          value={strategy}
+                          className="text-xs"
+                        >
+                          {describeRegistrationStrategy(strategy)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-border">
+              <Accordion
+                type="single"
+                collapsible
+                value={advancedOpen}
+                onValueChange={setAdvancedOpen}
+              >
+                <AccordionItem value="advanced" className="border-none">
+                  <AccordionTrigger className="px-4 py-3 cursor-pointer">
+                    <span className="text-sm font-medium">
+                      Advanced settings (optional)
+                    </span>
+                  </AccordionTrigger>
+                  <AccordionContent className="px-4 space-y-4 pb-4">
+                    <div className="space-y-2">
+                      <Label
+                        htmlFor="oauth-profile-scopes"
+                        className="text-xs text-muted-foreground"
+                      >
+                        Scopes
+                      </Label>
+                      <Textarea
+                        id="oauth-profile-scopes"
+                        value={draft.scopes}
+                        onChange={(event) =>
+                          setDraft((prev) => ({
+                            ...prev,
+                            scopes: event.target.value,
+                          }))
+                        }
+                        placeholder="openid profile email"
+                        rows={1}
+                        spellCheck={false}
+                        autoComplete="off"
+                        data-1p-ignore
+                        data-lpignore="true"
+                        data-form-type="other"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-muted-foreground">
+                        Client credentials
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        Used for pre-registered flows or when dynamic
+                        registration is skipped.
+                      </p>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <Input
+                          value={draft.clientId}
+                          onChange={(event) =>
+                            setDraft((prev) => ({
+                              ...prev,
+                              clientId: event.target.value,
+                            }))
+                          }
+                          placeholder="Client ID"
+                          spellCheck={false}
+                          autoComplete="off"
+                          data-1p-ignore
+                          data-lpignore="true"
+                          data-form-type="other"
+                        />
+                        <Input
+                          type="password"
+                          value={draft.clientSecret}
+                          onChange={(event) =>
+                            setDraft((prev) => ({
+                              ...prev,
+                              clientSecret: event.target.value,
+                            }))
+                          }
+                          placeholder="Client Secret (optional)"
+                          autoComplete="off"
+                          data-1p-ignore
+                          data-lpignore="true"
+                          data-form-type="other"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-muted-foreground">
+                        Custom headers
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        Added to discovery and token requests (e.g. API keys).
+                      </p>
+                      <div className="space-y-2">
+                        {headerRows.map((row) => (
+                          <div key={row.id} className="flex gap-2">
+                            <Input
+                              value={row.key}
+                              onChange={(event) =>
+                                updateHeaderRow(
+                                  row.id,
+                                  "key",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="Header-Name"
+                              className="text-xs"
+                            />
+                            <Input
+                              value={row.value}
+                              onChange={(event) =>
+                                updateHeaderRow(
+                                  row.id,
+                                  "value",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="header-value"
+                              className="text-xs"
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => removeHeaderRow(row.id)}
+                              className="h-8 w-8"
+                              aria-label="Remove header"
+                            >
+                              ×
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full text-xs"
+                        onClick={addHeaderRow}
+                      >
+                        + Add header
+                      </Button>
+                    </div>
+
+                    <div className="flex items-start gap-2 pt-1">
+                      <Switch
+                        id="oauth-profile-path-scoped"
+                        checked={allowPathScopedIssuer}
+                        onCheckedChange={setAllowPathScopedIssuer}
+                      />
+                      <div className="space-y-0.5">
+                        <label
+                          htmlFor="oauth-profile-path-scoped"
+                          className="block text-xs font-medium text-foreground"
+                        >
+                          Path-scoped authorization server
+                        </label>
+                        <p className="text-xs text-muted-foreground">
+                          Allow the metadata to advertise the origin root as
+                          issuer while the OAuth endpoints live under a
+                          different path. Off keeps the strict RFC 8414 issuer
+                          match.
+                        </p>
+                      </div>
+                    </div>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
+            </div>
+
+            {error ? (
+              <p className="text-sm text-red-600" role="alert">
+                {error}
+              </p>
+            ) : null}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onOpenChange(false)}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={saving}>
+              {saving ? "Saving…" : "Save configuration"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,236 @@
+/**
+ * McpjamAgentComposer — shared input shell for MCPJam Agent surfaces.
+ *
+ * Used by `McpjamAgentHero` (home greeting) and `McpjamAgentThread`
+ * (follow-up composer). When rendered inside a `ScenarioHostStyleProvider`
+ * (thread/sidebar), it picks up the same composer skin as the playground
+ * `ChatInput`. On the home hero (no host context), it uses the orange
+ * invite ring to prompt the first message.
+ */
+import {
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { ArrowUp, Square } from "lucide-react";
+import { Button } from "@mcpjam/design-system/button";
+import { TextareaAutosize } from "@/components/ui/textarea-autosize";
+import { cn } from "@/lib/utils";
+import {
+  useScenarioHostStyle,
+  useScenarioHostTheme,
+} from "@/contexts/scenario-client-style-context";
+import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
+import { getScenarioComposerAppearance } from "@/lib/scenario-composer-appearance";
+import { getScenarioHostFamily } from "@/lib/scenario-client-style";
+
+export interface McpjamAgentComposerProps {
+  evalStyle?: boolean;
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  ready?: boolean;
+  placeholder?: string;
+  loadingMessage?: string;
+  isStreaming?: boolean;
+  onStop?: () => void;
+  className?: string;
+  textareaRef?: RefObject<HTMLTextAreaElement | null>;
+  minRows?: number;
+  maxRows?: number;
+  header?: ReactNode;
+  /** Compact controls rendered at the left of the footer row (e.g. the
+   *  Tool Approval toggle). */
+  footerControls?: ReactNode;
+}
+
+export function McpjamAgentComposer({
+  evalStyle = false,
+  value,
+  onChange,
+  onSubmit,
+  ready = true,
+  placeholder = "Ask a question or give a task…",
+  loadingMessage = "Loading…",
+  isStreaming = false,
+  onStop,
+  className,
+  textareaRef,
+  minRows,
+  maxRows,
+  header,
+  footerControls,
+}: McpjamAgentComposerProps) {
+  const [focused, setFocused] = useState(false);
+  const scenarioHostStyle = useScenarioHostStyle();
+  const scenarioHostTheme = useScenarioHostTheme();
+  const globalThemeMode = usePreferencesStore((state) => state.themeMode);
+  const isScenarioMode = scenarioHostStyle != null;
+  const isDark = (scenarioHostTheme ?? globalThemeMode) === "dark";
+  const hostFamily = getScenarioHostFamily(scenarioHostStyle);
+  const scenarioAppearance = getScenarioComposerAppearance(hostFamily, isDark);
+
+  const canSubmit = value.trim().length > 0 && ready && !isStreaming;
+  const showInvite =
+    !isScenarioMode && ready && value.length === 0 && !isStreaming;
+  const showHint =
+    !ready || (!isScenarioMode && ready && focused && value.length === 0);
+
+  const resolvedMinRows = minRows ?? (isScenarioMode ? 2 : 3);
+  const resolvedMaxRows = maxRows ?? (isScenarioMode ? 4 : 8);
+
+  const onFormSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!isStreaming) {
+      onSubmit();
+    }
+  };
+
+  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isStreaming) return;
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
+      event.preventDefault();
+      onSubmit();
+    }
+  };
+
+  const hintText = !ready
+    ? loadingMessage
+    : "Enter to send · Shift+Enter for newline";
+
+  const shellClasses = evalStyle
+    ? "relative flex w-full cursor-text flex-col rounded-xl border border-primary/35 bg-card p-3 shadow-none focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/15"
+    : isScenarioMode
+      ? cn(
+          "relative flex w-full cursor-text flex-col px-2 pt-2 pb-2",
+          scenarioAppearance.shellClasses,
+        )
+      : cn(
+          "relative cursor-text rounded-2xl border bg-card/60 shadow-sm transition-[border-color,box-shadow,background-color]",
+          showInvite
+            ? cn(
+                "border-primary/50 ring-2 ring-primary/25 shadow-[0_8px_24px_-12px] shadow-primary/30",
+                focused && "border-primary/60 bg-card/80",
+              )
+            : cn(
+                "border-border/70",
+                focused &&
+                  "border-foreground/30 bg-card/80 shadow-md ring-1 ring-foreground/10",
+              ),
+        );
+
+  const textareaClasses = isScenarioMode
+    ? cn(
+        "min-h-[64px] w-full resize-none overflow-y-auto overscroll-contain border-none bg-transparent dark:bg-transparent px-4",
+        "pt-2 pb-3 text-base text-foreground placeholder:text-muted-foreground/70",
+        "outline-none focus-visible:outline-none focus-visible:ring-0 shadow-none focus-visible:shadow-none",
+        isStreaming && "cursor-not-allowed text-muted-foreground",
+      )
+    : "min-h-[5.5rem] resize-none rounded-none border-0 bg-transparent px-4 py-3 text-[15px] leading-[1.625] caret-foreground shadow-none outline-none focus-visible:border-0 focus-visible:ring-0 md:text-[15px]";
+
+  const footerClasses = isScenarioMode
+    ? "flex items-center justify-end gap-2 px-2 min-w-0"
+    : "flex items-center justify-between gap-3 px-4 py-3";
+
+  return (
+    <form
+      onSubmit={onFormSubmit}
+      onClick={(event) => {
+        const target = event.target as HTMLElement;
+        if (target.closest("button")) return;
+        textareaRef?.current?.focus();
+      }}
+      data-eval-composer={evalStyle ? "true" : undefined}
+      className={cn(shellClasses, className)}
+    >
+      {header}
+      <TextareaAutosize
+        ref={textareaRef}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={onKeyDown}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        placeholder={ready ? placeholder : loadingMessage}
+        minRows={resolvedMinRows}
+        maxRows={resolvedMaxRows}
+        disabled={isStreaming}
+        className={cn(
+          textareaClasses,
+          evalStyle && "px-1 pt-1 pb-3 text-sm md:text-sm",
+        )}
+      />
+      <div className={cn(footerClasses, evalStyle && "px-1 pt-2 pb-1")}>
+        {footerControls ? (
+          <div
+            className={cn(
+              "flex shrink-0 items-center gap-2",
+              isScenarioMode && "mr-auto",
+            )}
+          >
+            {footerControls}
+          </div>
+        ) : null}
+        {!isScenarioMode ? (
+          <span
+            className={cn(
+              "text-[11px] leading-none text-muted-foreground/70 transition-opacity",
+              showHint ? "opacity-100" : "opacity-0",
+            )}
+          >
+            {hintText}
+          </span>
+        ) : showHint ? (
+          <span className="mr-auto text-[11px] leading-none text-muted-foreground/70">
+            {hintText}
+          </span>
+        ) : null}
+        {isStreaming ? (
+          <Button
+            type="button"
+            size="icon"
+            variant={isScenarioMode ? "secondary" : "outline"}
+            onClick={onStop}
+            disabled={!onStop}
+            aria-label="Stop generating"
+            className={cn(
+              "size-[34px] shrink-0 rounded-full transition-colors shadow-none",
+            )}
+          >
+            <Square className="size-4" aria-hidden />
+          </Button>
+        ) : (
+          <Button
+            type="submit"
+            size="icon"
+            disabled={!canSubmit}
+            title={ready ? "Send" : loadingMessage}
+            aria-label="Send"
+            className={cn(
+              "shrink-0 rounded-full transition-colors shadow-none",
+              isScenarioMode ? "size-[34px]" : "size-8 self-center",
+              evalStyle
+                ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                : isScenarioMode
+                  ? canSubmit
+                    ? scenarioAppearance.activeSubmitButtonClasses
+                    : scenarioAppearance.inactiveSubmitButtonClasses
+                  : undefined,
+            )}
+          >
+            <ArrowUp
+              className={isScenarioMode ? "size-4" : "size-4"}
+              aria-hidden
+            />
+          </Button>
+        )}
+      </div>
+    </form>
+  );
+}

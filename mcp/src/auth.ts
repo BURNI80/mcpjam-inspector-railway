@@ -1,0 +1,313 @@
+import {
+  createRemoteJWKSet,
+  decodeJwt,
+  jwtVerify,
+  type JWTPayload,
+  type JWTVerifyGetKey,
+} from "jose";
+
+export interface VerifiedToken {
+  token: string;
+  payload: JWTPayload;
+}
+
+/**
+ * Guest token issuer. Mirrors the inspector's
+ * `server/services/guest-token-keypair.ts` and the backend's
+ * `convex/lib/guestJwt.ts` (`GUEST_ISSUER`). Guest tokens are RS256, carry
+ * `{ iss, sub, iat, exp }` with NO `aud` claim, and must NOT carry a
+ * `purpose` claim (promotion-proof tokens must not double as session
+ * bearers — see `verifyGuestBearerToken` in the backend).
+ */
+export const GUEST_ISSUER = "https://api.mcpjam.com/guest";
+
+export type VerifyResult =
+  | { ok: true; verified: VerifiedToken }
+  | { ok: false; response: Response };
+
+export function normalizeIssuer(domain: string | undefined): string | undefined {
+  if (!domain) return undefined;
+  const withScheme =
+    domain.startsWith("http://") || domain.startsWith("https://")
+      ? domain
+      : `https://${domain}`;
+  return withScheme.replace(/\/+$/, "");
+}
+
+/**
+ * Allowed issuer → JWKS URL map. Mirrors the inspector's
+ * `server/services/authkit-jwt.ts` (`authkitIssuerJwks`) and the backend's
+ * `convex/auth.config.ts`, so the worker accepts exactly the tokens the rest
+ * of the platform already honors.
+ *
+ * Why a map and not a single issuer: the browser AuthKit SDK talks to the
+ * default WorkOS API host, so the access tokens it mints carry
+ * `iss = https://api.workos.com/user_management/<clientId>` — NOT the custom
+ * AuthKit domain (`login.mcpjam.com`). Pinning verification to the single
+ * `AUTHKIT_DOMAIN` issuer therefore rejected every real production token,
+ * which is exactly why the MCPJam agent's platform tools silently vanished in
+ * prod (worker 401 → preflight drops the server). A token's `iss` selects the
+ * JWKS; an issuer absent from this map is rejected.
+ *
+ * Note the JWKS path differs by issuer: WorkOS-hosted issuers publish at
+ * `/sso/jwks/<clientId>`, the custom AuthKit domain at `/oauth2/jwks`.
+ */
+export function authkitIssuerJwks(
+  clientId: string,
+  authkitDomain: string | undefined,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  const workosJwks = `https://api.workos.com/sso/jwks/${clientId}`;
+  const mcpjamJwks = `https://api.mcpjam.com/sso/jwks/${clientId}`;
+  const authJwks = `https://auth.mcpjam.com/sso/jwks/${clientId}`;
+  map.set("https://api.workos.com/", workosJwks);
+  map.set(`https://api.workos.com/user_management/${clientId}`, workosJwks);
+  map.set("https://api.mcpjam.com/", mcpjamJwks);
+  map.set(`https://api.mcpjam.com/user_management/${clientId}`, mcpjamJwks);
+  map.set("https://auth.mcpjam.com/", authJwks);
+  map.set(`https://auth.mcpjam.com/user_management/${clientId}`, authJwks);
+  const authkitIssuer = normalizeIssuer(authkitDomain);
+  if (authkitIssuer) {
+    map.set(authkitIssuer, `${authkitIssuer}/oauth2/jwks`);
+  }
+  return map;
+}
+
+// One remote JWKS per URL (jose caches fetched keys internally per set).
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+function remoteJwks(jwksUrl: string) {
+  let set = jwksCache.get(jwksUrl);
+  if (!set) {
+    set = createRemoteJWKSet(new URL(jwksUrl));
+    jwksCache.set(jwksUrl, set);
+  }
+  return set;
+}
+
+// A remote JWKS getter, or a static key (jose 6 dropped the `KeyLike` alias;
+// static keys are `CryptoKey | Uint8Array`). The static branch is used by
+// tests / injected deps; production always resolves to a remote JWKS.
+type KeyResolver =
+  | ReturnType<typeof createRemoteJWKSet>
+  | CryptoKey
+  | Uint8Array;
+
+export interface VerifyConfig {
+  /**
+   * WorkOS client id. One of two accepted token audiences — the other is this
+   * server's resource identifier; see the `audience` array in
+   * `verifyBearerToken` for why both are legitimate.
+   */
+  clientId: string;
+  /** Custom AuthKit domain (`env.AUTHKIT_DOMAIN`), added to the issuer set. */
+  authkitDomain: string | undefined;
+  /**
+   * Guest verification. When set, a token whose `iss` equals `guest.issuer`
+   * is verified against `guest.jwksUrl` (the JWKS the platform publishes for
+   * guest tokens) with NO audience pin. When undefined, guest tokens are
+   * rejected (the guest issuer is absent from the AuthKit allow-list).
+   */
+  guest?: { issuer: string; jwksUrl: string };
+  /**
+   * Issuer → key/JWKS resolver. `null` rejects the issuer. Injectable for
+   * tests; production derives it from the allow-list above (remote JWKS).
+   */
+  resolveKey?: (issuer: string) => KeyResolver | null;
+  /**
+   * Guest key resolver, parallel to `resolveKey`. Injectable for tests so the
+   * guest branch doesn't need a remote JWKS; production resolves the remote
+   * JWKS at `guest.jwksUrl`.
+   */
+  resolveGuestKey?: (issuer: string) => KeyResolver | null;
+}
+
+function defaultResolveKey(
+  clientId: string,
+  authkitDomain: string | undefined,
+): (issuer: string) => KeyResolver | null {
+  const issuers = authkitIssuerJwks(clientId, authkitDomain);
+  return (issuer) => {
+    const jwksUrl = issuers.get(issuer);
+    return jwksUrl ? remoteJwks(jwksUrl) : null;
+  };
+}
+
+function extractBearerToken(header: string | null): string | undefined {
+  if (!header) return undefined;
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(header);
+  return match?.[1];
+}
+
+/**
+ * This resource server's canonical identifier (RFC 8707). It is the `resource`
+ * of our protected-resource metadata AND one of the two audiences a token may
+ * legitimately carry, so both must be derived here — if they ever drift, we
+ * advertise one identifier and accept a different one.
+ */
+export function resourceIdentifier(origin: string): string {
+  return `${origin}/mcp`;
+}
+
+function resourceMetadataUrl(origin: string): string {
+  return `${origin}/.well-known/oauth-protected-resource/mcp`;
+}
+
+function buildWwwAuthenticate(
+  origin: string,
+  error?: { code: string; description: string },
+): string {
+  const parts = ["Bearer"];
+  if (error) {
+    parts.push(`error="${error.code}"`);
+    parts.push(`error_description="${error.description}"`);
+  }
+  parts.push(`resource_metadata="${resourceMetadataUrl(origin)}"`);
+  return parts[0] + " " + parts.slice(1).join(", ");
+}
+
+export async function verifyBearerToken(
+  request: Request,
+  config: VerifyConfig,
+  origin: string,
+): Promise<VerifyResult> {
+  const token = extractBearerToken(request.headers.get("authorization"));
+  if (!token) {
+    return { ok: false, response: missingTokenResponse(origin) };
+  }
+
+  // Read the (unverified) issuer ONLY to select the matching JWKS. The trust
+  // decision is `jwtVerify` below — signature + issuer pin + audience +
+  // exp/nbf — so a spoofed `iss` cannot grant access: it must be in the
+  // allow-list AND be signed by that issuer's published keys.
+  let issuer: string | undefined;
+  try {
+    issuer = decodeJwt(token).iss;
+  } catch {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+  if (!issuer) {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+
+  // Guest branch: a guest token (`iss === guest.issuer`) is verified against
+  // the guest JWKS with NO audience pin (guest tokens carry no `aud`). Checked
+  // before the AuthKit path because the guest issuer is intentionally absent
+  // from `authkitIssuerJwks`. The trust decision is still `jwtVerify` —
+  // signature + issuer pin + RS256 + exp — plus an explicit `purpose`
+  // rejection mirroring the backend's `verifyGuestBearerToken`.
+  if (config.guest && issuer === config.guest.issuer) {
+    return verifyGuestToken(token, issuer, config, origin);
+  }
+
+  const resolveKey =
+    config.resolveKey ?? defaultResolveKey(config.clientId, config.authkitDomain);
+  const key = resolveKey(issuer);
+  if (!key) {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+  // Normalize to a key-getter so the overload is unambiguous: a remote JWKS is
+  // already a function; a static key (tests / injected deps) is wrapped.
+  const getKey: JWTVerifyGetKey =
+    typeof key === "function" ? (key as JWTVerifyGetKey) : async () => key;
+
+  try {
+    // Two audiences, because AuthKit legitimately mints either one and which
+    // we get is a dashboard setting, not a property of the token or client:
+    //
+    //  - `resourceIdentifier(origin)` — when an MCP Resource Indicator is
+    //    configured for this server (it is, in prod and staging), AuthKit
+    //    stamps `aud` with the `resource` the client requested. Every
+    //    third-party MCP client (Claude Code, Cursor, …) lands here.
+    //  - `config.clientId` — AuthKit's fallback `aud` when no Resource
+    //    Indicator applies, and what first-party browser session tokens carry.
+    //
+    // jose treats an array as "any of", so a token matching either passes.
+    // Accepting only the client id is what broke third-party OAuth entirely:
+    // the flow completed, then every request 401'd on the audience check.
+    //
+    // This is still a pin, not a loosening — the audience must be US. Dropping
+    // it would let any token from the same issuer, minted for any other
+    // resource, be replayed here (token substitution).
+    const { payload } = await jwtVerify(token, getKey, {
+      issuer,
+      audience: [config.clientId, resourceIdentifier(origin)],
+      algorithms: ["RS256"],
+      clockTolerance: 5,
+    });
+    return { ok: true, verified: { token, payload } };
+  } catch {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+}
+
+async function verifyGuestToken(
+  token: string,
+  issuer: string,
+  config: VerifyConfig,
+  origin: string,
+): Promise<VerifyResult> {
+  const guest = config.guest;
+  if (!guest) {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+  const key = config.resolveGuestKey
+    ? config.resolveGuestKey(issuer)
+    : remoteJwks(guest.jwksUrl);
+  if (!key) {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+  const getKey: JWTVerifyGetKey =
+    typeof key === "function" ? (key as JWTVerifyGetKey) : async () => key;
+
+  try {
+    const { payload } = await jwtVerify(token, getKey, {
+      issuer: guest.issuer,
+      // No `audience`: guest tokens carry no `aud` claim.
+      algorithms: ["RS256"],
+      clockTolerance: 5,
+    });
+    // Mirror the backend's `verifyGuestBearerToken`: session bearers never
+    // carry a `purpose` (promotion-proof tokens do), and must have a non-empty
+    // string `sub`.
+    if (payload.purpose !== undefined) {
+      return { ok: false, response: invalidTokenResponse(origin) };
+    }
+    if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+      return { ok: false, response: invalidTokenResponse(origin) };
+    }
+    return { ok: true, verified: { token, payload } };
+  } catch {
+    return { ok: false, response: invalidTokenResponse(origin) };
+  }
+}
+
+export const OAUTH_DISCOVERY_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-expose-headers": "WWW-Authenticate",
+} as const;
+
+function missingTokenResponse(origin: string): Response {
+  // RFC 6750 §3.1: no error code when credentials are absent.
+  return new Response(JSON.stringify({ error: "Authorization needed" }), {
+    status: 401,
+    headers: {
+      ...OAUTH_DISCOVERY_HEADERS,
+      "content-type": "application/json",
+      "www-authenticate": buildWwwAuthenticate(origin),
+    },
+  });
+}
+
+function invalidTokenResponse(origin: string): Response {
+  return new Response(JSON.stringify({ error: "Invalid bearer token" }), {
+    status: 401,
+    headers: {
+      ...OAUTH_DISCOVERY_HEADERS,
+      "content-type": "application/json",
+      "www-authenticate": buildWwwAuthenticate(origin, {
+        code: "invalid_token",
+        description: "The bearer token is invalid or expired",
+      }),
+    },
+  });
+}

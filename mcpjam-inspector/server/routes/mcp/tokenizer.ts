@@ -1,0 +1,293 @@
+import { fetchTokenizerCount } from "../../utils/tokenizer-backend.js";
+import { Hono } from "hono";
+import "../../types/hono";
+import {
+  mapModelIdToTokenizerBackend,
+  estimateTokensFromChars,
+  isFetchConnectionFailure,
+  getFetchErrorCause,
+} from "../../utils/tokenizer-helpers";
+import { logger } from "../../utils/logger";
+import { reportRouteFailure, readRequestJson } from "../../utils/route-error-report.js";
+
+const tokenizer = new Hono();
+
+/**
+ * Proxy endpoint to count tokens for MCP server tools
+ * POST /api/mcp/tokenizer/count-tools
+ * Body: { selectedServers: string[], modelId: string }
+ */
+tokenizer.post("/count-tools", async (c) => {
+  try {
+    const body = (await readRequestJson(c)) as {
+      selectedServers?: string[];
+      modelId?: string;
+    };
+
+    const { selectedServers, modelId } = body;
+
+    if (!Array.isArray(selectedServers)) {
+      return c.json(
+        {
+          ok: false,
+          error: "selectedServers must be an array",
+        },
+        400,
+      );
+    }
+
+    if (!modelId || typeof modelId !== "string") {
+      return c.json(
+        {
+          ok: false,
+          error: "modelId is required",
+        },
+        400,
+      );
+    }
+
+    // If no servers selected, return empty object
+    if (selectedServers.length === 0) {
+      return c.json({
+        ok: true,
+        tokenCounts: {},
+      });
+    }
+
+    const mcpClientManager = c.mcpClientManager;
+
+    const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+    if (!convexHttpUrl) {
+      return c.json(
+        {
+          ok: false,
+          error: "Server missing CONVEX_HTTP_URL configuration",
+        },
+        500,
+      );
+    }
+
+    // Get token counts for each server individually
+    const tokenCounts: Record<string, number> = {};
+
+    // Map model ID to backend-recognized format
+    const mappedModelId = mapModelIdToTokenizerBackend(modelId);
+    const useBackendTokenizer = mappedModelId !== null;
+
+    await Promise.all(
+      selectedServers.map(async (serverId) => {
+        try {
+          // Get tools JSON for this specific server
+          const tools = await mcpClientManager.getToolsForAiSdk([serverId]);
+
+          // Serialize tools JSON to string for tokenization
+          const toolsText = JSON.stringify(tools);
+
+          if (useBackendTokenizer && mappedModelId) {
+            // Use backend tokenizer API for mapped models
+            const response = await fetchTokenizerCount(toolsText, mappedModelId);
+
+            if (response.ok) {
+              const data = (await response.json()) as {
+                ok?: boolean;
+                tokenCount?: number;
+                error?: string;
+              };
+              if (data.ok) {
+                tokenCounts[serverId] = data.tokenCount || 0;
+              } else {
+                logger.warn(
+                  `[tokenizer] Failed to count tokens for server ${serverId}`,
+                  { serverId, error: data.error },
+                );
+                // Fallback to character-based estimation on backend error
+                tokenCounts[serverId] = estimateTokensFromChars(toolsText);
+              }
+            } else {
+              logger.warn(
+                `[tokenizer] Failed to count tokens for server ${serverId}`,
+                { serverId, status: response.status },
+              );
+              // Fallback to character-based estimation on HTTP error
+              tokenCounts[serverId] = estimateTokensFromChars(toolsText);
+            }
+          } else {
+            // Use character-based fallback for unmapped models
+            tokenCounts[serverId] = estimateTokensFromChars(toolsText);
+          }
+        } catch (error) {
+          // Connection-level failures reaching the Convex tokenizer come from
+          // the caller's network, not our backend — log locally and move on.
+          if (isFetchConnectionFailure(error)) {
+            logger.debug(
+              `[tokenizer] Backend unreachable for server, falling back to estimate`,
+              { serverId, cause: getFetchErrorCause(error) },
+            );
+          } else {
+            logger.warn(`[tokenizer] Error counting tokens for server`, {
+              serverId,
+              error: error instanceof Error ? error.message : String(error),
+              cause: getFetchErrorCause(error),
+            });
+          }
+          // Fallback to character-based estimation on error
+          try {
+            const tools = await mcpClientManager.getToolsForAiSdk([serverId]);
+            const toolsText = JSON.stringify(tools);
+            tokenCounts[serverId] = estimateTokensFromChars(toolsText);
+          } catch {
+            tokenCounts[serverId] = 0;
+          }
+        }
+      }),
+    );
+
+    return c.json({
+      ok: true,
+      tokenCounts,
+    });
+  } catch (error) {
+    reportRouteFailure("[tokenizer] Error counting MCP tools tokens", error, {
+      // The per-server body already swallows connection failures; anything
+      // that escapes to here is the route's own orchestration.
+      source: "mcp.tokenizer.tools",
+      hop: "mcpjam_internal",
+    });
+    return c.json(
+      {
+        ok: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      500,
+    );
+  }
+});
+
+/**
+ * Proxy endpoint to count tokens for arbitrary text
+ * POST /api/mcp/tokenizer/count-text
+ * Body: { text: string, modelId: string }
+ */
+tokenizer.post("/count-text", async (c) => {
+  try {
+    const body = (await readRequestJson(c)) as {
+      text?: string;
+      modelId?: string;
+    };
+
+    const { text, modelId } = body;
+
+    if (!text || typeof text !== "string") {
+      return c.json(
+        {
+          ok: false,
+          error: "text is required and must be a string",
+        },
+        400,
+      );
+    }
+
+    if (!modelId || typeof modelId !== "string") {
+      return c.json(
+        {
+          ok: false,
+          error: "modelId is required",
+        },
+        400,
+      );
+    }
+
+    const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+    if (!convexHttpUrl) {
+      return c.json(
+        {
+          ok: false,
+          error: "Server missing CONVEX_HTTP_URL configuration",
+        },
+        500,
+      );
+    }
+
+    const mappedModelId = mapModelIdToTokenizerBackend(modelId);
+    const useBackendTokenizer = mappedModelId !== null;
+
+    if (useBackendTokenizer && mappedModelId) {
+      try {
+        // Use backend tokenizer API for mapped models
+        const response = await fetchTokenizerCount(text, mappedModelId);
+
+        if (response.ok) {
+          const data = (await response.json()) as {
+            ok?: boolean;
+            tokenCount?: number;
+            error?: string;
+          };
+          if (data.ok) {
+            return c.json({
+              ok: true,
+              tokenCount: data.tokenCount || 0,
+            });
+          } else {
+            logger.warn(`[tokenizer] Failed to count tokens for text`, {
+              error: data.error,
+            });
+            // Fallback to character-based estimation on backend error
+            return c.json({
+              ok: true,
+              tokenCount: estimateTokensFromChars(text),
+            });
+          }
+        } else {
+          logger.warn(`[tokenizer] Failed to count tokens for text`, {
+            status: response.status,
+          });
+          // Fallback to character-based estimation on HTTP error
+          return c.json({
+            ok: true,
+            tokenCount: estimateTokensFromChars(text),
+          });
+        }
+      } catch (error) {
+        // Connection-level failures (DNS, ECONNREFUSED, TLS) are user-network
+        // issues, not backend problems. Demote to debug so they don't page
+        // Sentry; backend HTTP/logical errors are already handled above as warnings.
+        if (isFetchConnectionFailure(error)) {
+          logger.debug(
+            `[tokenizer] Backend unreachable, falling back to estimate`,
+            { cause: getFetchErrorCause(error) },
+          );
+        } else {
+          logger.warn(`[tokenizer] Error counting tokens for text`, {
+            error: error instanceof Error ? error.message : String(error),
+            cause: getFetchErrorCause(error),
+          });
+        }
+        // Fallback to character-based estimation on error
+        return c.json({
+          ok: true,
+          tokenCount: estimateTokensFromChars(text),
+        });
+      }
+    } else {
+      // Use character-based fallback for unmapped models
+      return c.json({
+        ok: true,
+        tokenCount: estimateTokensFromChars(text),
+      });
+    }
+  } catch (error) {
+    reportRouteFailure("[tokenizer] Error counting text tokens", error, {
+      source: "mcp.tokenizer.text",
+      hop: "mcpjam_internal",
+    });
+    return c.json(
+      {
+        ok: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      500,
+    );
+  }
+});
+
+export default tokenizer;

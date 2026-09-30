@@ -1,0 +1,1096 @@
+/**
+ * Convex control-plane client for Project Computers.
+ *
+ * The inspector server is the DATA plane (it holds `E2B_API_KEY` and the live
+ * exec/PTY connections); Convex owns the durable rows. This module wraps the
+ * backend's `/computers/*` HTTP routes (mcpjam-backend
+ * `convex/computersDataPlane.ts`), reached via `CONVEX_HTTP_URL` like
+ * `scenario-runtime-config.ts` does:
+ *
+ *   reserve           user-bearer auth — reserve/wake/poll the acting user's
+ *                     computer (idempotent; each poll also counts as activity)
+ *   sandbox-info      service-token auth — Convex row id → vendor sandbox id.
+ *                     The token marks us as the deployed server; browsers
+ *                     must never be able to make this exchange.
+ *   commands          service-token auth — durable command log (idempotent)
+ *   terminal-sessions service-token auth — session open/close records
+ */
+import { logger } from "../logger.js";
+import { type ExecutionScope } from "../execution-scope.js";
+import { redactForLog } from "../../routes/v1/redact-log-message.js";
+import {
+  EVAL_SANDBOX_CAPACITY_POLICY,
+  PLAYGROUND_CAPACITY_POLICY,
+  withCapacityRetry,
+} from "../run-supervisor/capacity-retry.js";
+
+export type ComputerStatus =
+  | "requested"
+  | "provisioning"
+  | "ready"
+  | "waking"
+  | "hibernating"
+  | "deleting"
+  | "deleted"
+  | "error";
+
+/**
+ * Which runtime a computer boots. Hand-mirrored from the backend
+ * (`projectComputers.runtimeKind`, PR d/e2); absent ⇒ terminal, so every
+ * existing caller keeps the terminal behaviour it had before desktop existed.
+ */
+export type RuntimeKind = "terminal" | "desktop-browser";
+
+export interface ReservedComputer {
+  computerId: string;
+  status: ComputerStatus;
+  provider: string;
+  lastError?: string;
+}
+
+export interface ComputerSandboxInfo {
+  computerId?: string;
+  sandboxRowId?: string;
+  providerComputerId: string | null;
+  provider: string;
+  status: ComputerStatus;
+  projectId: string;
+  ownerUserId: string;
+  /** Hand-mirrored from the backend `ComputerView` (PR e2). */
+  runtimeKind?: RuntimeKind;
+  bootedRuntimeCapabilities?: string[];
+}
+
+export type ControlPlaneResult<T> =
+  | { ok: true; value: T }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      /**
+       * The control plane's own machine code, when it sent one
+       * (`billing_limit_reached`, `at_capacity`, `FEATURE_UNAVAILABLE`, …).
+       * Absent for statuses that carry no code and for failures minted on this
+       * side. Callers that need to tell two refusals with the same status apart
+       * branch on this rather than on the message prose.
+       */
+      code?: string;
+      /** Which budget a capacity refusal hit; see `postJson`. */
+      resource?: string;
+      /** Server-provided retry hint, normalized to milliseconds. */
+      retryAfterMs?: number;
+      limit?: number;
+    };
+
+/**
+ * What a caller is told when a computer cannot be reached, reserved or woken
+ * (MJ-020, MJ-021): a fixed sentence chosen by the status and machine code.
+ * The upstream `error` text is logged here and never relayed — it is written
+ * for us, not for whoever is waiting on the computer.
+ */
+export function computerUnavailableError(
+  failure: { status: number; code?: string; error?: string },
+  source: string,
+): string {
+  logger.warn(`[computers] ${source} failed`, {
+    status: failure.status,
+    ...(failure.code ? { code: failure.code } : {}),
+    ...(failure.error ? { detail: redactForLog(failure.error) } : {}),
+  });
+  return `Computer unavailable: ${computerUnavailableReason(failure, source)}`;
+}
+
+function computerUnavailableReason(
+  {
+    status,
+    code,
+  }: {
+    status: number;
+    code?: string;
+  },
+  source: string,
+): string {
+  if (code === "at_capacity" || status === 503) {
+    return "computers are at capacity right now. Try again in a moment.";
+  }
+  if (
+    code === "billing_feature_not_included" ||
+    code === "FEATURE_UNAVAILABLE"
+  ) {
+    return "computers are not available for this organization.";
+  }
+  if (code === "billing_limit_reached" || status === 429) {
+    return "a usage limit was reached. Try again later.";
+  }
+  switch (status) {
+    case 0:
+      return "the computers service could not be reached.";
+    case 401:
+      // sandbox-info is gated on this server's own credential, which signing
+      // in again cannot repair.
+      return source === "sandbox-info"
+        ? "the computers service returned an error."
+        : "sign in again and retry.";
+    case 403:
+      return "you do not have access to this computer.";
+    case 404:
+    case 410:
+      return "this computer no longer exists.";
+    case 499:
+      return "the request was cancelled.";
+    case 502:
+      return "the computer failed to start.";
+    case 504:
+      return "the computer did not become ready in time. Try again in a moment.";
+  }
+  return status >= 400 && status < 500
+    ? "the request was not accepted."
+    : "the computers service returned an error.";
+}
+
+export function getConvexHttpUrl(): string | null {
+  return process.env.CONVEX_HTTP_URL?.trim() || null;
+}
+
+/**
+ * Set once the boot bootstrap gets a 401 from this server's Convex
+ * (`runtime-config.ts` calls `markServiceTokenRejected`): the
+ * `INSPECTOR_SERVICE_TOKEN` this process holds is NOT a valid data-plane
+ * credential. The runtime-config route and every secret-gated `/computers/*`
+ * route gate on the SAME check, so a token the bootstrap rejected will also
+ * 401 the data-plane calls — it must not count toward
+ * `isComputersDataPlaneConfigured()` or be presented on requests, or the
+ * server would advertise `localConfigured: true` while every computer call
+ * hard-401s. Sticky for the process lifetime: a wrong token only becomes
+ * right via an env change + restart, and a 401 bootstrap never re-runs.
+ */
+let serviceTokenRejected = false;
+
+/** Called by the bootstrap on a 401. */
+export function markServiceTokenRejected(): void {
+  serviceTokenRejected = true;
+}
+
+export function resetServiceTokenRejectedForTests(): void {
+  serviceTokenRejected = false;
+}
+
+function getServiceToken(): string | null {
+  if (serviceTokenRejected) return null;
+  return process.env.INSPECTOR_SERVICE_TOKEN?.trim() || null;
+}
+
+/**
+ * True when everything the computers data plane needs is present: a Convex to
+ * talk to, the inspector service token, the vendor key, and the terminal-token
+ * secret. The secret is still required because it signs/verifies harness proxy
+ * tokens (`harness-proxy-token.ts`) even though terminal tokens are now
+ * RS256/JWKS.
+ *
+ * Values may arrive from the environment OR from the boot bootstrap
+ * (`runtime-config.ts`, which fills env in place) — callers that can run
+ * before startup finishes must await `initComputersRuntimeConfigBootstrap`
+ * first (see `initComputersStartup` in `remote-data-plane.ts`).
+ */
+export function isComputersDataPlaneConfigured(): boolean {
+  return Boolean(
+    getConvexHttpUrl() &&
+    getServiceToken() &&
+    process.env.E2B_API_KEY &&
+    process.env.COMPUTERS_TERMINAL_TOKEN_SECRET?.trim(),
+  );
+}
+
+async function postJson<T>(
+  path: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<ControlPlaneResult<T>> {
+  const base = getConvexHttpUrl();
+  if (!base) {
+    return { ok: false, status: 0, error: "CONVEX_HTTP_URL is not set" };
+  }
+  let response: Response;
+  try {
+    response = await fetch(new URL(path, base).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (err) {
+    logger.error(`[computers] ${path} network error`, err);
+    return { ok: false, status: 0, error: "network error" };
+  }
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // fall through with null payload
+  }
+  if (!response.ok) {
+    const body =
+      payload && typeof payload === "object"
+        ? (payload as Record<string, unknown>)
+        : undefined;
+    const error =
+      body && "error" in body
+        ? String(body.error)
+        : `request failed (${response.status})`;
+    const code = typeof body?.code === "string" ? body.code : undefined;
+    const retryAfter = response.headers.get("retry-after");
+    const retryAfterSeconds = retryAfter ? Number(retryAfter) : NaN;
+    return {
+      ok: false,
+      status: response.status,
+      error,
+      ...(code ? { code } : {}),
+      ...(typeof body?.limit === "number" ? { limit: body.limit } : {}),
+      // WHICH budget a 503 hit (`run` | `desktop` | `org` | `global`), when
+      // the control plane said. Lets a caller word its wait notice — "waiting
+      // on desktop capacity" is a different sentence, and a different wait,
+      // from "this organization has too many sandboxes in flight".
+      ...(typeof body?.resource === "string"
+        ? { resource: body.resource }
+        : {}),
+      ...(Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+        ? { retryAfterMs: Math.round(retryAfterSeconds * 1000) }
+        : {}),
+    };
+  }
+  return { ok: true, value: payload as T };
+}
+
+/**
+ * Server-to-server auth headers for the secret-gated `/computers/*` routes:
+ * the inspector service token. Null when the server holds no (valid) token —
+ * callers treat that as unconfigured.
+ */
+function authHeaders(): Record<string, string> | null {
+  const token = getServiceToken();
+  return token ? { "x-inspector-service-token": token } : null;
+}
+
+function bearerHeader(raw: string): Record<string, string> {
+  const value = raw.trim();
+  return {
+    authorization: /^bearer\s/i.test(value) ? value : `Bearer ${value}`,
+  };
+}
+
+export interface EvalSandbox {
+  sandboxId: string;
+  sandboxRowId: string;
+  /**
+   * What ACTUALLY booted — not what was asked for. On a reuse the control
+   * plane answers with the row's own kind, so a caller can never believe it
+   * holds a desktop box when it holds a terminal one.
+   */
+  runtimeKind?: RuntimeKind;
+  /** What the live box advertises (`["bash","browser"]` for a desktop). */
+  capabilities?: string[];
+}
+
+/**
+ * Provision a fresh ephemeral sandbox for one eval iteration, pinned to the
+ * run's frozen environment build (user-bearer auth). The body carries only the
+ * run/iteration ids and the image CLASS — the control plane resolves the image
+ * itself from the run's configSnapshot, so this can never boot an arbitrary
+ * template.
+ *
+ * `runtimeKind: "desktop-browser"` is a REQUEST, not a grant: the control
+ * plane refuses it unless the iteration's own frozen host config advertises
+ * the `browser` tool, and refuses it outright when the run also pins a custom
+ * environment image.
+ *
+ * Failure statuses the caller must distinguish:
+ *   409 `desktop_not_advertised` / `desktop_pin_conflict` /
+ *       `desktop_unavailable` — terminal for this run, and the `error` string
+ *       is written for a human: surface it, do not retry.
+ *   503 — at capacity; `resource` says which budget. Retryable with backoff.
+ */
+/**
+ * Provision the sandbox for ONE eval iteration.
+ *
+ * Retries `503 at_capacity` rather than failing the iteration on it. A full
+ * pool is a queue, not a verdict: before this, a suite that happened to launch
+ * while the pool was saturated recorded its iterations as genuine failures,
+ * and a capacity blip read as a quality regression on the run's chart.
+ *
+ * The LOOP is `withCapacityRetry`, shared with the Playground path; the POLICY
+ * is {@link EVAL_SANDBOX_CAPACITY_POLICY}, which is deliberately not the
+ * Playground's — see that constant for why a suite needs jitter and a much
+ * shorter ceiling than one waiting user does.
+ *
+ * Every other failure (409, auth, a malformed body) is returned untouched on
+ * the first attempt: only capacity is worth waiting on.
+ */
+export async function provisionEvalSandbox(args: {
+  bearer: string;
+  runId: string;
+  iterationId?: string;
+  runtimeKind?: RuntimeKind;
+  signal?: AbortSignal;
+  /**
+   * Shorter aggregate wait than the policy's default. The caller knows what is
+   * LEFT of the iteration's clock; this function only knows the policy, and a
+   * capacity wait that outlives the iteration it is blocking is pure waste.
+   */
+  timeoutMs?: number;
+  onWait?: (info: { delayMs: number; resource?: string }) => void;
+}): Promise<ControlPlaneResult<EvalSandbox>> {
+  type Result = ControlPlaneResult<EvalSandbox>;
+  const atCapacity = (result: Result): boolean =>
+    !result.ok && result.status === 503 && result.code === "at_capacity";
+
+  const outcome = await withCapacityRetry<Result>(
+    // The attempt signal, not `args.signal`: `postJson` sets no timeout of its
+    // own, so a control plane that accepts the connection and then stalls must
+    // cost ONE attempt rather than the whole budget.
+    (_attempt, signal) =>
+      postJson<EvalSandbox>(
+        "/evals/sandbox/provision",
+        bearerHeader(args.bearer),
+        {
+          runId: args.runId,
+          ...(args.iterationId ? { iterationId: args.iterationId } : {}),
+          ...(args.runtimeKind ? { runtimeKind: args.runtimeKind } : {}),
+        },
+        signal,
+      ),
+    {
+      ...EVAL_SANDBOX_CAPACITY_POLICY,
+      totalBudgetMs:
+        args.timeoutMs ?? EVAL_SANDBOX_CAPACITY_POLICY.totalBudgetMs,
+      shouldRetry: atCapacity,
+      retryAfterMsOf: (result) =>
+        !result.ok && typeof result.retryAfterMs === "number"
+          ? result.retryAfterMs
+          : undefined,
+      ...(args.signal ? { signal: args.signal } : {}),
+      onWait: ({ delayMs, result }) => {
+        const resource =
+          result && !result.ok && typeof result.resource === "string"
+            ? result.resource
+            : undefined;
+        args.onWait?.({ delayMs, ...(resource ? { resource } : {}) });
+      },
+    },
+  );
+
+  if (outcome.kind === "settled") return outcome.result;
+  // Out of attempts or out of clock. The LAST result is returned when there is
+  // one, so the caller sees the control plane's own words (and its `resource`)
+  // rather than a message this function invented about a failure it only
+  // relayed.
+  if (outcome.lastResult) return outcome.lastResult;
+  if (outcome.reason === "aborted") {
+    return { ok: false, status: 499, error: "cancelled" };
+  }
+  return {
+    ok: false,
+    status: 503,
+    error: "Eval sandbox capacity did not become available in time",
+    code: "at_capacity",
+  };
+}
+
+export interface ResolvedEvalAttachment {
+  name: string;
+  /** Absolute path inside the sandbox to write the file to (frozen at run start). */
+  path: string;
+  contentHash: string;
+  size: number;
+  /**
+   * Download URL for the pinned blob, read by this server only (see
+   * `resolveEvalRunAttachments`); null when the pin is gone.
+   */
+  url: string | null;
+}
+
+export interface ResolvedEvalAttachmentsCase {
+  /** Frozen case id — match against the running iteration's `test.testCaseId`. */
+  testCaseId: string;
+  attachments: ResolvedEvalAttachment[];
+}
+
+/**
+ * Resolve the run's frozen per-case attachments to download URLs (user-bearer
+ * auth). The control plane joins each case's pinned content-hashes to their
+ * blobs and mints download URLs; a `url: null` means the pin vanished, and
+ * the caller must fail the iteration honestly rather than seed a missing file.
+ *
+ * The service token rides along when this server holds one (MJ-005): the
+ * backend then answers with locations that serve an attachment of any size.
+ * Without it, it answers with signed links, which serve smaller files only.
+ * A token already rejected at boot (`markServiceTokenRejected`) is not
+ * presented, since the backend answers an invalid token with 403 rather than
+ * with signed links. Either way the URLs are read by this server alone
+ * (`seedAttachmentsIntoSandbox`) and are never returned to a caller.
+ */
+export async function resolveEvalRunAttachments(args: {
+  bearer: string;
+  runId: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<{ cases: ResolvedEvalAttachmentsCase[] }>> {
+  return postJson<{ cases: ResolvedEvalAttachmentsCase[] }>(
+    "/evals/sandbox/attachments",
+    {
+      ...bearerHeader(args.bearer),
+      ...(getServiceToken()
+        ? { "x-inspector-service-token": getServiceToken()! }
+        : {}),
+    },
+    { runId: args.runId },
+    args.signal,
+  );
+}
+
+export interface JourneySandbox {
+  sandboxId: string;
+  sandboxRowId: string;
+  /** Working directory the target's host configured (backend-resolved). */
+  workdir?: string;
+  /** What ACTUALLY booted — on a reuse, the row's kind, not the request's. */
+  runtimeKind?: RuntimeKind;
+  /** What the live box advertises (`["bash","browser"]` for a desktop). */
+  capabilities?: string[];
+}
+
+export interface PlaygroundSandbox {
+  sandboxRowId: string;
+  status: "provisioning" | "live" | "sleeping" | "waking";
+  providerSandboxId?: string;
+}
+
+export interface SessionBrowserToken {
+  token: string;
+  expiresAt: number;
+  sessionId: string;
+  target: "computer" | "sandbox";
+  computerId?: string;
+  sandboxRowId?: string;
+  status: string;
+}
+
+/** Mint a short-lived token scoped to one durable logical browser session. */
+export async function mintBrowserTokenForSession(args: {
+  bearer: string;
+  projectId: string;
+  sessionId: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<SessionBrowserToken>> {
+  return postJson<SessionBrowserToken>(
+    "/computers/browser-token",
+    bearerHeader(args.bearer),
+    { projectId: args.projectId, sessionId: args.sessionId },
+    args.signal,
+  );
+}
+
+/** Wake a sleeping Playground box owned by the current bearer. */
+export async function wakePlaygroundSandbox(args: {
+  bearer: string;
+  sandboxRowId: string;
+  /** Identity already verified from a short-lived browser token by the panel. */
+  verifiedUserId?: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<{ ok: boolean; woke?: boolean }>> {
+  return postJson<{ ok: boolean; woke?: boolean }>(
+    "/playground/sandbox/wake",
+    {
+      ...bearerHeader(args.bearer),
+      ...(args.verifiedUserId && getServiceToken()
+        ? { "x-inspector-service-token": getServiceToken()! }
+        : {}),
+    },
+    {
+      sandboxRowId: args.sandboxRowId,
+      ...(args.verifiedUserId ? { verifiedUserId: args.verifiedUserId } : {}),
+    },
+    args.signal,
+  );
+}
+
+/**
+ * Provision the watched desktop for one Playground conversation.
+ *
+ * Capacity is transient and shared by every sandbox family. Keep the retry
+ * policy here, at the control-plane boundary, so chat routes and browser tools
+ * cannot accidentally invent different retry loops. The ten-minute ceiling is
+ * intentionally finite: a full queue should become a user-visible notice,
+ * not an unbounded tool call.
+ *
+ * The LOOP is `withCapacityRetry` (`server/utils/run-supervisor/`), shared with
+ * the swarm and eval sandbox paths; the POLICY and the terminal shapes stay
+ * here, because they are this surface's and no two of the three agree. See
+ * {@link PLAYGROUND_CAPACITY_POLICY} for the numbers.
+ */
+export async function provisionPlaygroundSandbox(args: {
+  bearer: string;
+  projectId: string;
+  chatSessionId: string;
+  hostId?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  onWait?: (info: { delayMs: number; resource?: string }) => void;
+}): Promise<ControlPlaneResult<PlaygroundSandbox>> {
+  type Result = ControlPlaneResult<PlaygroundSandbox>;
+  const atCapacity = (result: Result): boolean =>
+    !result.ok && result.status === 503 && result.code === "at_capacity";
+  const resourceOf = (result: Result | undefined): string | undefined =>
+    result && !result.ok && typeof result.resource === "string"
+      ? result.resource
+      : undefined;
+  /** The one message every give-up path has always used. */
+  const outOfTime = (
+    extra: Partial<Extract<Result, { ok: false }>> = {},
+  ): Result => ({
+    ok: false,
+    status: 503,
+    error: "Playground browser capacity did not become available in time",
+    code: "at_capacity",
+    ...extra,
+  });
+
+  const outcome = await withCapacityRetry<Result>(
+    // `postJson` sets no timeout of its own and `args.signal` fires only on a
+    // caller-level cancel, so a control plane that accepts the connection and
+    // then stalls would park this await well past the ceiling. The policy's
+    // per-attempt deadline — capped by what is LEFT of the aggregate budget —
+    // is what bounds it.
+    (_attempt, signal) =>
+      postJson<PlaygroundSandbox>(
+        "/playground/sandbox/provision",
+        {
+          ...bearerHeader(args.bearer),
+          ...(getServiceToken()
+            ? { "x-inspector-service-token": getServiceToken()! }
+            : {}),
+        },
+        {
+          projectId: args.projectId,
+          chatSessionId: args.chatSessionId,
+          ...(args.hostId ? { hostId: args.hostId } : {}),
+        },
+        signal,
+      ),
+    {
+      ...PLAYGROUND_CAPACITY_POLICY,
+      totalBudgetMs: args.timeoutMs ?? PLAYGROUND_CAPACITY_POLICY.totalBudgetMs,
+      shouldRetry: atCapacity,
+      retryAfterMsOf: (result) =>
+        !result.ok && typeof result.retryAfterMs === "number"
+          ? result.retryAfterMs
+          : undefined,
+      ...(args.signal ? { signal: args.signal } : {}),
+      onWait: ({ delayMs, result }) => {
+        const resource = resourceOf(result);
+        args.onWait?.({ delayMs, ...(resource ? { resource } : {}) });
+      },
+    },
+  );
+
+  if (outcome.kind === "settled") return outcome.result;
+  if (outcome.reason === "aborted") {
+    return { ok: false, status: 499, error: "cancelled" };
+  }
+  if (outcome.reason === "budget_before_delay") {
+    // Gave up in FRONT of a wait, so we know how long that wait would have
+    // been and which budget was full — both worth telling the caller.
+    const resource = resourceOf(outcome.lastResult);
+    return outOfTime({
+      ...(resource ? { resource } : {}),
+      ...(outcome.plannedDelayMs !== undefined
+        ? { retryAfterMs: outcome.plannedDelayMs }
+        : {}),
+    });
+  }
+  return outOfTime();
+}
+
+/**
+ * Provision (or re-obtain) the ephemeral sandbox for ONE journey attempt —
+ * user-bearer auth, the launching member's token.
+ *
+ * The body carries only `(runId, targetId, sessionIdx)`. The control plane
+ * resolves the image from the run's frozen snapshot and the vendor template
+ * from the frozen build, so this can never boot an arbitrary template — the
+ * caller does not know, and cannot supply, an image identifier.
+ *
+ * IDEMPOTENT at the backend: a duplicated call for the same attempt returns the
+ * same sandbox rather than booting a second paid box, and a call arriving after
+ * the attempt finished is refused outright.
+ *
+ * Failure statuses the caller must distinguish:
+ *   409 — no image pinned / attempt not running / image unavailable, or one of
+ *         the desktop refusals (`desktop_not_advertised`,
+ *         `desktop_pin_conflict`, `desktop_unavailable`). Terminal for this
+ *         attempt; the `error` string is written for a human.
+ *   503 — at capacity; `resource` says which budget. Retryable with backoff.
+ *
+ * `runtimeKind: "desktop-browser"` is a REQUEST, not a grant — the control
+ * plane refuses it unless the target's FROZEN snapshot advertises `browser`.
+ */
+export async function provisionJourneySandbox(args: {
+  bearer: string;
+  runId: string;
+  targetId: string;
+  sessionIdx: number;
+  runtimeKind?: RuntimeKind;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<JourneySandbox>> {
+  return postJson<JourneySandbox>(
+    "/journeys/sandbox/provision",
+    bearerHeader(args.bearer),
+    {
+      runId: args.runId,
+      targetId: args.targetId,
+      sessionIdx: args.sessionIdx,
+      ...(args.runtimeKind ? { runtimeKind: args.runtimeKind } : {}),
+    },
+    args.signal,
+  );
+}
+
+/**
+ * A one-time, user-visible fact about a scenario conversation's sandbox —
+ * the BACKEND-mintable subset of `SandboxNoticeReason`. Inspector-minted
+ * reasons (`sandbox_unavailable`) are deliberately NOT members: there is no
+ * backend notice row behind them, so they must never enter the ack protocol.
+ */
+export type ScenarioSandboxNotice = "sandbox_reset" | "stale_image";
+
+const SCENARIO_SANDBOX_NOTICES: ReadonlySet<string> = new Set([
+  "sandbox_reset",
+  "stale_image",
+]);
+
+export function isScenarioSandboxNotice(
+  value: unknown,
+): value is ScenarioSandboxNotice {
+  return typeof value === "string" && SCENARIO_SANDBOX_NOTICES.has(value);
+}
+
+/**
+ * The notice peek/ack protocol version this build speaks (mcpjam-backend
+ * `scenarioSandboxes.SCENARIO_SANDBOX_NOTICE_ACK_VERSION`).
+ *
+ * Declaring it switches the backend from "consume at provision" to "return
+ * pending, wait for an ack". It is a CLIENT flag on purpose: an unacked notice
+ * re-delivers on the next peek, so a build that cannot ack must never be put
+ * into peek mode or it would re-show "your sandbox was reset" every turn.
+ * A backend that predates the protocol ignores the field and consumes as
+ * before, which its `noticeAckPending: false` reports back.
+ */
+export const SCENARIO_SANDBOX_NOTICE_ACK_VERSION = 1;
+
+export interface ScenarioSandbox {
+  sandboxId: string;
+  sandboxRowId: string;
+  /** Working directory the environment's host configured (backend-resolved). */
+  workdir?: string;
+  /**
+   * Notices to surface for this conversation. Emit every one of them.
+   *
+   * Whether they are already consumed depends on {@link noticeAckPending}.
+   */
+  notices?: ScenarioSandboxNotice[];
+  /**
+   * TRUE ⇒ these notices are still PENDING server-side and this caller MUST
+   * {@link ackScenarioSandboxNotices} once they are on the wire, or they will be
+   * re-delivered on the next turn.
+   *
+   * FALSE/absent ⇒ already consumed by the provision call — either the legacy
+   * fused path or a backend that predates the protocol. Nothing to ack.
+   */
+  noticeAckPending?: boolean;
+}
+
+/**
+ * Provision (or re-obtain) the ephemeral sandbox for ONE scenario conversation —
+ * user-bearer auth, the acting member's token.
+ *
+ * The body carries only `(scenarioId, chatSessionId)`. The control plane resolves
+ * the image from the environment the scenario points at, LIVE, on every call, so
+ * this can never boot an arbitrary template — the caller does not know, and
+ * cannot supply, an image identifier.
+ *
+ * IDEMPOTENT at the backend: the next turn of the same conversation returns the
+ * SAME sandbox rather than booting a second paid box. There is no matching
+ * release: the box lives for the conversation and the backend's idle reaper
+ * (20 min since last use, 4h ceiling) owns its teardown.
+ *
+ * Failure statuses the caller must distinguish:
+ *   409 — not env-backed / no image pinned / image unavailable. Terminal for
+ *         this conversation right now; retrying cannot help. Run WITHOUT bash.
+ *   503 — at capacity, or a sibling call is still booting. Retryable.
+ */
+export async function provisionScenarioSandbox(args: {
+  bearer: string;
+  scenarioId: string;
+  chatSessionId: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<ScenarioSandbox>> {
+  return postJson<ScenarioSandbox>(
+    "/scenarios/sandbox/provision",
+    bearerHeader(args.bearer),
+    {
+      scenarioId: args.scenarioId,
+      chatSessionId: args.chatSessionId,
+      // Opt into peek/ack delivery. Without this the backend consumes the
+      // notice here, before any SSE writer exists to carry it.
+      noticeAckVersion: SCENARIO_SANDBOX_NOTICE_ACK_VERSION,
+    },
+    args.signal,
+  );
+}
+
+/**
+ * ACK the notices this turn has PUT ON THE WIRE — the second half of the
+ * peek/ack handshake.
+ *
+ * Call it immediately after writing the SSE parts, never before: the whole
+ * point of the split is that the control plane does not mark a notice delivered
+ * until it demonstrably was. A failed ack is therefore SAFE and deliberately
+ * best-effort — the notice stays pending and is re-delivered next turn, which
+ * is the correct direction to fail for "your sandbox was reset, earlier files
+ * are gone".
+ *
+ * Idempotent at the backend: a duplicate ack consumes nothing.
+ */
+export async function ackScenarioSandboxNotices(args: {
+  bearer: string;
+  sandboxRowId: string;
+  notices: ScenarioSandboxNotice[];
+  signal?: AbortSignal;
+}): Promise<void> {
+  if (args.notices.length === 0) return;
+  const result = await postJson(
+    "/scenarios/sandbox/notices/ack",
+    bearerHeader(args.bearer),
+    { sandboxRowId: args.sandboxRowId, notices: args.notices },
+    args.signal,
+  );
+  if (!result.ok) {
+    // Best-effort by design: re-delivery is the failure mode, not loss.
+    logger.warn("[computers] failed to ack scenario sandbox notices", {
+      sandboxRowId: args.sandboxRowId,
+      status: result.status,
+      error: result.error,
+    });
+  }
+}
+
+/**
+ * Release ANY ephemeral sandbox (service-token auth; idempotent).
+ *
+ * Scope-agnostic: eval iterations and swarm attempts release through the same
+ * route. Falls back to the legacy `/evals/sandbox/release` path when the
+ * backend predates the rename — a server that can provision but cannot release
+ * burns paid boxes until the GC cron notices them, so the fallback is not
+ * cosmetic.
+ */
+export async function releaseSandbox(args: {
+  sandboxRowId: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const headers = authHeaders();
+  if (!headers) return;
+  let result = await postJson(
+    "/computers/sandbox/release",
+    headers,
+    { sandboxRowId: args.sandboxRowId },
+    args.signal,
+  );
+  if (!result.ok && result.status === 404) {
+    result = await postJson(
+      "/evals/sandbox/release",
+      headers,
+      { sandboxRowId: args.sandboxRowId },
+      args.signal,
+    );
+  }
+  if (!result.ok) {
+    // Best-effort: the GC cron reaps any box this misses by TTL.
+    logger.warn("[computers] failed to release ephemeral sandbox", {
+      sandboxRowId: args.sandboxRowId,
+      status: result.status,
+      error: result.error,
+    });
+  }
+}
+
+/** @deprecated Renamed {@link releaseSandbox} — release is scope-agnostic now.
+ * Kept so `evals-runner.ts` needs no edit. */
+export async function releaseEvalSandbox(args: {
+  sandboxRowId: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  return releaseSandbox(args);
+}
+
+/**
+ * Reserve/wake the acting user's computer (user-bearer auth). Phase 3: when an
+ * `executionScope` is supplied (from runtime-config), send it so the backend
+ * re-resolves live access and applies per-swarm isolation/caps; otherwise fall
+ * back to the legacy `{ projectId }` body. The scope is opaque to the client —
+ * the backend is authoritative.
+ */
+export async function reserveComputer(args: {
+  bearer: string;
+  projectId: string;
+  executionScope?: ExecutionScope;
+  /** Request a specific runtime (PR e2 forwards this at the reserve boundary).
+   *  Absent ⇒ terminal, so existing callers are byte-for-byte unchanged. */
+  runtimeKind?: RuntimeKind;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<ReservedComputer>> {
+  const body: Record<string, unknown> = args.executionScope
+    ? { executionScope: args.executionScope }
+    : { projectId: args.projectId };
+  if (args.runtimeKind) body.runtimeKind = args.runtimeKind;
+  return postJson<ReservedComputer>(
+    "/computers/reserve",
+    bearerHeader(args.bearer),
+    body,
+    args.signal,
+  );
+}
+
+/** Exchange a computer row id for its vendor sandbox info (service-token auth). */
+export async function getComputerSandboxInfo(args: {
+  computerId?: string;
+  sandboxRowId?: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<ComputerSandboxInfo>> {
+  const headers = authHeaders();
+  if (!headers) {
+    // authHeaders() is null when the token is unset OR was rejected by the
+    // bootstrap (markServiceTokenRejected) — name both so operators don't
+    // chase a "not set" that is actually a wrong token.
+    return {
+      ok: false,
+      status: 0,
+      error: "INSPECTOR_SERVICE_TOKEN is not set or was rejected",
+    };
+  }
+  if ((args.computerId ? 1 : 0) + (args.sandboxRowId ? 1 : 0) !== 1) {
+    return {
+      ok: false,
+      status: 400,
+      error: "exactly one of computerId or sandboxRowId is required",
+    };
+  }
+  return postJson<ComputerSandboxInfo>(
+    "/computers/sandbox-info",
+    headers,
+    args.computerId
+      ? { computerId: args.computerId }
+      : { sandboxRowId: args.sandboxRowId },
+    args.signal,
+  );
+}
+
+/**
+ * Resume a computer that is merely ASLEEP, without reserving one.
+ *
+ * Connecting to a paused E2B box resumes it, so attaching already woke
+ * machines as a side effect — and did it behind the control plane's back: the
+ * row stays `hibernating` while the box runs, which means unmetered and
+ * invisible to every idle sweep. Saying so explicitly is what keeps the
+ * machine's state something the control plane knows.
+ *
+ * Never provisions: the backend refuses (409 `not_wakeable`) anything that is
+ * not a hibernating row with a vendor box, because a panel is a place to LOOK
+ * at a machine and must not be able to conjure one.
+ *
+ * Service-token auth, like `getComputerSandboxInfo` — the panel's own bearer
+ * proves who is asking, and the route is server-to-server.
+ */
+export async function wakeComputer(args: {
+  computerId: string;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<{ ok: string; status?: ComputerStatus }>> {
+  const headers = authHeaders();
+  if (!headers) {
+    return {
+      ok: false,
+      status: 0,
+      error: "INSPECTOR_SERVICE_TOKEN is not set or was rejected",
+    };
+  }
+  return postJson<{ ok: string; status?: ComputerStatus }>(
+    "/computers/wake",
+    headers,
+    { computerId: args.computerId },
+    args.signal,
+  );
+}
+
+/** Record an executed command (service-token auth; idempotent on commandId). */
+export async function recordComputerCommand(args: {
+  computerId: string;
+  commandId: string;
+  source: "chat" | "terminal-api";
+  command: string;
+  status: "completed" | "failed";
+  exitCode?: number;
+  outputPreview?: string;
+}): Promise<void> {
+  const headers = authHeaders();
+  if (!headers) return;
+  const result = await postJson("/computers/commands", headers, { ...args });
+  if (!result.ok) {
+    // Best-effort log write: the command already ran; losing the record must
+    // not fail the tool call.
+    logger.warn("[computers] failed to record command", {
+      computerId: args.computerId,
+      status: result.status,
+      error: result.error,
+    });
+  }
+}
+
+export interface UploadBytesReservation {
+  total: number;
+  cap: number;
+}
+
+/**
+ * Reserve `bytes` against the computer's cumulative-upload quota BEFORE writing
+ * them into the box (service-token auth). The check-and-increment is atomic in
+ * Convex, so this is the race-safe chokepoint shared by every metered file-API
+ * writer (the `/computers/upload` route and harness skill-file materialization).
+ * Callers MUST write only on `{ ok: true }`:
+ *   - ok:true              → reserved; proceed with the write.
+ *   - ok:false, status 413 → over quota; surface a 413-style error, write nothing.
+ *   - ok:false, status 404 → computer gone; treat as unavailable (503).
+ *   - ok:false, status 0   → not configured / network error; caller decides its
+ *                            fail-open vs fail-closed policy.
+ * Not idempotent — one successful call reserves the bytes exactly once, so call
+ * it once per write with the total byte count.
+ */
+export async function reserveUploadBytes(args: {
+  computerId: string;
+  bytes: number;
+  signal?: AbortSignal;
+}): Promise<ControlPlaneResult<UploadBytesReservation>> {
+  const headers = authHeaders();
+  if (!headers) {
+    return {
+      ok: false,
+      status: 0,
+      error: "INSPECTOR_SERVICE_TOKEN is not set or was rejected",
+    };
+  }
+  return postJson<UploadBytesReservation>(
+    "/computers/reserve-upload-bytes",
+    headers,
+    { computerId: args.computerId, bytes: args.bytes },
+    args.signal,
+  );
+}
+
+/** Record a terminal session transition (service-token auth; idempotent). */
+export async function recordTerminalSession(args: {
+  sessionId: string;
+  action: "open" | "close";
+  computerId?: string;
+}): Promise<void> {
+  const headers = authHeaders();
+  if (!headers) return;
+  const result = await postJson("/computers/terminal-sessions", headers, {
+    sessionId: args.sessionId,
+    action: args.action,
+    ...(args.computerId ? { computerId: args.computerId } : {}),
+  });
+  if (!result.ok) {
+    logger.warn("[computers] failed to record terminal session", {
+      sessionId: args.sessionId,
+      action: args.action,
+      status: result.status,
+      error: result.error,
+    });
+  }
+}
+
+/**
+ * Bump the computer's `lastActiveAt` (service-token auth) so live terminal I/O
+ * counts as activity for the idle-hibernate sweep. Sent throttled (~once/min)
+ * from the terminal bridge on PTY I/O; best-effort — a dropped touch just risks
+ * an earlier idle hibernate, never a failed keystroke.
+ */
+export async function touchComputerActivity(args: {
+  computerId: string;
+}): Promise<void> {
+  const headers = authHeaders();
+  if (!headers) return;
+  const result = await postJson("/computers/terminal-sessions", headers, {
+    action: "touch",
+    computerId: args.computerId,
+  });
+  if (!result.ok) {
+    logger.warn("[computers] failed to touch computer activity", {
+      computerId: args.computerId,
+      status: result.status,
+      error: result.error,
+    });
+  }
+}
+
+/**
+ * Reserve and poll until the computer is `ready` (provision-on-first-use and
+ * wake-on-cold both converge here). Polling re-calls reserve — it's
+ * idempotent, keeps `lastActiveAt` fresh so the idle sweep can't reclaim the
+ * machine mid-wait, and rides the same authorization as the first call.
+ */
+export async function ensureComputerReady(args: {
+  bearer: string;
+  projectId: string;
+  /** Phase 3 scope; forwarded verbatim to reserveComputer (legacy when absent). */
+  executionScope?: ExecutionScope;
+  /** Forwarded to reserveComputer on every poll so the desktop kind sticks. */
+  runtimeKind?: RuntimeKind;
+  signal?: AbortSignal;
+  /** Overall budget. E2B cold provision is seconds; waking ~1s. */
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}): Promise<ControlPlaneResult<ReservedComputer>> {
+  const timeoutMs = args.timeoutMs ?? 75_000;
+  const pollIntervalMs = args.pollIntervalMs ?? 1_500;
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const reserved = await reserveComputer(args);
+    if (!reserved.ok) return reserved;
+    const { status } = reserved.value;
+    if (status === "ready") return reserved;
+    if (status === "error") {
+      return {
+        ok: false,
+        status: 502,
+        error: reserved.value.lastError
+          ? `computer failed to provision: ${reserved.value.lastError}`
+          : "computer failed to provision",
+      };
+    }
+    if (status === "deleting" || status === "deleted") {
+      return { ok: false, status: 410, error: "computer was deleted" };
+    }
+    if (Date.now() + pollIntervalMs > deadline) {
+      return {
+        ok: false,
+        status: 504,
+        error: `computer not ready after ${Math.round(
+          timeoutMs / 1000,
+        )}s (status: ${status})`,
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    if (args.signal?.aborted) {
+      return { ok: false, status: 499, error: "cancelled" };
+    }
+  }
+}

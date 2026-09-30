@@ -1,0 +1,357 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Hono } from "hono";
+
+// Covers the v1 catalog read proxies: path-param -> query-param translation,
+// bearer forwarding, verbatim status/body passthrough, and upstream failure
+// mapping. The Convex side of the contract is covered by the backend's
+// publicApi tests; these assert the Inspector half of the proxy seam.
+
+const { validateGuestTokenMock, captureServerEventMock } = vi.hoisted(() => ({
+  validateGuestTokenMock: vi.fn(),
+  captureServerEventMock: vi.fn(),
+}));
+
+vi.mock("../../../services/guest-token.js", () => ({
+  validateGuestTokenDetailedAsync: validateGuestTokenMock,
+}));
+
+vi.mock("../../../utils/analytics.js", () => ({
+  captureServerEvent: captureServerEventMock,
+}));
+
+import v1Routes from "../index.js";
+
+function makeApp(): Hono {
+  const app = new Hono();
+  app.route("/api/v1", v1Routes);
+  return app;
+}
+
+function request(app: Hono, path: string): Promise<Response> {
+  return Promise.resolve(
+    app.request(path, {
+      method: "GET",
+      headers: { Authorization: "Bearer tok" },
+    })
+  );
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("v1 catalog read proxies", () => {
+  const originalEnv = process.env.CONVEX_HTTP_URL;
+  const originalFetch = global.fetch;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.CONVEX_HTTP_URL = "https://convex-http.example.com";
+    validateGuestTokenMock.mockResolvedValue({ valid: false });
+    fetchMock = vi.fn();
+    global.fetch = fetchMock as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    if (originalEnv) process.env.CONVEX_HTTP_URL = originalEnv;
+    else delete process.env.CONVEX_HTTP_URL;
+  });
+
+  it.each([
+    ["/api/v1/me", "https://convex-http.example.com/v1/me"],
+    ["/api/v1/models", "https://convex-http.example.com/v1/models"],
+    [
+      "/api/v1/projects?organizationId=org_1",
+      "https://convex-http.example.com/v1/projects?organizationId=org_1",
+    ],
+    [
+      "/api/v1/projects/p1/servers",
+      "https://convex-http.example.com/v1/project-servers?projectId=p1",
+    ],
+    [
+      "/api/v1/projects/p1/eval-suites",
+      "https://convex-http.example.com/v1/eval-suites?projectId=p1",
+    ],
+    [
+      "/api/v1/chat-sessions?projectId=p1&status=archived&limit=10&before=123",
+      "https://convex-http.example.com/v1/chat-sessions?projectId=p1&status=archived&limit=10&before=123",
+    ],
+    [
+      "/api/v1/projects/p1/scenarios",
+      "https://convex-http.example.com/v1/scenarios?projectId=p1",
+    ],
+    [
+      // Project-NESTED, and every search param forwarded verbatim — `cursor`
+      // is NOT renamed here, unlike `/chat-sessions` above.
+      "/api/v1/projects/p1/sessions?q=refund&scope=transcripts&sourceType=direct,eval&status=archived&limit=10&cursor=abc",
+      "https://convex-http.example.com/v1/sessions?projectId=p1&sourceType=direct%2Ceval&status=archived&q=refund&scope=transcripts&limit=10&cursor=abc",
+    ],
+  ])(
+    "maps %s onto the Convex read surface",
+    async (inspectorPath, convexUrl) => {
+      fetchMock.mockResolvedValue(jsonResponse({ items: [] }));
+      const res = await request(makeApp(), inspectorPath);
+      expect(res.status).toBe(200);
+      const [target, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+      expect(String(target)).toBe(convexUrl);
+      // JWT callers: the original bearer is forwarded verbatim. The hosted
+      // models catalog is deliberately public and sends no authorization.
+      if (inspectorPath === "/api/v1/models") {
+        expect(init.headers).toBeUndefined();
+      } else {
+        expect((init.headers as Record<string, string>)["Authorization"]).toBe(
+          "Bearer tok"
+        );
+      }
+    }
+  );
+
+  it("maps the public `cursor` param onto the upstream `before`", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ items: [] }));
+    await request(makeApp(), "/api/v1/chat-sessions?limit=2&cursor=999");
+    const [target] = fetchMock.mock.calls[0] as [URL];
+    expect(String(target)).toBe(
+      "https://convex-http.example.com/v1/chat-sessions?limit=2&before=999"
+    );
+  });
+
+  it("passes the upstream `scope` echo through to the caller", async () => {
+    // The SDK fails closed on a missing marker, so the proxy dropping or
+    // rewriting it would break transcript search across every surface.
+    fetchMock.mockResolvedValue(
+      jsonResponse({ items: [], scope: "transcripts" })
+    );
+    const res = await request(
+      makeApp(),
+      "/api/v1/projects/p1/sessions?q=refund&scope=transcripts"
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ items: [], scope: "transcripts" });
+  });
+
+  it("counts a blank ?q= as a listing, matching what it forwarded", async () => {
+    // `forwardQueryParams` drops `q=`, so the upstream ran a list. Reporting
+    // it as a search would inflate the metric with the very requests it is
+    // meant to be compared against.
+    captureServerEventMock.mockClear();
+    fetchMock.mockResolvedValue(jsonResponse({ items: [], scope: "titles" }));
+    await request(makeApp(), "/api/v1/projects/p1/sessions?q=");
+
+    const [, event, props] = captureServerEventMock.mock.calls.at(-1)!;
+    expect(event).toBe("api_sessions_search");
+    expect(props.hasQuery).toBe(false);
+    // And the upstream really did not receive it.
+    const [target] = fetchMock.mock.calls[0] as [URL];
+    expect(String(target)).not.toContain("q=");
+  });
+
+  it("reports the honored scope and item count, never the query text", async () => {
+    captureServerEventMock.mockClear();
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        items: [{ id: "s1" }],
+        scope: "transcripts",
+        nextCursor: "abc",
+      })
+    );
+    await request(
+      makeApp(),
+      "/api/v1/projects/p1/sessions?q=super-secret-term&scope=transcripts&sourceType=direct,eval"
+    );
+
+    const [, , props] = captureServerEventMock.mock.calls.at(-1)!;
+    expect(props).toMatchObject({
+      scope: "transcripts",
+      hasQuery: true,
+      itemCount: 1,
+      hasNextCursor: true,
+      sourceTypes: ["direct", "eval"],
+    });
+    // A search term is user content and can carry names or secrets.
+    expect(JSON.stringify(props)).not.toContain("super-secret");
+  });
+
+  it("does not forward a bearer to the public models catalog", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ items: [] }));
+    const res = await request(makeApp(), "/api/v1/models");
+    expect(res.status).toBe(200);
+    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(init.headers).toBeUndefined();
+  });
+
+  it("forwards OTLP pagination headers and query parameters", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ resourceSpans: [] }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "x-mcpjam-next-cursor": "next",
+          "x-mcpjam-export-complete": "false",
+        },
+      })
+    );
+    const res = await request(
+      makeApp(),
+      "/api/v1/trace-exports/otlp?projectId=p1&cursor=c1&includeContent=true"
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ resourceSpans: [] });
+    expect(res.headers.get("x-mcpjam-next-cursor")).toBe("next");
+    expect(res.headers.get("x-mcpjam-export-complete")).toBe("false");
+    const [target] = fetchMock.mock.calls[0] as [URL];
+    expect(String(target)).toBe(
+      "https://convex-http.example.com/v1/trace-exports/otlp?projectId=p1&cursor=c1&includeContent=true"
+    );
+  });
+
+  it("lets `cursor` win over an explicit `before`", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ items: [] }));
+    await request(makeApp(), "/api/v1/chat-sessions?before=123&cursor=999");
+    const [target] = fetchMock.mock.calls[0] as [URL];
+    expect(String(target)).toBe(
+      "https://convex-http.example.com/v1/chat-sessions?before=999"
+    );
+  });
+
+  it("passes the upstream page body through verbatim", async () => {
+    const page = {
+      items: [{ id: "s_1", name: "echo", transportType: "http" }],
+      nextCursor: "cur_2",
+    };
+    fetchMock.mockResolvedValue(jsonResponse(page));
+    const res = await request(makeApp(), "/api/v1/projects/p1/servers");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(page);
+  });
+
+  it("passes upstream error envelopes through with their status", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ code: "NOT_FOUND", message: "Project not found" }, 404)
+    );
+    const res = await request(makeApp(), "/api/v1/projects/p_bad/servers");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("maps an unreachable upstream to 502 SERVER_UNREACHABLE", async () => {
+    fetchMock.mockRejectedValue(new Error("connect ECONNREFUSED"));
+    const res = await request(makeApp(), "/api/v1/me");
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { code?: string }).code).toBe(
+      "SERVER_UNREACHABLE"
+    );
+  });
+
+  it("maps a non-JSON upstream response to 502", async () => {
+    fetchMock.mockResolvedValue(
+      new Response("<html>oops</html>", { status: 200 })
+    );
+    const res = await request(makeApp(), "/api/v1/me");
+    expect(res.status).toBe(502);
+  });
+
+  it("maps an upstream timeout to 504 TIMEOUT", async () => {
+    const abortError = new Error("aborted");
+    abortError.name = "AbortError";
+    fetchMock.mockRejectedValue(abortError);
+    const res = await request(makeApp(), "/api/v1/me");
+    expect(res.status).toBe(504);
+    expect(((await res.json()) as { code?: string }).code).toBe("TIMEOUT");
+  });
+
+  it("maps a response body stalled past the deadline to 504 TIMEOUT, not 502", async () => {
+    // fetch resolves on headers; the deadline must keep guarding the body
+    // read. A stalled body surfaces as json() rejecting with an abort.
+    const abortError = new Error("aborted");
+    abortError.name = "AbortError";
+    fetchMock.mockResolvedValue({
+      status: 200,
+      json: () => Promise.reject(abortError),
+    } as unknown as Response);
+    const res = await request(makeApp(), "/api/v1/me");
+    expect(res.status).toBe(504);
+    expect(((await res.json()) as { code?: string }).code).toBe("TIMEOUT");
+  });
+
+  it("returns the scenario detail when the path projectId matches", async () => {
+    const detail = {
+      id: "cbx_1",
+      projectId: "p1",
+      name: "Support Scenario",
+      modelId: "gpt-4o-mini",
+      servers: [{ id: "srv_1", name: "server-a", url: null, useOAuth: false }],
+    };
+    fetchMock.mockResolvedValue(jsonResponse(detail));
+    const res = await request(makeApp(), "/api/v1/projects/p1/scenarios/cbx_1");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(detail);
+    expect(String((fetchMock.mock.calls[0] as [URL])[0])).toBe(
+      "https://convex-http.example.com/v1/scenario?scenarioId=cbx_1"
+    );
+  });
+
+  it("answers NOT_FOUND when the scenario lives in a different project", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ id: "cbx_1", projectId: "p2", name: "Support Scenario" })
+    );
+    const res = await request(makeApp(), "/api/v1/projects/p1/scenarios/cbx_1");
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { code?: string }).code).toBe("NOT_FOUND");
+  });
+
+  it("passes a scenario upstream error through with its status", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ code: "VALIDATION_ERROR", message: "bad id" }, 400)
+    );
+    const res = await request(makeApp(), "/api/v1/projects/p1/scenarios/bad");
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code?: string }).code).toBe(
+      "VALIDATION_ERROR"
+    );
+  });
+
+  it("admits guests on allowlisted catalog reads (projects) and forwards the guest bearer", async () => {
+    validateGuestTokenMock.mockResolvedValue({ valid: true, guestId: "g1" });
+    fetchMock.mockResolvedValue(jsonResponse({ items: [] }));
+    const res = await request(makeApp(), "/api/v1/projects");
+    expect(res.status).toBe(200);
+    const [target, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(String(target)).toBe("https://convex-http.example.com/v1/projects");
+    // The guest JWT is forwarded verbatim so Convex authedV1 resolves the guest.
+    expect((init.headers as Record<string, string>)["Authorization"]).toBe(
+      "Bearer tok"
+    );
+  });
+
+  it("admits guests on the project-nested sessions read", async () => {
+    // The route is on the guest allowlist because it is part of the platform
+    // MCP tool surface; the backend threads the guest bearer's subject through
+    // to `ownsSession`, so a guest sees only their own rows.
+    validateGuestTokenMock.mockResolvedValue({ valid: true, guestId: "g1" });
+    fetchMock.mockResolvedValue(jsonResponse({ items: [], scope: "titles" }));
+    const res = await request(
+      makeApp(),
+      "/api/v1/projects/p1/sessions?q=refund"
+    );
+    expect(res.status).toBe(200);
+    const [target, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(String(target)).toBe(
+      "https://convex-http.example.com/v1/sessions?projectId=p1&q=refund"
+    );
+    expect((init.headers as Record<string, string>)["Authorization"]).toBe(
+      "Bearer tok"
+    );
+  });
+
+  it("rejects guests on non-allowlisted catalog reads (/me)", async () => {
+    validateGuestTokenMock.mockResolvedValue({ valid: true, guestId: "g1" });
+    const res = await request(makeApp(), "/api/v1/me");
+    expect(res.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,27 @@
+# Build context trimming for the mcpjam-inspector/Dockerfile image.
+#
+# Everything this file excludes is NOT copied by any stage of
+# mcpjam-inspector/Dockerfile, so removing it from the context cannot change
+# the built image. The excluded paths are the bulk of the tree: ~32 MB of
+# documentation screenshots, the GitHub automation, and internal notes.
+#
+# Do NOT add any of these without checking the Dockerfile's COPY list first:
+# the build reads package.json/package-lock.json for all 13 workspaces, plus
+# the full source of evaluators, sdk, cli, design-system, chat-ui,
+# widget-react, mcpjam-inspector, soundcheck, mcp, slack-app, surface-core and
+# discord-app (vitest contributes only its package.json).
+
+.git
+.github
+docs
+notes
+
+# Workspace build output — every one of these is produced inside the image.
+node_modules
+**/node_modules
+**/dist
+**/out
+**/.vite
+
+.DS_Store
+*.log

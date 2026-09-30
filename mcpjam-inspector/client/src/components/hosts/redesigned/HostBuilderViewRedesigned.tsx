@@ -1,0 +1,784 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router";
+import { Loader2, Save } from "lucide-react";
+import { useAppNavigate } from "@/lib/app-navigation";
+import { toast } from "@/lib/toast";
+import { useConvexAuth } from "convex/react";
+import { ReactFlowProvider } from "@xyflow/react";
+import { track } from "@/lib/analytics";
+import { Button } from "@mcpjam/design-system/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@mcpjam/design-system/tooltip";
+import { Skeleton } from "@mcpjam/design-system/skeleton";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import { useHost, useHostMutations } from "@/hooks/useClients";
+import { useProjectServers, useServerMutations } from "@/hooks/useProjects";
+import { useAutoConnectProjectServers } from "@/hooks/useAutoConnectProjectServers";
+import { useSharedAppState } from "@/state/app-state-context";
+import { AddServerModal } from "@/components/connection/AddServerModal";
+import { ViewModeSelector } from "@/components/shared/view-mode-selector";
+import { HostSectionTabs } from "@/components/hosts/HostSectionTabs";
+import type { ServerFormData } from "@/shared/types";
+import { getBillingErrorMessage } from "@/lib/billing-entitlements";
+import {
+  emptyHostConfigInputV2,
+  hostConfigDtoToInput,
+  hostConfigInputsEqual,
+  serverConnectionOverridesEqual,
+  type HostConfigInputV2,
+} from "@/lib/client-config-v2";
+import { getScenarioShellStyle } from "@/lib/scenario-client-style";
+import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
+import { RedesignedHostCanvas } from "./canvas/RedesignedHostCanvas";
+import { HostCanvasSelector } from "./HostCanvasSelector";
+import { parseHostVerifyTabParam } from "../host-verify-deep-link";
+import { buildRedesignedHostCanvas } from "./canvas/canvasBuilder";
+import { HostFocusPanel } from "./focus/HostFocusPanel";
+import { emitClientSaveTelemetry } from "./client-save-telemetry";
+import { useBrowserProfileName } from "@/hooks/useBrowserProfileName";
+import { useComputersEnabled, useBrowserEnabled } from "@/hooks/useComputersEnabled";
+import { useSkillsEnabled } from "@/hooks/useSkillsEnabled";
+import { HOSTED_MODE } from "@/lib/config";
+import { useComputerStatus } from "@/hooks/useProjectComputer";
+import { useBuiltInToolCatalog } from "@/hooks/useBuiltInToolCatalog";
+import {
+  collectHostAttentionIssues,
+  hasBlockingErrors,
+  saveDisabledReason as computeSaveDisabledReason,
+  useHostDraftValidation,
+} from "./focus/useHostDraftValidation";
+import {
+  focusTabForNodeId,
+  type HostFocusState,
+  type HostFocusTabId,
+  type SandboxConfigSubKey,
+} from "./types";
+
+interface HostBuilderViewRedesignedProps {
+  hostId: string;
+  projectId: string;
+  /**
+   * Reconnects one server by name. Threaded from `App` (which owns it) so a
+   * saved setting that only takes effect at connect time can be applied to the
+   * live connection — see the cancellation hook in `handleSave`.
+   */
+  onReconnect?: (
+    serverName: string,
+    options?: { forceOAuthFlow?: boolean; allowInteractiveOAuthFlow?: boolean },
+  ) => Promise<unknown> | void;
+}
+
+/**
+ * Whether a save changed the tool-cancellation setting.
+ *
+ * Compared as canonical JSON rather than by reference, matching how
+ * `handleSave` diffs the rest of the draft: the record is rebuilt on every
+ * keystroke, so identity always differs and would reconnect on every save.
+ */
+export function toolCallCancellationChanged(
+  saved: HostConfigInputV2 | null | undefined,
+  draft: HostConfigInputV2,
+): boolean {
+  return (
+    JSON.stringify(saved?.mcpProfile?.toolCallCancellation) !==
+    JSON.stringify(draft.mcpProfile?.toolCallCancellation)
+  );
+}
+
+/**
+ * The servers a cancellation change must be applied to: this host's own
+ * servers that are currently CONNECTED.
+ *
+ * Disconnected ones are deliberately excluded — they read the setting when
+ * they next connect, and reconnecting them from a config save would be a
+ * surprise the user did not ask for.
+ */
+export function serversNeedingCancellationReconnect(
+  hostServerNames: ReadonlyArray<string>,
+  connectionStatusByName: Record<
+    string,
+    { connectionStatus?: string } | undefined
+  >,
+): string[] {
+  return hostServerNames.filter(
+    (name) => connectionStatusByName[name]?.connectionStatus === "connected",
+  );
+}
+
+const CLOSED_FOCUS: HostFocusState = {
+  open: false,
+  tab: null,
+  selectedServerId: null,
+};
+
+export function HostBuilderViewRedesigned({
+  hostId,
+  projectId,
+  onReconnect,
+}: HostBuilderViewRedesignedProps) {
+  const navigate = useAppNavigate();
+  const location = useLocation();
+  const { isAuthenticated } = useConvexAuth();
+  const { host } = useHost({
+    isAuthenticated,
+    hostId,
+  });
+  const { servers } = useProjectServers({ projectId, isAuthenticated });
+  const computersEnabled = useComputersEnabled();
+  const browsersEnabled = useBrowserEnabled();
+  // Mirrors ConnectViewHeader's gating: Skills is flagged in hosted mode only,
+  // local filesystem skills are ungated.
+  const skillsEnabled = useSkillsEnabled();
+  const showSkillsTab = !HOSTED_MODE || skillsEnabled;
+  // Project Computers canvas inputs. Both queries resolve to `undefined`
+  // until their backend functions are deployed and stay cheap when the
+  // feature flag is off (the islands they feed aren't emitted then).
+  const computerStatus = useComputerStatus(projectId);
+  const builtInToolCatalog = useBuiltInToolCatalog();
+  const { updateHost } = useHostMutations();
+  const { createServer } = useServerMutations();
+
+  const [draftName, setDraftName] = useState("");
+  const [draftConfig, setDraftConfig] = useState<HostConfigInputV2 | null>(
+    null,
+  );
+  const browserProfileName = useBrowserProfileName(projectId, draftConfig?.browserProfileId);
+  const [isSaving, setIsSaving] = useState(false);
+  const saveInFlightRef = useRef(false);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [showAddServer, setShowAddServer] = useState(false);
+  const [focusState, setFocusState] = useState<HostFocusState>({
+    open: true,
+    tab: "behavior",
+    selectedServerId: null,
+  });
+  const requestedFocusTab = useMemo(
+    () => parseHostVerifyTabParam(location.search),
+    [location.search],
+  );
+  const appliedFocusTabRef = useRef<string | null>(null);
+  // Diff snapshot — populated for ONE render after a host switch so the
+  // canvas can mark changed leaves/fields. Cleared after the flash
+  // duration so subsequent in-place edits don't keep re-firing the
+  // animation. Captured from the outgoing draft *before* it's reseeded.
+  const [prevHostSnapshot, setPrevHostSnapshot] = useState<{
+    hostName: string;
+    draft: HostConfigInputV2;
+  } | null>(null);
+  const lastSeededHostIdRef = useRef<string | null>(null);
+  // Carry the previous host's snapshot id across the brief window where
+  // `useHost(hostId)` re-fires and returns `undefined` — keeps the canvas
+  // chip from blinking blank during in-place host swaps.
+  const lastSnapshotIdRef = useRef<string>("");
+
+  // Seed draft state from the loaded host. The `host` reference changes
+  // whenever Convex re-emits the host doc — after a save, that's the signal
+  // that aligns draft state with persistence so `isDirty` resets.
+  //
+  // `optionalServerIds` is retired under the "all project servers attach"
+  // rule. Normalize to `[]` on both the draft and the saved comparison so
+  // existing hosts (saved with a non-empty optional list under the old model)
+  // don't surface a phantom unsaved diff.
+  useEffect(() => {
+    if (!host) return;
+    if (
+      lastSeededHostIdRef.current &&
+      lastSeededHostIdRef.current !== hostId &&
+      draftConfig
+    ) {
+      // Host switch — capture the OUTGOING draft as the diff baseline
+      // before we overwrite it. Reset to null first so React schedules a
+      // commit even when the same outgoing host reappears (back-and-forth
+      // toggles between two hosts should still flash each time).
+      setPrevHostSnapshot({ hostName: draftName, draft: draftConfig });
+    }
+    lastSeededHostIdRef.current = hostId;
+    setDraftName(host.name);
+    setDraftConfig({
+      ...hostConfigDtoToInput(host.config),
+      ...(!HOSTED_MODE ? { localBrowserEnabled: host.config.localBrowserEnabled } : {}),
+      optionalServerIds: [],
+    });
+    // draftName / draftConfig intentionally excluded: keying the effect on
+    // them would re-fire the diff capture on every keystroke and mark the
+    // user's own edits as "diff from previous host," which is wrong.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [host, hostId]);
+
+  // Fire once per *loaded* host for builder-view adoption. Gating on `host`
+  // (not just `hostId`) means a stale/deleted deep link to /clients/:hostId
+  // — which HostsTab eventually reconciles by clearing the selection —
+  // never logs a phantom view for a client the user didn't actually open.
+  // The ref dedupes across Convex re-emits of the same host doc so we get
+  // one capture per hostId, not one per subscription tick. Telemetry is
+  // best-effort: a posthog throw must not trip the nearest error boundary.
+  const capturedBuilderHostIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hostId || !host) return;
+    if (capturedBuilderHostIdRef.current === hostId) return;
+    capturedBuilderHostIdRef.current = hostId;
+    try {
+      track("client_builder_viewed", {
+        location: "client_builder",
+        client_id: hostId,
+      });
+    } catch {
+      // swallow — analytics must not break the builder view
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, host]);
+
+  // Clear the diff snapshot ~1.5s after a host switch so subsequent
+  // in-place edits don't keep re-firing the morph animation. Matches the
+  // CSS flash duration in RedesignedHostCanvas.
+  useEffect(() => {
+    if (!prevHostSnapshot) return;
+    const t = window.setTimeout(() => setPrevHostSnapshot(null), 1500);
+    return () => window.clearTimeout(t);
+  }, [prevHostSnapshot]);
+
+  const savedConfig = useMemo(
+    () =>
+      host
+        ? { ...hostConfigDtoToInput(host.config), ...(!HOSTED_MODE ? { localBrowserEnabled: host.config.localBrowserEnabled } : {}), optionalServerIds: [] }
+        : null,
+    [host],
+  );
+
+  useEffect(() => {
+    if (!requestedFocusTab) return;
+    const applyKey = `${hostId}:${requestedFocusTab}`;
+    if (appliedFocusTabRef.current === applyKey) return;
+    appliedFocusTabRef.current = applyKey;
+    setFocusState({
+      open: true,
+      tab: requestedFocusTab,
+      selectedServerId: null,
+    });
+  }, [hostId, requestedFocusTab]);
+
+  const isDirty = useMemo(() => {
+    if (!host || !draftConfig || !savedConfig) return false;
+    return (
+      draftName !== host.name ||
+      !hostConfigInputsEqual(draftConfig, savedConfig) ||
+      !serverConnectionOverridesEqual(
+        draftConfig.serverConnectionOverrides,
+        savedConfig.serverConnectionOverrides,
+      )
+    );
+  }, [host, draftName, draftConfig, savedConfig]);
+
+  // Validation: recompute issues whenever draft or host display name changes.
+  const attention = useHostDraftValidation(
+    draftConfig ?? emptyHostConfigInputV2(),
+    draftName,
+    // The SAVED model, so clearing a pinned model blocks Save while a legacy
+    // host that never had one keeps saving unrelated edits.
+    { savedModelId: savedConfig?.modelId },
+  );
+
+  // Runtime connection state lives in `appState.servers` keyed by server
+  // name, not in the persisted Convex row. Mirror it into the host builder
+  // so both the canvas card dot and the Servers-tab row dot reflect the
+  // same state the Servers tab shows — without this they'd be
+  // unconditionally emerald even when the server is disconnected.
+  const sharedAppState = useSharedAppState();
+  const connectionStatusByName = sharedAppState.servers;
+
+  // Auto-connect every project server once per session (personal
+  // preference; see `useAutoConnectProjectServers`). The host being edited
+  // only supplies the scope key, so opening a different client re-runs the
+  // handshake under that identity.
+  const projectServerNames = useMemo(
+    () => (servers ?? []).map((s) => s.name),
+    [servers],
+  );
+  useAutoConnectProjectServers({
+    projectId,
+    hostScopeKey: hostId,
+    serverNames: projectServerNames,
+    catalogLoaded: servers !== undefined,
+  });
+
+  // `availableServers` (the focus-panel-shaped catalog) was retired
+  // alongside the per-host Servers tab — server selection lives in
+  // Project Settings → Servers now. The canvas still needs the
+  // catalog for layout, so `availableServersForCanvas` stays.
+  const availableServersForCanvas = useMemo(
+    () =>
+      (servers ?? []).map((s) => ({
+        id: s._id,
+        name: s.name,
+        url: s.url ?? undefined,
+        connectionStatus:
+          connectionStatusByName[s.name]?.connectionStatus ?? "disconnected",
+      })),
+    [servers, connectionStatusByName],
+  );
+
+  const themeMode = usePreferencesStore((s) => s.themeMode);
+  // Brand shell on the canvas subtree only (not the top tab chrome) so the
+  // tab row matches the global Header background.
+  const canvasShellStyle = useMemo(
+    () =>
+      draftConfig?.hostStyle
+        ? getScenarioShellStyle(
+            draftConfig.hostStyle,
+            themeMode,
+            draftConfig.chatUiOverride,
+          )
+        : undefined,
+    [draftConfig?.hostStyle, draftConfig?.chatUiOverride, themeMode],
+  );
+  const liveSnapshotId = host?.config?.id ?? "";
+  if (liveSnapshotId) lastSnapshotIdRef.current = liveSnapshotId;
+  const savedSnapshotId = liveSnapshotId || lastSnapshotIdRef.current;
+
+  // Runs the save-triggered cancellation reconnect once the app's view of the
+  // host has caught up with the save — see `handleSave`. Deliberately narrow:
+  // only connected servers, never interactive (a save must not open an OAuth
+  // prompt), and best-effort (the config is already persisted, so a failed
+  // reconnect is a warning, never a failed save).
+  const [pendingCancellationReconnect, setPendingCancellationReconnect] =
+    useState<string | null>(null);
+  useEffect(() => {
+    if (!pendingCancellationReconnect || !onReconnect) return;
+    if (liveSnapshotId !== pendingCancellationReconnect) return;
+    setPendingCancellationReconnect(null);
+    // Every connected server, not just `serverIds`: under the "all project
+    // servers attach" rule a server the host actually talks to need not
+    // appear in that list.
+    const connectedNames = serversNeedingCancellationReconnect(
+      Object.keys(connectionStatusByName),
+      connectionStatusByName,
+    );
+    void (async () => {
+      for (const name of connectedNames) {
+        try {
+          await onReconnect(name, { allowInteractiveOAuthFlow: false });
+        } catch {
+          toast.warning(
+            `Saved, but "${name}" did not reconnect — its tool-cancellation setting still reflects the previous connection.`,
+          );
+        }
+      }
+    })();
+  }, [
+    pendingCancellationReconnect,
+    liveSnapshotId,
+    onReconnect,
+    connectionStatusByName,
+  ]);
+
+  const viewModel = useMemo(() => {
+    const draft = draftConfig ?? emptyHostConfigInputV2();
+    return buildRedesignedHostCanvas(
+      {
+        hostName: draftName,
+        draft,
+        savedSnapshotId,
+        isDirty,
+        projectServers: availableServersForCanvas,
+        prev: prevHostSnapshot ?? undefined,
+        computersEnabled,
+        browsersEnabled,
+        browserProfileName,
+        computerStatus,
+        builtInToolCatalog,
+      },
+      attention,
+    );
+  }, [
+    draftName,
+    draftConfig,
+    savedSnapshotId,
+    isDirty,
+    availableServersForCanvas,
+    attention,
+    prevHostSnapshot,
+    computersEnabled,
+    browsersEnabled,
+    browserProfileName,
+    computerStatus,
+    builtInToolCatalog,
+  ]);
+
+  const openFocus = useCallback(
+    (
+      tab: HostFocusTabId,
+      selectedServerId: string | null = null,
+      focusSubKey?: SandboxConfigSubKey,
+    ) => {
+      setFocusState({
+        open: true,
+        tab,
+        selectedServerId,
+        ...(focusSubKey ? { focusSubKey } : {}),
+      });
+    },
+    [],
+  );
+
+  const closeFocus = useCallback(() => {
+    setFocusState(CLOSED_FOCUS);
+  }, []);
+
+  const handleSelectNode = useCallback(
+    (nodeId: string) => {
+      setSelectedNodeId(nodeId);
+      const target = focusTabForNodeId(nodeId);
+      if (target)
+        openFocus(target.tab, target.selectedServerId, target.focusSubKey);
+    },
+    [openFocus],
+  );
+
+  const persistClient = useCallback(
+    async (
+      name: string,
+      config: HostConfigInputV2,
+      showSuccessToast: boolean,
+    ): Promise<boolean> => {
+      if (!host || host.hostId !== hostId || saveInFlightRef.current) {
+        return false;
+      }
+      const nextAttention = collectHostAttentionIssues(config, name, {
+        savedModelId: savedConfig?.modelId,
+      });
+      if (hasBlockingErrors(nextAttention)) {
+        toast.error(
+          computeSaveDisabledReason({
+            isDirty: true,
+            isSaving: false,
+            issues: nextAttention,
+          }) ?? "Fix validation errors before saving",
+        );
+        return false;
+      }
+      saveInFlightRef.current = true;
+      setIsSaving(true);
+      try {
+        // Compare the same persisted and draft snapshots used by save telemetry.
+        const cancellationChanged = toolCallCancellationChanged(
+          savedConfig,
+          config,
+        );
+        const { localBrowserEnabled, ...input } = config;
+        const { hostConfigId } = await updateHost({
+          hostId,
+          name,
+          input,
+          ...(!HOSTED_MODE && localBrowserEnabled !== savedConfig?.localBrowserEnabled
+            ? { localBrowserEnabled }
+            : {}),
+        });
+        // The freshly persisted config id arrives via the Convex
+        // subscription on the next tick; don't include it in this toast
+        // because `host?.config?.id` is still the *previous* saved config here.
+        if (showSuccessToast) toast.success("Client saved");
+        // Tool cancellation is read from the connection's config at CONNECT
+        // time, so a saved toggle would otherwise sit inert until the user
+        // happened to reconnect — which reads as the switch doing nothing.
+        // Reconnect the host's live servers so the just-saved value governs
+        // them, the same reason the per-server protocol pin reconnects after
+        // its save (`ServersTab`).
+        //
+        // DEFERRED, not run here. The reconnect builds its connection defaults
+        // from the active host's profile as the app currently sees it, and at
+        // this point the Convex subscription still holds the PREVIOUS config
+        // (see the toast note above). Reconnecting now would apply the value
+        // the user just replaced — one save behind, every time. The effect
+        // below waits until the saved config id is the one the app is showing.
+        if (cancellationChanged && onReconnect) {
+          setPendingCancellationReconnect(hostConfigId);
+        }
+        if (host && savedConfig) {
+          emitClientSaveTelemetry(track, {
+            clientId: hostId,
+            clientConfigId: hostConfigId,
+            savedName: host.name,
+            draftName: name,
+            savedConfig,
+            draftConfig: config,
+          });
+        }
+        return true;
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to save client",
+        );
+        return false;
+      } finally {
+        saveInFlightRef.current = false;
+        setIsSaving(false);
+      }
+    },
+    [hostId, savedConfig, host, updateHost, onReconnect],
+  );
+
+  const handleSave = useCallback(async () => {
+    if (!draftConfig) return;
+    await persistClient(draftName, draftConfig, true);
+  }, [draftName, draftConfig, persistClient]);
+
+  const handleSaveLatest = useCallback(
+    (name: string, config: HostConfigInputV2) =>
+      persistClient(name, config, false),
+    [persistClient],
+  );
+
+  const handleAddServer = useCallback(
+    async (formData: ServerFormData) => {
+      try {
+        const serverId = (await createServer({
+          projectId,
+          name: formData.name,
+          enabled: true,
+          transportType: formData.type === "stdio" ? "stdio" : "http",
+          url: formData.url,
+          headers: formData.headers,
+          timeout: formData.requestTimeout,
+          useOAuth: formData.useOAuth,
+          oauthScopes: formData.oauthScopes,
+          clientId: formData.clientId,
+        })) as string;
+        // Per the project-scoped server config rollout: the host draft
+        // no longer owns serverIds — `projects.serverIds` does, and the
+        // backend fan-out re-materializes every host's hostConfigId.
+        // We intentionally do NOT append to draftConfig.serverIds here
+        // (that's the bypass the audit flagged) and we do NOT open the
+        // now-removed Servers focus tab. The new server lands in the
+        // project catalog, which is what auto-connect reads, so it
+        // connects on its own if the personal Auto-connect switch is on.
+        setSelectedNodeId(`server-card:${serverId}`);
+        toast.success(`Server "${formData.name}" added`);
+      } catch (err) {
+        toast.error(getBillingErrorMessage(err, "Failed to add server"));
+      }
+    },
+    [createServer, projectId],
+  );
+
+  // Only show the skeleton on the very first mount when there's nothing
+  // to paint. On host swaps `useHost(hostId)` briefly returns `undefined`,
+  // but `draftConfig` still holds the previous host — keep rendering it so
+  // the canvas morphs in place instead of flashing a loader, and the diff
+  // animation has an old→new transition to play against.
+  if (!draftConfig) {
+    return (
+      <div className="flex flex-col gap-4 p-6">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    );
+  }
+
+  // Block save on any blocking-level validation error. The user still sees
+  // attention badges on the offending sub-nodes/tabs; without this gate the
+  // Save button would happily submit (e.g. empty host name, blank model id,
+  // non-positive timeout) and the write would only fail at the backend.
+  const canSave = isDirty && !isSaving && !hasBlockingErrors(attention);
+
+  // Explain WHY the button is greyed out. A silently-disabled Save is what
+  // sent a Discord report chasing a phantom "you must pick a model" rule —
+  // the real gate is just "no unsaved changes" or a blocking validation
+  // error. Surface that verbatim on hover so the disabled state is never a
+  // guessing game. `null` ⇒ enabled (or actively saving) ⇒ no hint needed.
+  const saveDisabledReason = computeSaveDisabledReason({
+    isDirty,
+    isSaving,
+    issues: attention,
+  });
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+      <div className="@container relative shrink-0 border-b border-border/40 px-4 py-2.5 md:px-8">
+        {/* 3-column grid mirrors the Servers view (ConnectViewHeader): the
+            client selector, the centered view selector, and the right-side
+            controls each own a column so they can never overlap. The switch is
+            gated on the header's own width via `@container` (not the viewport)
+            so it stacks correctly when the sidebar is open and the container —
+            not the window — is narrow. Below the container breakpoint it
+            stacks into one column. */}
+        <div className="flex flex-col items-stretch gap-2 @2xl:grid @2xl:grid-cols-[1fr_auto_1fr] @2xl:items-center @2xl:gap-3">
+          {/* Client selector lives in the nav row rather than floating over
+              the canvas, so Add client / the switcher sit on the same line as
+              Servers|Client instead of overlapping the flow. */}
+          <div className="flex min-w-0 justify-center @2xl:justify-start">
+            <HostCanvasSelector projectId={projectId} activeHostId={hostId} />
+          </div>
+          <div className="flex min-w-0 justify-center">
+            <ViewModeSelector
+              value="host"
+              ariaLabel="Connect view"
+              onChange={(next) => {
+                try {
+                  track("connect_view_selected", { from: "host", to: next });
+                } catch {
+                  // swallow — a posthog throw must never block navigation
+                }
+                if (next === "servers") {
+                  // Skip `onBack()` (which would push `/hosts` first via
+                  // the parent's handleSelectHost) and just navigate.
+                  // The URL→state sync in HostsRoute will clear the
+                  // selected host when /servers takes over.
+                  navigate("/servers");
+                } else if (next === "computer") {
+                  navigate("/computer");
+                } else if (next === "skills") {
+                  navigate("/skills");
+                }
+              }}
+              options={[
+                { value: "servers", label: "Servers" },
+                { value: "host", label: "Client" },
+                // "Compare" is reached from the inline Host|Compare pill, not
+                // this primary nav — keep it out so it isn't duplicated.
+                ...(computersEnabled
+                  ? [{ value: "computer", label: "Computer" }]
+                  : []),
+                ...(showSkillsTab
+                  ? [{ value: "skills", label: "Skills" }]
+                  : []),
+              ]}
+            />
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center justify-center gap-2 @2xl:justify-end sm:gap-3">
+            {/* Host/Compare sub-nav sits inline beside Save — a single header
+                row instead of a second segmented bar stacked over the canvas.
+                `flex-wrap` lets the pill + Save drop to their own line rather
+                than overlap if the column is ever squeezed. */}
+            <HostSectionTabs
+              value="host"
+              hostEnabled
+              onSelect={(next) => {
+                if (next === "compare") navigate("/host-compare");
+              }}
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                {/* Span wrapper: a disabled <button> swallows pointer events,
+                    so the tooltip must hang off an always-interactive parent. */}
+                <span className="inline-flex shrink-0">
+                  <Button
+                    size="sm"
+                    onClick={() => void handleSave()}
+                    disabled={!canSave}
+                    variant={isDirty ? "default" : "ghost"}
+                    className={
+                      isDirty
+                        ? "shrink-0"
+                        : "shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-40"
+                    }
+                  >
+                    {isSaving ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Save className="size-4" />
+                    )}
+                    {isDirty ? "Save client" : "Saved"}
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              {saveDisabledReason ? (
+                <TooltipContent side="bottom" variant="muted">
+                  {saveDisabledReason}
+                </TooltipContent>
+              ) : null}
+            </Tooltip>
+          </div>
+        </div>
+      </div>
+
+      <div
+        className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background text-foreground"
+        style={canvasShellStyle}
+      >
+        {/* Canvas + side focus panel (mirrors the ScenarioBuilderView layout:
+          left = canvas, right = setup/focus rail). Resizable so the user
+          can grow the editor without losing the canvas context. */}
+        <div className="min-h-0 flex-1 p-4">
+          {/*
+          Remount when the right pane mounts/unmounts so react-resizable-panels
+          recomputes layout. Otherwise defaultSize only applies on first mount
+          and the focus panel can render at ~0 width after opening.
+        */}
+          <ResizablePanelGroup
+            key={focusState.open ? "host-builder-split" : "host-builder-canvas"}
+            direction="horizontal"
+            className="h-full"
+          >
+            <ResizablePanel
+              defaultSize={focusState.open ? 55 : 100}
+              minSize={30}
+            >
+              <div className="relative h-full min-h-0 pr-2">
+                <ReactFlowProvider>
+                  <RedesignedHostCanvas
+                    viewModel={viewModel}
+                    selectedNodeId={selectedNodeId}
+                    onSelectNode={handleSelectNode}
+                    onClearSelection={() => setSelectedNodeId(null)}
+                    onAddServer={() => setShowAddServer(true)}
+                    onOpenComputer={() => navigate("/computer")}
+                    themeMode={themeMode}
+                    shellStyle={canvasShellStyle}
+                  />
+                </ReactFlowProvider>
+              </div>
+            </ResizablePanel>
+            {focusState.open ? (
+              <>
+                <ResizableHandle withHandle />
+                <ResizablePanel defaultSize={45} minSize={35} maxSize={70}>
+                  <HostFocusPanel
+                    projectId={projectId}
+                    hostId={hostId}
+                    tab={focusState.tab}
+                    onTabChange={(next) =>
+                      setFocusState((prev) =>
+                        prev.open ? { ...prev, tab: next } : prev,
+                      )
+                    }
+                    focusSubKey={focusState.focusSubKey}
+                    hostDisplayName={draftName}
+                    savedHostDisplayName={host?.name ?? draftName}
+                    onHostDisplayNameChange={setDraftName}
+                    themeMode={themeMode}
+                    draft={draftConfig}
+                    savedDraft={savedConfig ?? draftConfig}
+                    onDraftChange={(updater) =>
+                      setDraftConfig((prev) => (prev ? updater(prev) : prev))
+                    }
+                    onSaveLatest={handleSaveLatest}
+                    hostLoaded={host !== null}
+                    saveInFlight={isSaving}
+                    attention={attention}
+                    onClose={closeFocus}
+                  />
+                </ResizablePanel>
+              </>
+            ) : null}
+          </ResizablePanelGroup>
+        </div>
+
+        {showAddServer && (
+          <AddServerModal
+            isOpen={showAddServer}
+            onClose={() => setShowAddServer(false)}
+            onSubmit={handleAddServer}
+          />
+        )}
+      </div>
+    </div>
+  );
+}

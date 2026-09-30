@@ -1,0 +1,252 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@mcpjam/design-system/dialog";
+import { Button } from "@mcpjam/design-system/button";
+import { Textarea } from "@mcpjam/design-system/textarea";
+import { Slider } from "@mcpjam/design-system/slider";
+import { AlertTriangle, Settings2 } from "lucide-react";
+import { toast } from "sonner";
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+} from "@mcpjam/design-system/alert";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@mcpjam/design-system/tooltip";
+import {
+  ModelDefinition,
+  modelDefinitionSupportsTemperature,
+} from "@/shared/types";
+
+interface SystemPromptSelectorProps {
+  systemPrompt: string;
+  onSystemPromptChange: (prompt: string) => void;
+  temperature: number;
+  onTemperatureChange: (temperature: number) => void;
+  disabled?: boolean;
+  isLoading?: boolean;
+  hasMessages?: boolean;
+  onResetChat: () => void;
+  currentModel: ModelDefinition;
+  multiModelEnabled?: boolean;
+  selectedModels?: ModelDefinition[];
+  /** Custom trigger element to replace the default toolbar button. */
+  renderTrigger?: React.ReactNode;
+  /** Controlled open state (overrides internal state when provided). */
+  open?: boolean;
+  /** Callback when controlled open state changes. */
+  onOpenChange?: (open: boolean) => void;
+}
+
+export function SystemPromptSelector({
+  systemPrompt,
+  onSystemPromptChange,
+  temperature,
+  onTemperatureChange,
+  disabled,
+  isLoading,
+  hasMessages,
+  onResetChat,
+  currentModel,
+  multiModelEnabled = false,
+  selectedModels,
+  renderTrigger,
+  open: controlledOpen,
+  onOpenChange: controlledOnOpenChange,
+}: SystemPromptSelectorProps) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const isOpen = controlledOpen ?? internalOpen;
+  const setIsOpen = controlledOnOpenChange ?? setInternalOpen;
+  const [draftPrompt, setDraftPrompt] = useState(systemPrompt);
+  const [draftTemperature, setDraftTemperature] = useState(temperature);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  // Re-seed the draft from the live `systemPrompt`/`temperature` whenever the
+  // dialog transitions from closed to open. Radix's `onOpenChange` does NOT
+  // fire when `open` is controlled and flipped externally, so the equivalent
+  // sync inside `handleOpenChange` only covers internally-driven opens. Surfaces
+  // that drive `open` themselves (chat-input passes a controlled `open`) would
+  // otherwise show whatever `systemPrompt` was at the selector's mount time —
+  // e.g. the default literal — even after the host-driven state moved on.
+  const previousOpenRef = useRef(isOpen);
+  useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = isOpen;
+    if (isOpen && !wasOpen) {
+      setDraftPrompt(systemPrompt);
+      setDraftTemperature(temperature);
+      setConfirmReset(false);
+    }
+  }, [isOpen, systemPrompt, temperature]);
+
+  const effectiveSelectedModels =
+    multiModelEnabled && selectedModels && selectedModels.length > 0
+      ? selectedModels
+      : [currentModel];
+  // Passes the whole row, not just its id, so a hosted model the catalog says
+  // takes no `temperature` greys the slider out here too rather than leaving it
+  // live over a value prepareChatV2 goes on to drop.
+  const someSelectedModelsIgnoreTemperature = effectiveSelectedModels.some(
+    (model) => !modelDefinitionSupportsTemperature(model)
+  );
+  const allSelectedModelsIgnoreTemperature = effectiveSelectedModels.every(
+    (model) => !modelDefinitionSupportsTemperature(model)
+  );
+
+  const handleOpenChange = (open: boolean) => {
+    setIsOpen(open);
+    if (open) {
+      setDraftPrompt(systemPrompt);
+      setDraftTemperature(temperature);
+    }
+    setConfirmReset(false);
+  };
+
+  const handleSave = () => {
+    const promptChanged = draftPrompt !== systemPrompt;
+    const temperatureChanged = draftTemperature !== temperature;
+    if (hasMessages && (promptChanged || temperatureChanged) && !confirmReset) {
+      setConfirmReset(true);
+      return;
+    }
+
+    onSystemPromptChange(draftPrompt);
+    onTemperatureChange(draftTemperature);
+    if (promptChanged || temperatureChanged) {
+      onResetChat();
+    }
+    setIsOpen(false);
+    setConfirmReset(false);
+    toast.success("System prompt and temperature updated");
+  };
+
+  const handleCancel = () => {
+    setDraftPrompt(systemPrompt);
+    setDraftTemperature(temperature);
+    setConfirmReset(false);
+    setIsOpen(false);
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleOpenChange}>
+      {controlledOpen !== undefined ? null : renderTrigger ? (
+        <DialogTrigger asChild>{renderTrigger}</DialogTrigger>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DialogTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={disabled || isLoading}
+                className="h-8 px-2 rounded-full hover:bg-muted/80 transition-colors text-xs cursor-pointer max-w-[180px] @max-2xl/toolbar:w-8 @max-2xl/toolbar:px-0 @max-2xl/toolbar:max-w-none"
+              >
+                <Settings2 className="h-2 w-2 mr-1 flex-shrink-0 @max-2xl/toolbar:h-4 @max-2xl/toolbar:w-4 @max-2xl/toolbar:mr-0" />
+                <span className="text-[10px] font-medium truncate @max-2xl/toolbar:hidden">
+                  System Prompt & Temperature
+                </span>
+              </Button>
+            </DialogTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            System Prompt & Temperature
+          </TooltipContent>
+        </Tooltip>
+      )}
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>System Prompt & Temperature</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-6">
+          <div className="space-y-2">
+            <label className="text-sm font-medium">System Prompt</label>
+            <Textarea
+              value={draftPrompt}
+              onChange={(e) => {
+                setDraftPrompt(e.target.value);
+                setConfirmReset(false);
+              }}
+              placeholder="You are a helpful assistant with access to MCP tools."
+              className="h-[140px] resize-none"
+            />
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">Temperature</label>
+              <span className="text-sm text-muted-foreground">
+                {draftTemperature.toFixed(1)}
+              </span>
+            </div>
+            <Slider
+              value={[draftTemperature]}
+              onValueChange={(value) => {
+                setDraftTemperature(value[0]);
+                setConfirmReset(false);
+              }}
+              min={0}
+              max={2}
+              step={0.1}
+              className="w-full"
+              disabled={allSelectedModelsIgnoreTemperature}
+            />
+            {allSelectedModelsIgnoreTemperature ? (
+              <p className="text-xs text-muted-foreground">
+                Temperature is not supported for the selected models
+              </p>
+            ) : someSelectedModelsIgnoreTemperature ? (
+              <p className="text-xs text-muted-foreground">
+                Some selected models do not support temperature. The setting
+                still applies to the others.
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Lower values (0-0.3) for focused tasks, higher values (0.7-2.0)
+                for creative tasks
+              </p>
+            )}
+          </div>
+
+          {confirmReset && (
+            <Alert
+              variant="destructive"
+              className="bg-destructive/10 border-destructive/40"
+            >
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Confirm reset</AlertTitle>
+              <AlertDescription>
+                Changing the system prompt or temperature will clear the current
+                chat session. Press save again to continue.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="ghost"
+              onClick={handleCancel}
+              className="cursor-pointer"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSave}
+              className="cursor-pointer"
+              variant={confirmReset ? "destructive" : "default"}
+            >
+              {confirmReset ? "Confirm & Reset" : "Save"}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

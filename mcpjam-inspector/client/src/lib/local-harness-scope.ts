@@ -1,0 +1,54 @@
+/** Local Claude Code is available to the member on direct and environment chat. Shared/scenario execution stays hosted. */
+export const LOCAL_HARNESS_SCOPED_HARNESS_ID = "claude-code";
+
+export interface LocalHarnessScopeInput {
+  /**
+   * The harness the host for THIS send or lane runs, as the client knows it.
+   *
+   * Null / undefined ⇒ out of scope. An unknown harness is not `claude-code`,
+   * and guessing in the permissive direction here would offer local execution
+   * on a host that will not run it.
+   */
+  harnessId: string | null | undefined;
+  /** `HOSTED_MODE`. */
+  hostedMode: boolean;
+  /** Set on a scenario (share-link or owner-preview) session. */
+  scenarioId?: string | null;
+  /** Set on an environment-target run. */
+  environmentId?: string | null;
+  /**
+   * The surface has forced itself onto the org-aware web route.
+   *
+   * A superset signal covering environment mode and the hosted rail. Local
+   * execution only exists on the local `/api/mcp` route, so a surface that has
+   * already decided otherwise is out of scope by construction.
+   */
+  requiresWebChatApi?: boolean;
+  /**
+   * A shared or replayed run rather than the member's own turn.
+   *
+   * REQUIRED, unlike the other surface facts. Consent is bound to one attended
+   * member running their own turn on their own machine, so "is this that?" is
+   * the question this predicate exists to ask — and an optional boolean answers
+   * it `false` for any caller that forgets, which is the permissive direction.
+   * Making it required means a new surface has to state the answer rather than
+   * inherit a default that happens to suit the surface it was copied from.
+   */
+  sharedRun: boolean;
+}
+
+/**
+ * Is this send/lane one that local Claude Code execution could apply to?
+ *
+ * Answers the SHAPE question only. Whether the machine can actually do it —
+ * flag, sign-in, runtime, consent — is every other gate's business, and each of
+ * those failing must leave an explicit local request explicitly unsatisfied
+ * rather than quietly turning it into a hosted one.
+ */
+export function isLocalHarnessScope(args: LocalHarnessScopeInput): boolean {
+  if (args.hostedMode) return false;
+  if (args.harnessId !== LOCAL_HARNESS_SCOPED_HARNESS_ID) return false;
+  if (args.sharedRun === true) return false;
+  if (args.scenarioId) return false;
+  return true;
+}

@@ -1,0 +1,296 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  loadLastOwnProviderModelId,
+  loadLeadModelProviderHint,
+  saveLeadModelProviderHint,
+  loadSelectedModelId,
+  loadSelectedModelIds,
+  replaceLeadModelId,
+  saveLastOwnProviderModelId,
+  saveSelectedModelId,
+  saveSelectedModelIds,
+  subscribeSelectedModelId,
+  subscribeSelectedModelIds,
+} from "../selected-model-storage";
+
+const LEAD_KEY = "mcp-inspector-selected-model";
+const ARRAY_KEY = "mcp-inspector-selected-models";
+const OWN_PROVIDER_KEY = "mcp-inspector-last-own-provider-model";
+const PROVIDER_HINT_KEY = "mcp-inspector-selected-model-provider";
+
+describe("selected-model-storage", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  describe("loadLastOwnProviderModelId / saveLastOwnProviderModelId", () => {
+    it("round-trips an own-provider model id", () => {
+      saveLastOwnProviderModelId("claude-haiku-4-5");
+      expect(loadLastOwnProviderModelId()).toBe("claude-haiku-4-5");
+      expect(localStorage.getItem(OWN_PROVIDER_KEY)).toBe("claude-haiku-4-5");
+    });
+
+    it("returns null when nothing is stored", () => {
+      expect(loadLastOwnProviderModelId()).toBeNull();
+    });
+
+    it("treats blank ids as cleared", () => {
+      saveLastOwnProviderModelId("claude-haiku-4-5");
+      saveLastOwnProviderModelId("   ");
+      expect(loadLastOwnProviderModelId()).toBeNull();
+      expect(localStorage.getItem(OWN_PROVIDER_KEY)).toBeNull();
+    });
+
+    it("is independent of the lead selection", () => {
+      saveLastOwnProviderModelId("claude-haiku-4-5");
+      // The lead flips to a free-tier model — the own-provider memory is what
+      // the BYOK hand-off reads back, so it must survive this (BACK2-628).
+      saveSelectedModelId("anthropic/claude-haiku-4.5");
+      expect(loadLastOwnProviderModelId()).toBe("claude-haiku-4-5");
+    });
+  });
+
+  describe("loadSelectedModelIds / saveSelectedModelIds", () => {
+    it("returns [] when nothing is stored", () => {
+      expect(loadSelectedModelIds()).toEqual([]);
+    });
+
+    it("round-trips a normalized array", () => {
+      saveSelectedModelIds(["a", "b", "c"]);
+      expect(loadSelectedModelIds()).toEqual(["a", "b", "c"]);
+      expect(localStorage.getItem(ARRAY_KEY)).toBe(JSON.stringify(["a", "b", "c"]));
+    });
+
+    it("dedupes, trims, and drops non-strings on save", () => {
+      saveSelectedModelIds([
+        " a ",
+        "a",
+        "",
+        // @ts-expect-error — exercising runtime normalization
+        null,
+        "b",
+        "b",
+      ]);
+      expect(loadSelectedModelIds()).toEqual(["a", "b"]);
+    });
+
+    it("removes the key when saving an empty array", () => {
+      saveSelectedModelIds(["a"]);
+      saveSelectedModelIds([]);
+      expect(localStorage.getItem(ARRAY_KEY)).toBeNull();
+    });
+
+    it("returns [] when the stored JSON is malformed", () => {
+      localStorage.setItem(ARRAY_KEY, "{not json");
+      expect(loadSelectedModelIds()).toEqual([]);
+    });
+  });
+
+  describe("replaceLeadModelId", () => {
+    it("seeds the array with [newId] when it is currently empty", () => {
+      replaceLeadModelId("openai/gpt-5");
+      expect(loadSelectedModelId()).toBe("openai/gpt-5");
+      expect(loadSelectedModelIds()).toEqual(["openai/gpt-5"]);
+    });
+
+    it("is a no-op on the array when newId already sits at index 0", () => {
+      saveSelectedModelIds(["a", "b", "c"]);
+      replaceLeadModelId("a");
+      expect(loadSelectedModelId()).toBe("a");
+      expect(loadSelectedModelIds()).toEqual(["a", "b", "c"]);
+    });
+
+    it("rotates an existing id at index k > 0 to the front, preserving count", () => {
+      saveSelectedModelIds(["a", "b", "c"]);
+      replaceLeadModelId("c");
+      expect(loadSelectedModelId()).toBe("c");
+      // count preserved (3), c moved to slot 0, original order otherwise intact
+      expect(loadSelectedModelIds()).toEqual(["c", "a", "b"]);
+    });
+
+    it("replaces the lead slot when newId is not in the array, preserving count", () => {
+      saveSelectedModelIds(["a", "b", "c"]);
+      replaceLeadModelId("z");
+      expect(loadSelectedModelId()).toBe("z");
+      // count preserved (3); slot 0 replaced, slots 1+ untouched
+      expect(loadSelectedModelIds()).toEqual(["z", "b", "c"]);
+    });
+
+    it("clears the lead but leaves the array intact when called with null", () => {
+      saveSelectedModelIds(["a", "b", "c"]);
+      saveSelectedModelId("a");
+      replaceLeadModelId(null);
+      expect(loadSelectedModelId()).toBeNull();
+      expect(loadSelectedModelIds()).toEqual(["a", "b", "c"]);
+    });
+
+    it("treats whitespace-only ids like null", () => {
+      saveSelectedModelIds(["a", "b"]);
+      saveSelectedModelId("a");
+      replaceLeadModelId("   ");
+      expect(loadSelectedModelId()).toBeNull();
+      expect(loadSelectedModelIds()).toEqual(["a", "b"]);
+    });
+
+    it("preserves multi-column count when switching hosts (regression for column-drift bug)", () => {
+      // Two-column setup in "host A".
+      saveSelectedModelIds(["host-a-lead", "extra"]);
+      saveSelectedModelId("host-a-lead");
+
+      // Host switch to "host B" with a different default lead.
+      replaceLeadModelId("host-b-lead");
+
+      // Count stays at 2; new host's lead sits at slot 0; second column
+      // (the workspace preference) is preserved.
+      const ids = loadSelectedModelIds();
+      expect(ids.length).toBe(2);
+      expect(ids[0]).toBe("host-b-lead");
+      expect(ids[1]).toBe("extra");
+      expect(loadSelectedModelId()).toBe("host-b-lead");
+    });
+  });
+
+  describe("subscribeSelectedModelId", () => {
+    it("fires the callback when the lead is saved", () => {
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelId(cb);
+      saveSelectedModelId("openai/gpt-5");
+      expect(cb).toHaveBeenCalled();
+      unsubscribe();
+    });
+
+    it("does NOT fire the lead callback when only the array is saved", () => {
+      // Regression: `saveSelectedModelIds` is called as a mirror by the
+      // in-app React setter and must not feed back into React state by
+      // dispatching the lead-id channel. The host-switch primitive
+      // (`replaceLeadModelId`) is the only path that updates the array
+      // from outside React and uses its own channel
+      // (`subscribeSelectedModelIds`).
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelId(cb);
+      saveSelectedModelIds(["a", "b"]);
+      expect(cb).not.toHaveBeenCalled();
+      unsubscribe();
+    });
+
+    it("fires the lead callback once per replaceLeadModelId, and the read after the event sees both keys updated", () => {
+      saveSelectedModelIds(["a", "b"]);
+      saveSelectedModelId("a");
+
+      let observedLead: string | null | undefined;
+      let observedArray: string[] | undefined;
+      const cb = vi.fn(() => {
+        observedLead = loadSelectedModelId();
+        observedArray = loadSelectedModelIds();
+      });
+      const unsubscribe = subscribeSelectedModelId(cb);
+
+      // "c" isn't in the array, so the lead slot is replaced; count
+      // (2) is preserved — that's the column-drift fix.
+      replaceLeadModelId("c");
+
+      // Subscriber receives an event and re-reads both lead and array
+      // — and sees a consistent snapshot (both updated together).
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(observedLead).toBe("c");
+      expect(observedArray).toEqual(["c", "b"]);
+
+      unsubscribe();
+    });
+
+    it("stops firing after unsubscribe", () => {
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelId(cb);
+      unsubscribe();
+      saveSelectedModelId("anything");
+      expect(cb).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("subscribeSelectedModelIds", () => {
+    it("does NOT fire when only `saveSelectedModelIds` is called (in-app mirror path)", () => {
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelIds(cb);
+      saveSelectedModelIds(["a", "b"]);
+      expect(cb).not.toHaveBeenCalled();
+      unsubscribe();
+    });
+
+    it("fires when `replaceLeadModelId` mutates the array (host-switch path)", () => {
+      saveSelectedModelIds(["a", "b"]);
+      saveSelectedModelId("a");
+
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelIds(cb);
+      // Replaces slot 0 ("a") with "c" — array changes.
+      replaceLeadModelId("c");
+      expect(cb).toHaveBeenCalledTimes(1);
+      unsubscribe();
+    });
+
+    it("does NOT fire when `replaceLeadModelId` leaves the array untouched (lead already at slot 0)", () => {
+      saveSelectedModelIds(["a", "b"]);
+      saveSelectedModelId("a");
+
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelIds(cb);
+      // "a" is already at slot 0 — no array change, no array event.
+      replaceLeadModelId("a");
+      expect(cb).not.toHaveBeenCalled();
+      unsubscribe();
+    });
+
+    it("stops firing after unsubscribe", () => {
+      saveSelectedModelIds(["a"]);
+      const cb = vi.fn();
+      const unsubscribe = subscribeSelectedModelIds(cb);
+      unsubscribe();
+      replaceLeadModelId("b");
+      expect(cb).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("lead model provider hint", () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  it("round-trips the pair it was picked as", () => {
+    saveLeadModelProviderHint({
+      modelId: "anthropic/claude-sonnet-5",
+      provider: "openrouter",
+    });
+    expect(loadLeadModelProviderHint()).toEqual({
+      modelId: "anthropic/claude-sonnet-5",
+      provider: "openrouter",
+    });
+  });
+
+  it("is empty until something is picked", () => {
+    expect(loadLeadModelProviderHint()).toBeNull();
+  });
+
+  it("clears on null", () => {
+    saveLeadModelProviderHint({ modelId: "a/b", provider: "openrouter" });
+    saveLeadModelProviderHint(null);
+    expect(localStorage.getItem(PROVIDER_HINT_KEY)).toBeNull();
+    expect(loadLeadModelProviderHint()).toBeNull();
+  });
+
+  // Whatever is in storage came from a browser we do not control; a bad value
+  // must read as "no hint", which means the id-only resolution of before.
+  it.each([
+    ["not JSON", "{oops"],
+    ["a bare string", JSON.stringify("openrouter")],
+    ["missing provider", JSON.stringify({ modelId: "a/b" })],
+    ["blank id", JSON.stringify({ modelId: " ", provider: "openrouter" })],
+    ["wrong types", JSON.stringify({ modelId: 1, provider: true })],
+  ])("reads %s as no hint", (_label, raw) => {
+    localStorage.setItem(PROVIDER_HINT_KEY, raw);
+    expect(loadLeadModelProviderHint()).toBeNull();
+  });
+});

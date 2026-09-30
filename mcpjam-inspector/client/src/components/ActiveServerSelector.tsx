@@ -1,0 +1,496 @@
+import { useEffect, useRef, useState } from "react";
+import { ServerWithName } from "@/hooks/use-app-state";
+import { cn } from "@/lib/utils";
+import { AddServerModal } from "./connection/AddServerModal";
+import { ServerFormData } from "@/shared/types.js";
+import { Check, ChevronLeft, ChevronRight, RefreshCw, X } from "lucide-react";
+import {
+  UNKNOWN_CONNECTION_STATUS,
+  getConnectionStatusMeta,
+  isConnectionStatus,
+} from "@/components/connection/server-card-utils";
+import { track } from "@/lib/analytics";
+import { HOSTED_MODE } from "@/lib/config";
+import {
+  isOAuthDebuggerHeaderServer,
+  isXaaDebuggerHeaderServer,
+} from "@/lib/debugger-header-servers";
+
+const HOSTED_HTTPS_REQUIRED_HINT =
+  "MCPJam’s hosted web app requires an HTTPS server URL. To connect over HTTP, run npx @mcpjam/inspector@latest on your computer or use the MCPJam desktop app.";
+
+function isHostedInsecureHttpServer(server: ServerWithName): boolean {
+  if (!HOSTED_MODE || !("url" in server.config) || !server.config.url) {
+    return false;
+  }
+
+  try {
+    return new URL(server.config.url.toString()).protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+export interface ActiveServerSelectorProps {
+  serverConfigs: Record<string, ServerWithName>;
+  selectedServer: string;
+  selectedMultipleServers: string[];
+  isMultiSelectEnabled: boolean;
+  onServerChange: (server: string) => void;
+  onMultiServerToggle: (server: string) => void;
+  /**
+   * Bulk-replace the multi-server selection. Wired in for the Playground
+   * tab's host snapshot — picking a named host should toggle on the host's
+   * required + optional servers in one shot, not per-server. Optional on
+   * the shared interface so single-select callers don't need it.
+   */
+  onSelectMultipleServers?: (serverNames: string[]) => void;
+  onConnect: (formData: ServerFormData) => void;
+  /**
+   * Override the "Add Server" click. When provided, the button calls this
+   * instead of opening the generic Add Server modal — used by the XAA / OAuth
+   * debuggers to open their own purpose-built "configure server" modals.
+   */
+  onAddServerRequested?: () => void;
+  onReconnect?: (serverName: string) => Promise<void>;
+  /** Disconnect a connected server (Playground toggle off = unplug). */
+  onDisconnect?: (serverName: string) => void;
+  /**
+   * Hide a server from THIS header only (OAuth / XAA debugger). View-only: the
+   * server config, tokens, and Convex row are untouched — it's dropped from this
+   * tab's chip strip until un-hidden. When provided, each chip renders an "x".
+   */
+  onHideServer?: (serverName: string) => void;
+  /** Server names hidden from this header; filtered out of the rendered list. */
+  hiddenServers?: Set<string>;
+  showOnlyOAuthServers?: boolean; // Only show servers that use OAuth
+  /**
+   * When `showOnlyOAuthServers` is on, also admit Cross-App Access (XAA)
+   * servers (useXaa, useOAuth left false). Scoped to the XAA tab so XAA servers
+   * don't leak into the OAuth-flow tab's list.
+   */
+  includeXaaServers?: boolean;
+  showOnlyServersWithViews?: boolean; // Only show servers that have saved views
+  /** Auto-select when the current selection is hidden by filters. `true`
+   * replaces an invalid selection with the most recently connected eligible
+   * server. `"when-empty"` only fills a blank selection ("none") and never
+   * replaces an existing one — the debugger tabs use this so their target
+   * (which live auth requests are fired at) can't change without an explicit
+   * click. */
+  autoSelectFilteredServer?: boolean | "when-empty";
+  serversWithViews?: Set<string>; // Set of server names that have saved views
+  hasMessages?: boolean; // Reserved for callers that still compute this
+  className?: string;
+}
+
+/** Props supplied by the shell; `className` is set in PlaygroundMain. */
+export type PlaygroundServerSelectorProps = Omit<
+  ActiveServerSelectorProps,
+  "hasMessages" | "className"
+>;
+
+export function ActiveServerSelector({
+  serverConfigs,
+  selectedServer,
+  selectedMultipleServers,
+  isMultiSelectEnabled,
+  onServerChange,
+  onMultiServerToggle,
+  onConnect,
+  onAddServerRequested,
+  onReconnect,
+  onHideServer,
+  hiddenServers,
+  showOnlyOAuthServers = false,
+  includeXaaServers = false,
+  showOnlyServersWithViews = false,
+  autoSelectFilteredServer = true,
+  serversWithViews,
+  className,
+}: ActiveServerSelectorProps) {
+  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const hasNoServersWithViews =
+    showOnlyServersWithViews && (serversWithViews?.size ?? 0) === 0;
+
+  const servers = Object.entries(serverConfigs).filter(([name, server]) => {
+    // View-only dismissals from this header (OAuth / XAA debugger x button).
+    if (hiddenServers?.has(name)) return false;
+    if (
+      showOnlyOAuthServers &&
+      !isOAuthDebuggerHeaderServer(server) &&
+      !(includeXaaServers && isXaaDebuggerHeaderServer(server))
+    )
+      return false;
+    if (showOnlyServersWithViews && !serversWithViews?.has(name)) return false;
+    return true;
+  });
+
+  /**
+   * WHICH servers are listed, not how many.
+   *
+   * The effect below reads `servers` but used to depend on `servers.length`,
+   * so any change that preserved the count — a rename, or one server leaving
+   * as another arrives — never re-ran it, and `selectedServer` went on
+   * pointing at a name the list no longer holds. That is precisely the state
+   * the effect exists to repair. JSON, not a joined string, so a name
+   * containing the separator cannot forge a key.
+   */
+  const listedServersKey = JSON.stringify(servers.map(([name]) => name));
+
+  // Auto-select first available server if current selection is not in the list
+  useEffect(() => {
+    if (
+      !autoSelectFilteredServer ||
+      isMultiSelectEnabled ||
+      hasNoServersWithViews
+    ) {
+      return;
+    }
+
+    const serverNames = servers.map(([name]) => name);
+    const isCurrentSelectionValid = serverNames.includes(selectedServer);
+    const hasExplicitSelection =
+      Boolean(selectedServer) && selectedServer !== "none";
+
+    // "when-empty" fills a blank selection but never replaces one the user
+    // already made — an invalid selection stays put (the tab renders its own
+    // "not testable" state) instead of being silently swapped for a server
+    // the user never clicked.
+    if (autoSelectFilteredServer === "when-empty" && hasExplicitSelection) {
+      return;
+    }
+
+    if (!isCurrentSelectionValid && servers.length > 0) {
+      // Pick the most recently connected server instead of the first by insertion order
+      const sorted = [...servers].sort(
+        ([, a], [, b]) =>
+          new Date(b.lastConnectionTime).getTime() -
+          new Date(a.lastConnectionTime).getTime(),
+      );
+      onServerChange(sorted[0][0]);
+    } else if (!isCurrentSelectionValid && selectedServer !== "none") {
+      // No available servers and selection is stale — clear it
+      onServerChange("none");
+    }
+  }, [
+    listedServersKey,
+    selectedServer,
+    isMultiSelectEnabled,
+    onServerChange,
+    hasNoServersWithViews,
+    autoSelectFilteredServer,
+  ]);
+
+  const handleServerClick = (name: string) => {
+    if (isMultiSelectEnabled) {
+      onMultiServerToggle(name);
+      return;
+    }
+    onServerChange(name);
+  };
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+
+    const updateScrollState = () => {
+      setCanScrollLeft(node.scrollLeft > 0);
+      setCanScrollRight(
+        node.scrollLeft + node.clientWidth < node.scrollWidth - 1,
+      );
+    };
+
+    updateScrollState();
+    node.addEventListener("scroll", updateScrollState, { passive: true });
+    window.addEventListener("resize", updateScrollState);
+
+    return () => {
+      node.removeEventListener("scroll", updateScrollState);
+      window.removeEventListener("resize", updateScrollState);
+    };
+  }, [servers.length]);
+
+  const scroll = (direction: "left" | "right") => {
+    const node = scrollRef.current;
+    if (!node) return;
+    // Scroll by approximately 2 tab widths (200px) for smooth incremental navigation
+    const scrollAmount = 200;
+    const newScrollLeft =
+      direction === "left"
+        ? Math.max(0, node.scrollLeft - scrollAmount)
+        : Math.min(
+            node.scrollWidth - node.clientWidth,
+            node.scrollLeft + scrollAmount,
+          );
+    node.scrollTo({
+      left: newScrollLeft,
+      behavior: "smooth",
+    });
+  };
+
+  if (hasNoServersWithViews) {
+    return null;
+  }
+
+  return (
+    <div className={cn("relative h-full w-full min-w-0", className)}>
+      <div
+        ref={scrollRef}
+        className={cn(
+          "w-full h-full min-w-0 overflow-x-auto scrollbar-hidden",
+          "flex justify-start",
+        )}
+      >
+        <div className="flex flex-nowrap min-w-fit h-full items-end gap-[3px]">
+          {servers.map(([name, serverConfig]) => {
+            const isSelected = isMultiSelectEnabled
+              ? selectedMultipleServers.includes(name)
+              : selectedServer === name;
+            const isHostedHttpReconnectBlocked =
+              isHostedInsecureHttpServer(serverConfig);
+            /**
+             * The same helper the server cards and the picker read. The local
+             * copies this replaces had no `oauth-flow` case at all, so a
+             * server waiting on consent showed a grey dot titled "Unknown"
+             * here while the card beside it said "Authorizing in browser...".
+             *
+             * A status OUTSIDE the union keeps its own answer rather than
+             * taking the helper's `disconnected` fallback: "we cannot read
+             * this" and "this is not connected" are different claims, and only
+             * the first one is true here.
+             */
+            const statusMeta = isConnectionStatus(serverConfig.connectionStatus)
+              ? getConnectionStatusMeta(serverConfig.connectionStatus)
+              : UNKNOWN_CONNECTION_STATUS;
+            // The pulse stays local to the strip. The shared helper carries the
+            // colour and the word, not the motion: these tabs are dense and
+            // always on screen, so a handshake in flight is worth animating
+            // here in a way the picker's one-off popover row is not.
+            const isHandshaking =
+              serverConfig.connectionStatus === "connecting" ||
+              serverConfig.connectionStatus === "oauth-flow";
+
+            return (
+              <button
+                key={name}
+                aria-current={
+                  !isMultiSelectEnabled && isSelected ? "true" : undefined
+                }
+                aria-pressed={isMultiSelectEnabled ? isSelected : undefined}
+                onClick={(e) => {
+                  // Ignore clicks from the inline action buttons (reconnect /
+                  // hide). Using Element to cover SVG elements too.
+                  if (
+                    (e.target as Element).closest(
+                      "[data-reconnect-button],[data-hide-button]",
+                    )
+                  ) {
+                    return;
+                  }
+                  handleServerClick(name);
+                }}
+                className={cn(
+                  "group relative isolate flex items-center gap-3 px-4 cursor-pointer outline-none text-foreground",
+                  // Sheets in a stack: rounded head, square foot, hairline
+                  // round the edge. The idle ones drop the bottom side — they
+                  // float 6px clear of the panel and their fill already ends
+                  // them against the linen. `overflow-hidden` so the rising
+                  // fill below is cut to the same silhouette.
+                  "h-[calc(100%-6px)] rounded-t-lg overflow-hidden border border-chrome-control-border",
+                  // Colours only. `box-shadow` in this list pinned the cast at
+                  // the transition's start value and it never painted — the
+                  // shadow is built from --tw-shadow, a registered property, so
+                  // listing it hands the paint to an interpolation that never
+                  // lands. Height left too: every sheet is the same size now.
+                  "transition-colors duration-200 ease-out",
+                  // The ring is on the BASE, not on one branch: `outline-none`
+                  // above kills the native indicator for every tab, so the
+                  // selected one would otherwise take keyboard focus with
+                  // nothing to show for it. Inset because the strip scrolls
+                  // horizontally (`overflow-x-auto`) and would clip an
+                  // outset ring on the first and last tab.
+                  "focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/45",
+                  // Every sheet is the same size; the selected one is lit to
+                  // the panel fill, ruled at the foot and given a soft cast
+                  // off its head. The idle ones keep --chrome-control,
+                  // the fill the design system gives things that sit ON the
+                  // linen ground. Hover cannot be `bg-accent` or
+                  // `bg-chrome-hover` here: --accent IS the chrome ground and
+                  // --chrome-hover is for controls with no fill at rest, which
+                  // these no longer are.
+                  isSelected
+                    ? "border-b-2 bg-chrome-control shadow-chrome-tab"
+                    : "border-b-0 bg-chrome-control hover:bg-chrome-control-hover focus-visible:bg-chrome-control-hover",
+                )}
+              >
+                {isMultiSelectEnabled && (
+                  <div
+                    className={cn(
+                      "w-4 h-4 rounded border-2 flex items-center justify-center transition-colors",
+                      isSelected
+                        ? "bg-primary border-primary text-primary-foreground"
+                        : "border-muted-foreground/30 hover:border-primary/50",
+                    )}
+                  >
+                    {isSelected && <Check className="w-3 h-3" />}
+                  </div>
+                )}
+                {/* `title` alone is a tooltip, not an accessible name: a
+                    screen reader moving through these tabs never hears the
+                    connection state. `role="img"` + `aria-label` is what the
+                    shared picker panel already does for the same dot. */}
+                <div
+                  role="img"
+                  aria-label={statusMeta.label}
+                  className={cn(
+                    "w-2 h-2 rounded-full",
+                    statusMeta.indicatorClassName,
+                    isHandshaking && "animate-pulse",
+                  )}
+                  title={statusMeta.label}
+                />
+                <span className="text-sm font-medium truncate max-w-36">
+                  {name}
+                </span>
+                <div className="text-xs opacity-70">
+                  {serverConfig.config.command ? "STDIO" : "HTTP"}
+                </div>
+                {onReconnect && (
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    data-reconnect-button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      // Also prevent default to avoid double actions if standard button behavior applies
+                      e.preventDefault();
+                      if (isHostedHttpReconnectBlocked) {
+                        return;
+                      }
+                      onReconnect(name).catch(() => {});
+                    }}
+                    className={cn(
+                      "ml-auto p-1 rounded-md transition-colors",
+                      isHostedHttpReconnectBlocked
+                        ? "cursor-not-allowed text-muted-foreground/40"
+                        : "hover:bg-muted-foreground/20 text-muted-foreground hover:text-foreground",
+                    )}
+                    title={
+                      isHostedHttpReconnectBlocked
+                        ? HOSTED_HTTPS_REQUIRED_HINT
+                        : "Reconnect"
+                    }
+                    aria-disabled={isHostedHttpReconnectBlocked}
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                  </div>
+                )}
+                {onHideServer && (
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    data-hide-button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      e.preventDefault();
+                      onHideServer(name);
+                    }}
+                    className={cn(
+                      "p-1 rounded-md transition-colors text-muted-foreground",
+                      "hover:bg-destructive/10 hover:text-destructive",
+                      // Right-align the action cluster when there's no
+                      // reconnect button to carry the ml-auto.
+                      onReconnect ? "" : "ml-auto",
+                    )}
+                    title="Hide from this tab"
+                    aria-label={`Hide ${name} from this header`}
+                  >
+                    <X className="w-3 h-3" />
+                  </div>
+                )}
+                {isSelected && (
+                  // The panel fill, climbing from the foot to the head of the
+                  // sheet when you pick it. It is the same colour the tab
+                  // rests at, so the sweep IS the state arriving, not a tint
+                  // passing over it. Sits behind the content (`-z-10` inside
+                  // the button's own `isolate` context) so it never paints
+                  // over the label, and over the tab's --chrome-control base
+                  // so the part it hasn't reached yet still reads as an idle
+                  // sheet rather than a hole in the strip.
+                  <span
+                    aria-hidden
+                    className="pointer-events-none absolute inset-0 -z-10 bg-background animate-server-tab-fill-rise"
+                  />
+                )}
+              </button>
+            );
+          })}
+
+          {/* Add Server Button */}
+          <button
+            onClick={() => {
+              if (onAddServerRequested) {
+                onAddServerRequested();
+                return;
+              }
+              setIsAddModalOpen(true);
+            }}
+            className={cn(
+              "group relative flex h-[calc(100%-6px)] items-center gap-3 px-4 cursor-pointer",
+              "rounded-t-lg border border-b-0 transition-all duration-200",
+              // Not a tab, so it never wears the panel fill — it stays on the
+              // chrome and only lights up on hover.
+              "hover:bg-chrome-hover hover:text-foreground",
+              // Same text colour as the server tabs beside it. It was muted,
+              // which on the linen ground read as disabled rather than as the
+              // secondary action it is; the dashed border already says "not a
+              // server".
+              "text-foreground border-dashed border-chrome-control-border",
+            )}
+          >
+            {isMultiSelectEnabled && (
+              <div className="w-4 h-4" /> // Spacer for alignment
+            )}
+            <span className="text-sm font-medium">Add Server</span>
+            <div className="text-xs opacity-70">+</div>
+          </button>
+        </div>
+
+        <AddServerModal
+          isOpen={isAddModalOpen}
+          onClose={() => setIsAddModalOpen(false)}
+          onSubmit={(formData) => {
+            track("connecting_server", {
+              location: "active_server_selector",
+            });
+            onConnect(formData);
+          }}
+        />
+
+        {canScrollLeft && (
+          <button
+            className="absolute left-0 top-0 h-full px-3 flex items-center bg-gradient-to-r from-background via-background/95 to-background/40 cursor-pointer"
+            onClick={() => scroll("left")}
+            aria-label="Scroll left"
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+        )}
+        {canScrollRight && (
+          <button
+            className="absolute right-0 top-0 h-full px-3 flex items-center bg-gradient-to-l from-background via-background/95 to-background/40 cursor-pointer"
+            onClick={() => scroll("right")}
+            aria-label="Scroll right"
+          >
+            <ChevronRight className="h-5 w-5" />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

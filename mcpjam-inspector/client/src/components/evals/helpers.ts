@@ -1,0 +1,1816 @@
+import {
+  CommitGroup,
+  EvalCase,
+  EvalIteration,
+  EvalIterationCostBasis,
+  EvalSuite,
+  EvalSuiteOverviewEntry,
+  EvalSuiteRun,
+  EvalSuiteConfigTest,
+  RunClientDescriptor,
+  SuiteAggregate,
+  TagGroupAggregate,
+} from "./types";
+import { computeIterationResult } from "./pass-criteria";
+import { toast } from "sonner";
+import { RESULT_STATUS } from "./constants";
+import { getBillingErrorMessage } from "@/lib/billing-entitlements";
+import { clientDisplayName } from "@/lib/client-display-name";
+import { findHostStyle, type HostThemeMode } from "@/lib/client-styles";
+import {
+  getScenarioHostLabel,
+  getScenarioHostLogo,
+} from "@/lib/scenario-client-style";
+
+/**
+ * What servers can this suite see at run-time? Mirrors the precedence
+ * `startTestSuiteRun` applies server-side (testSuites.ts ~4584):
+ *
+ *   1. `suite.serverAttachment` (standalone) — overrides EVERYTHING for
+ *      ALL hosts. Per-host picks and the legacy flat `environment.servers`
+ *      list are inert when this is set.
+ *   2. Per-host `hostAttachments[].resolvedServerNames` ∪ legacy
+ *      `environment.servers`.
+ *
+ * Without the standalone short-circuit, a suite that had a per-host
+ * attachment carrying old servers (e.g. seeded at suite-create time)
+ * and later got a narrower standalone picked still gates "Run all" /
+ * per-case Run on the shadowed per-host set — including any OAuth
+ * servers in there, which surfaces as a spurious "Re-authenticate with
+ * <staging>" toast even though the active attachment doesn't use them.
+ */
+export function getEffectiveSuiteServers(
+  // Accept a structurally narrower suite than the full `EvalSuite`: some
+  // call sites (the test-case overview's lightweight Convex row) carry
+  // an optional `environment.servers` rather than the required shape.
+  // The body already optional-chains both fields, so widening the param
+  // is safe and avoids forcing every caller to assert into a stricter
+  // type than it actually has.
+  suite: {
+    environment?: { servers?: string[] } | undefined;
+    hostAttachments?: EvalSuite["hostAttachments"];
+    serverAttachment?: EvalSuite["serverAttachment"];
+    environmentTargets?: EvalSuite["environmentTargets"];
+  },
+): string[] {
+  // An ENVIRONMENT suite's servers are its environments' — the legacy fields
+  // below are not read by its runs. This is every server ANY of its runs
+  // touches (for filters and summaries); a surface acting on one run uses
+  // that environment's own list (`suiteEnvironmentTargets`).
+  if (suite.environmentTargets?.length) {
+    return Array.from(
+      new Set(suite.environmentTargets.flatMap((target) => target.serverNames)),
+    );
+  }
+  if (suite.serverAttachment) {
+    return Array.from(
+      new Set(suite.serverAttachment.resolvedServerNames ?? []),
+    );
+  }
+  const flatServers = suite.environment?.servers ?? [];
+  const hostAttachmentServers =
+    suite.hostAttachments?.flatMap(
+      (attachment) => attachment.resolvedServerNames ?? [],
+    ) ?? [];
+  if (hostAttachmentServers.length === 0) {
+    return flatServers;
+  }
+  return Array.from(new Set([...flatServers, ...hostAttachmentServers]));
+}
+
+export type SuiteHostRunPlan = {
+  namedHostId?: string;
+  hostName: string | null;
+  serverIds: string[];
+};
+
+function suiteDefaultRunPlan(serverIds: string[]): SuiteHostRunPlan {
+  // Defensive mixed-version fallback; the backend now attaches a default client.
+  return {
+    namedHostId: undefined,
+    hostName: null,
+    serverIds,
+  };
+}
+
+function hostAttachmentRunPlan(
+  attachment: NonNullable<EvalSuite["hostAttachments"]>[number],
+  fallbackServerIds: string[],
+  useAttachmentServerIds = true,
+): SuiteHostRunPlan {
+  return {
+    namedHostId: attachment.namedHostId,
+    hostName: attachment.hostName ?? "host",
+    serverIds:
+      useAttachmentServerIds && attachment.resolvedServerNames.length > 0
+        ? attachment.resolvedServerNames
+        : fallbackServerIds,
+  };
+}
+
+export function buildSuiteHostRunPlans(
+  suite: {
+    environment?: { servers?: string[] } | undefined;
+    hostAttachments?: EvalSuite["hostAttachments"];
+    serverAttachment?: EvalSuite["serverAttachment"];
+  },
+  fallbackServerIds = getEffectiveSuiteServers(suite),
+): SuiteHostRunPlan[] {
+  const suiteServerIds = fallbackServerIds;
+  const attachments = suite.hostAttachments ?? [];
+  const useAttachmentServerIds = !suite.serverAttachment;
+  if (attachments.length === 0) {
+    return [suiteDefaultRunPlan(suiteServerIds)];
+  }
+  return attachments.map((attachment) =>
+    hostAttachmentRunPlan(attachment, suiteServerIds, useAttachmentServerIds),
+  );
+}
+
+export type SuiteRunPlan = SuiteHostRunPlan & {
+  /** Set on environment plans; forwarded on the run request wire. */
+  environmentId?: string;
+  /** Display-only (toasts/labels); the server re-resolves authoritatively. */
+  environmentName?: string;
+};
+
+/**
+ * Run-all fan-out plans. When the suite has attached project environments,
+ * the ENVIRONMENT axis replaces the host axis: one plan per environment, in
+ * attach order, carrying `{environmentId, environmentName}` ONLY —
+ * `serverIds` stays EMPTY because `listEnvironments` intentionally returns
+ * pointers, not a closed execution set. The Inspector server performs the
+ * authoritative resolution (P0.1 `resolveEnvironmentForLaunch`) and returns
+ * a readable auth/connection error for that exact closed set; any browser
+ * readiness check is advisory only. Suites without environments delegate to
+ * {@link buildSuiteHostRunPlans} unchanged.
+ */
+export function buildSuiteRunPlans(
+  suite: {
+    environment?: { servers?: string[] } | undefined;
+    hostAttachments?: EvalSuite["hostAttachments"];
+    serverAttachment?: EvalSuite["serverAttachment"];
+    environmentIds?: string[];
+  },
+  environments?: Array<{ environmentId: string; name: string }>,
+  fallbackServerIds?: string[],
+): SuiteRunPlan[] {
+  const envIds = suite.environmentIds ?? [];
+  if (envIds.length > 0) {
+    return envIds.map((environmentId) => ({
+      namedHostId: undefined,
+      hostName: null,
+      serverIds: [],
+      environmentId,
+      environmentName:
+        environments?.find((e) => e.environmentId === environmentId)?.name ??
+        environmentId,
+    }));
+  }
+  return buildSuiteHostRunPlans(suite, fallbackServerIds);
+}
+
+/**
+ * Number of plans `buildSuiteRunPlans` produces for this suite — it delegates and
+ * reads `.length`, so parity holds by construction. Used by the pre-run credit
+ * estimate to tell the backend how wide the Run-all fan-out is (environments,
+ * then hosts, then the single default plan).
+ *
+ * Kept immediately beside `buildSuiteRunPlans` and covered by a parity test
+ * against `buildSuiteRunPlans(...).length`: if the plan shape ever gains another
+ * axis, a count that silently lags would understate every estimate.
+ */
+export function countSuiteRunPlans(
+  suite: {
+    environment?: { servers?: string[] } | undefined;
+    hostAttachments?: EvalSuite["hostAttachments"];
+    serverAttachment?: EvalSuite["serverAttachment"];
+    environmentIds?: string[];
+  },
+  environments?: Array<{ environmentId: string; name: string }>,
+  fallbackServerIds?: string[],
+): number {
+  return buildSuiteRunPlans(suite, environments, fallbackServerIds).length;
+}
+
+export function getSelectedSuiteHostRunPlan(
+  suite: {
+    environment?: { servers?: string[] } | undefined;
+    hostAttachments?: EvalSuite["hostAttachments"];
+    serverAttachment?: EvalSuite["serverAttachment"];
+  },
+  namedHostId: string | undefined,
+): SuiteHostRunPlan {
+  const suiteServerIds = getEffectiveSuiteServers(suite);
+  const attachment = namedHostId
+    ? suite.hostAttachments?.find(
+        (candidate) => candidate.namedHostId === namedHostId,
+      )
+    : null;
+  if (!attachment) {
+    return suiteDefaultRunPlan(suiteServerIds);
+  }
+  return hostAttachmentRunPlan(
+    attachment,
+    suiteServerIds,
+    !suite.serverAttachment,
+  );
+}
+
+export function formatTime(ts?: number) {
+  return ts ? new Date(ts).toLocaleString() : "—";
+}
+
+export function getIterationRecencyTimestamp(
+  iteration: Pick<EvalIteration, "updatedAt" | "startedAt" | "createdAt">,
+) {
+  return iteration.updatedAt ?? iteration.startedAt ?? iteration.createdAt ?? 0;
+}
+
+export function formatDuration(durationMs: number) {
+  if (durationMs < 1000) {
+    return `${durationMs}ms`;
+  }
+
+  const totalSeconds = Math.round(durationMs / 1000);
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+export function formatRunId(runId: string): string {
+  // Format Convex ID for display (e.g., "j1234567890abcdef" -> "j1234567")
+  return runId.substring(0, 8);
+}
+
+// ─── Run execution context (Project Environments, Phase 3) ───────────────────
+
+/**
+ * The launch provenance the context helpers below read. Structurally narrower
+ * than `EvalSuiteRun` on purpose: case-history and rail code carries partial
+ * run rows, and callers only need the descriptor and launch context.
+ *
+ * NOTE `configSnapshot.environment` (the flat `{ servers }` bag) is a THIRD,
+ * unrelated meaning of the word "environment" — a raw server-name list. It is
+ * deliberately not read here; only `configSnapshot.environmentRef` identifies
+ * a Project Environment.
+ */
+export type RunContextSource = {
+  namedHostId?: string;
+  client?: RunClientDescriptor | null;
+  configSnapshot?: {
+    environmentRef?: {
+      environmentId: string;
+      name: string;
+      revision: number;
+    };
+  };
+};
+
+/** The Project Environment this run resolved at start, or `null` (legacy run). */
+export function runEnvironmentRef(
+  run: RunContextSource,
+): NonNullable<
+  NonNullable<RunContextSource["configSnapshot"]>["environmentRef"]
+> | null {
+  return run.configSnapshot?.environmentRef ?? null;
+}
+
+/**
+ * Execution-client identity, independent of the environment that selected it.
+ * A historical style or SDK harness is a valid comparison key without a host ID.
+ */
+export type RunClientIdentity = {
+  name: string;
+  hostStyle?: string;
+  key: string;
+  source: RunClientDescriptor["source"] | "unknown";
+  namedHostId?: string;
+};
+
+export function runClientIdentity(
+  run: RunContextSource,
+  hostNamesById?: ReadonlyMap<string, string | null>,
+): RunClientIdentity {
+  const client = run.client;
+  const namedHostId = client?.namedHostId ?? run.namedHostId;
+  if (client) {
+    const hostStyle = client.hostStyle?.trim();
+    // Use the persisted style, not the inspector's default: the backend's
+    // historical fallback is Claude while the inspector defaults to MCPJam.
+    const name =
+      (client.versionId
+        ? client.name.trim()
+        : namedHostId && hostNamesById?.get(namedHostId)?.trim()) ||
+      (client.source === "suite_default" && findHostStyle(hostStyle)
+        ? getScenarioHostLabel(hostStyle!)
+        : client.name.trim()) ||
+      "Client";
+    return {
+      name,
+      hostStyle,
+      namedHostId,
+      source: client.source,
+      key: namedHostId
+        ? `host:${namedHostId}`
+        : client.source === "sdk"
+          ? "sdk"
+          : `style:${hostStyle || "unknown"}`,
+    };
+  }
+  if (namedHostId)
+    return {
+      name: hostNamesById?.get(namedHostId)?.trim() || formatRunId(namedHostId),
+      namedHostId,
+      key: `host:${namedHostId}`,
+      source: "unknown",
+    };
+  return { name: "Suite default", key: "style:unknown", source: "unknown" };
+}
+
+export function runClientLogo(
+  run: RunContextSource,
+  theme?: HostThemeMode,
+): string | undefined {
+  const style = runClientIdentity(run).hostStyle;
+  return style && findHostStyle(style)
+    ? getScenarioHostLogo(style, undefined, theme)
+    : undefined;
+}
+
+export function snapshotTestModels(
+  test: Pick<EvalSuiteConfigTest, "models" | "model" | "provider">,
+): Array<{ model: string; provider: string }> {
+  if (Array.isArray(test.models))
+    return test.models.filter((entry) => Boolean(entry.model));
+  return test.model
+    ? [{ model: test.model, provider: test.provider ?? "" }]
+    : [];
+}
+
+/** Context groups retain environment identity, never its mutable revision. */
+export function runContextKey(run: RunContextSource): string {
+  const ref = runEnvironmentRef(run);
+  return ref ? `environment:${ref.environmentId}` : runClientIdentity(run).key;
+}
+
+/**
+ * The run's resolved HOST name only — never its environment name. Falls back to
+ * a truncated host id or the descriptor's durable name for historical runs.
+ *
+ * This is the branch the `project-environments-enabled` kill-switch falls back
+ * to. An old environment-backed run without a resolved host or descriptor
+ * yields `null` so its environment name cannot leak through a host chip.
+ */
+export function runHostLabel(
+  run: RunContextSource,
+  hostNamesById?: Map<string, string | null>,
+): string | null {
+  // A run that names no client at all stays null rather than borrowing
+  // `runClientIdentity`'s "Suite default" placeholder. That string is a label
+  // for a client the run DOES have and could not name; handing it back here
+  // would invent a host for rows that never recorded one, and callers read a
+  // non-null label as "this run ran somewhere nameable" — one of them turns it
+  // into a client filter option.
+  if (!run.client && !run.namedHostId) return null;
+  return runClientIdentity(run, hostNamesById).name;
+}
+
+/**
+ * Display name for a run's context: the environment name for environment-backed
+ * runs, the resolved host name (falling back to a truncated id) for legacy runs.
+ * A run that names neither gets the neutral "Suite default" placeholder rather
+ * than `null` — a context chip always says something. Callers that want to show
+ * their own text instead (a count, say) must read {@link runHostLabel}, which
+ * DOES return `null` there.
+ *
+ * This CAN return environment identity, so every call site must sit behind
+ * `project-environments-enabled`; the flag-off branch uses
+ * {@link runHostLabel} instead.
+ */
+export function runContextLabel(
+  run: RunContextSource,
+  hostNamesById?: Map<string, string | null>,
+): string | null {
+  const ref = runEnvironmentRef(run);
+  if (ref) return ref.name;
+  // A context chip always says something, so a run that names no client falls
+  // back to the neutral placeholder. `runHostLabel` deliberately does not —
+  // see the note there.
+  return (
+    runHostLabel(run, hostNamesById) ??
+    runClientIdentity(run, hostNamesById).name
+  );
+}
+
+/**
+ * The exact revision this run pinned, e.g. `"rev 4"`. Belongs on an individual
+ * RUN row only — a group header spans many revisions and must never claim one
+ * arbitrary revision of them.
+ */
+export function runRevisionLabel(run: RunContextSource): string | null {
+  const ref = runEnvironmentRef(run);
+  return ref ? `rev ${ref.revision}` : null;
+}
+
+/**
+ * `namedHostId` → display name across every host a suite surface can name: the
+ * suite's attachments (authoritative label) plus the project host list, which
+ * is the ONLY source for a host with no attachment — notably the host an
+ * environment-backed run resolved to.
+ */
+export function buildHostNamesById(
+  attachments:
+    Array<{ namedHostId: string; hostName: string | null }> | undefined,
+  projectHosts:
+    Array<{ hostId: string; name: string; displayName?: string }> | undefined,
+): Map<string, string | null> {
+  const map = new Map<string, string | null>();
+  const projectHostById = new Map(
+    (projectHosts ?? []).map((host) => [host.hostId, host]),
+  );
+  for (const host of projectHosts ?? []) {
+    map.set(host.hostId, clientDisplayName(host));
+  }
+  for (const attachment of attachments ?? []) {
+    const projectHost = projectHostById.get(attachment.namedHostId);
+    const attachmentMatchesRawName =
+      projectHost !== undefined &&
+      attachment.hostName?.trim().toLowerCase() ===
+        projectHost.name.trim().toLowerCase();
+    map.set(
+      attachment.namedHostId,
+      projectHost && (attachment.hostName === null || attachmentMatchesRawName)
+        ? clientDisplayName(projectHost)
+        : (attachment.hostName ?? map.get(attachment.namedHostId) ?? null),
+    );
+  }
+  return map;
+}
+
+/** Distinct context keys across a set of runs, in first-seen order. */
+export function runContextKeys(runs: RunContextSource[]): string[] {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const run of runs) {
+    const key = runContextKey(run);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
+/** True when any run in the set launched against a Project Environment. */
+export function hasEnvironmentRun(runs: RunContextSource[]): boolean {
+  return runs.some((run) => runEnvironmentRef(run) !== null);
+}
+
+/**
+ * Group-level revision summary — a RANGE or count, never a single arbitrary
+ * revision. `"rev 4"` only when every environment run in the group agrees;
+ * `"rev 2–7"` when they span. `null` when the group has no environment runs.
+ */
+export function runContextRevisionSummary(
+  runs: RunContextSource[],
+): string | null {
+  const revisions = runs
+    .map((run) => runEnvironmentRef(run)?.revision)
+    .filter((revision): revision is number => typeof revision === "number");
+  if (revisions.length === 0) return null;
+  const min = Math.min(...revisions);
+  const max = Math.max(...revisions);
+  return min === max ? `rev ${min}` : `rev ${min}–${max}`;
+}
+
+/**
+ * The launch-time environment-drift 409 (`ENVIRONMENT_REVISION_CONFLICT`),
+ * distinguished from a generic run failure so the retry-able cause is visible.
+ * Returns the server's readable message ("Environment changed — retry the run.")
+ * or `null` when this isn't a drift conflict.
+ */
+export function getEnvironmentConflictMessage(error: unknown): string | null {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (code !== "ENVIRONMENT_REVISION_CONFLICT") return null;
+  const message = error instanceof Error ? error.message : null;
+  return message && message.length > 0
+    ? message
+    : "Environment changed since the suite was configured — retry the run.";
+}
+
+/**
+ * Compute summary statistics for a list of iterations
+ */
+export function computeIterationSummary(items: EvalIteration[]) {
+  const summary = {
+    runs: items.length,
+    passed: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+    tokens: 0,
+    avgDuration: null as number | null,
+  };
+
+  let totalDuration = 0;
+  let durationCount = 0;
+
+  items.forEach((iteration) => {
+    if (iteration.result === "passed") summary.passed += 1;
+    else if (iteration.result === "failed") summary.failed += 1;
+    else if (iteration.result === "cancelled") summary.cancelled += 1;
+    // A timed-out iteration is terminal; without an explicit verdict it counts
+    // as failed, not pending.
+    else if (iteration.status === "timed_out") summary.failed += 1;
+    else summary.pending += 1;
+
+    summary.tokens += iteration.tokensUsed || 0;
+
+    const startedAt = iteration.startedAt ?? iteration.createdAt;
+    const completedAt = iteration.updatedAt ?? iteration.createdAt;
+    if (startedAt && completedAt) {
+      const duration = Math.max(completedAt - startedAt, 0);
+      totalDuration += duration;
+      durationCount += 1;
+    }
+  });
+
+  if (durationCount > 0) {
+    summary.avgDuration = totalDuration / durationCount;
+  }
+
+  return summary;
+}
+
+/**
+ * Get the template key for a test case or config test
+ * Falls back to a unique identifier if no explicit template key exists
+ */
+export function getTemplateKey(test: {
+  testTemplateKey?: string;
+  title?: string;
+  query?: string;
+  _id?: string;
+}): string {
+  if (test.testTemplateKey) return test.testTemplateKey;
+  if (test._id) return `fallback:${test._id}`;
+  return `fallback:${test.title}-${test.query}`;
+}
+
+export function aggregateSuite(
+  _suite: EvalSuite,
+  cases: EvalCase[],
+  iterations: EvalIteration[],
+): SuiteAggregate {
+  // Backend already filters iterations by suite, so we use them directly
+  const totals = iterations.reduce(
+    (acc, it) => {
+      const result = computeIterationResult(it);
+      if (result === "pending") {
+        acc.pending += 1;
+      } else if (result === "passed") {
+        acc.passed += 1;
+      } else if (result === "failed") {
+        acc.failed += 1;
+      } else if (result === "cancelled") {
+        acc.cancelled += 1;
+      }
+      acc.tokens += it.tokensUsed || 0;
+      return acc;
+    },
+    { passed: 0, failed: 0, cancelled: 0, pending: 0, tokens: 0 },
+  );
+
+  const byCaseMap = new Map<string, SuiteAggregate["byCase"][number]>();
+  for (const it of iterations) {
+    const id = it.testCaseId;
+    if (!id) continue;
+    if (!byCaseMap.has(id)) {
+      const c = cases.find((x) => x._id === id);
+      const caseIterations = iterations.filter(
+        (iter) => iter.testCaseId === id,
+      );
+      const snapshots = caseIterations
+        .map((iter) => iter.testCaseSnapshot)
+        .filter((snapshot): snapshot is NonNullable<typeof snapshot> =>
+          Boolean(snapshot?.model || snapshot?.provider),
+        );
+      // ONE representative iteration for the whole row. Title and model must be
+      // read from the SAME iteration: sourcing the title from the first
+      // iteration and the model from the last snapshot-bearing one shows a
+      // renamed-then-rerun case under its old title beside its new model, a
+      // pairing that never existed. Falls back to this iteration's own snapshot
+      // when none carries a model, which is the title source either way.
+      const representativeSnapshot =
+        snapshots.length > 0
+          ? snapshots[snapshots.length - 1]
+          : it.testCaseSnapshot;
+      // Key EVERY iteration, not only the snapshot-bearing ones. A case whose
+      // iterations mix snapshot rows with pre-snapshot rows is still a mix: the
+      // legacy rows are labelled from the case's CURRENT model, so keying only
+      // the snapshots collapses `snapshotKeys` to one entry and stamps the whole
+      // row with the snapshot's model while the counters below fold in
+      // iterations that ran a different one. Each legacy row keys under the
+      // fallback the label would use for it, so the two agree by construction.
+      const modelKeys = new Set(
+        caseIterations.map((iter) => {
+          const snapshot = iter.testCaseSnapshot;
+          return JSON.stringify(
+            snapshot?.model || snapshot?.provider
+              ? [snapshot.provider ?? "", snapshot.model ?? ""]
+              : [c?.models?.[0]?.provider ?? "", c?.models?.[0]?.model ?? ""],
+          );
+        }),
+      );
+      const hasMixedModels = modelKeys.size > 1;
+      // Count total iterations for this test case
+      const totalRuns = caseIterations.length;
+      // THE ITERATION'S OWN SNAPSHOT WINS over the case's current definition.
+      // A case's authored `models[0]` is what it would run TODAY; an
+      // environment-backed run executes the environment's model instead, and a
+      // later edit to either can move the authored list. Labelling history
+      // from the live case therefore relabels finished runs with a model they
+      // never used.
+      //
+      // The fallback is for pre-snapshot rows only: those predate environment
+      // overrides, so their case's current model is the best available answer.
+      //
+      // SCOPE, unchanged by this: `byCase` is ONE ROW PER CASE, folding every
+      // iteration handed to `aggregateSuite` — which, when the caller passes
+      // iterations from more than one run, can span two models. The label then
+      // comes from ONE representative iteration while the counts cover all of
+      // them (the explicit `multiple` marker below is what keeps that from
+      // reading as a claim). That is a pre-existing property of the shape,
+      // not something the snapshot introduces (the live case's `models[0]` was
+      // equally single-valued), and narrowing it means giving `byCase` a
+      // run/model key — a change to the type every caller renders. Callers that
+      // need per-model rows should aggregate one run at a time.
+      byCaseMap.set(id, {
+        testCaseId: id,
+        title: representativeSnapshot?.title || c?.title || "Untitled",
+        // A suite can legitimately contain the same case under multiple
+        // environment models. Never label the combined counters with whichever
+        // snapshot happened to be visited first; surface an explicit mixed
+        // marker until the UI has a per-model aggregate view.
+        provider: hasMixedModels
+          ? "multiple"
+          : representativeSnapshot?.provider || c?.models?.[0]?.provider || "",
+        model: hasMixedModels
+          ? "multiple"
+          : representativeSnapshot?.model || c?.models?.[0]?.model || "",
+        runs: totalRuns,
+        passed: 0,
+        failed: 0,
+        cancelled: 0,
+        tokens: 0,
+      });
+    }
+    const entry = byCaseMap.get(id)!;
+    const result = computeIterationResult(it);
+    if (result === "pending") {
+      // do not count pending/running
+    } else if (result === "passed") {
+      entry.passed += 1;
+    } else if (result === "failed") {
+      entry.failed += 1;
+    } else if (result === "cancelled") {
+      entry.cancelled += 1;
+    }
+    entry.tokens += it.tokensUsed || 0;
+  }
+
+  return {
+    filteredIterations: iterations,
+    totals,
+    byCase: Array.from(byCaseMap.values()),
+  };
+}
+
+/**
+ * Sort Explore cases: failures first, then "warning" tier (pending/running, no result yet,
+ * cancelled-only, or negative tests), then passes. Ties break by title.
+ */
+export function sortExploreCasesBySignal(
+  cases: EvalCase[],
+  aggregate: SuiteAggregate | null,
+  iterations: EvalIteration[],
+): EvalCase[] {
+  const byCaseId = new Map(
+    aggregate?.byCase.map((row) => [row.testCaseId, row]) ?? [],
+  );
+
+  const latestIterationForCase = (
+    testCaseId: string,
+  ): EvalIteration | undefined => {
+    const forCase = iterations.filter((i) => i.testCaseId === testCaseId);
+    if (forCase.length === 0) return undefined;
+    return forCase.reduce((a, b) =>
+      (a.updatedAt ?? 0) >= (b.updatedAt ?? 0) ? a : b,
+    );
+  };
+
+  const signalRank = (c: EvalCase): number => {
+    const row = byCaseId.get(c._id);
+    if (row && row.failed > 0) return 0;
+
+    const latest = latestIterationForCase(c._id);
+    if (!latest) return 1;
+
+    const computed = computeIterationResult(latest);
+    if (computed === "failed") return 0;
+    if (computed === "pending") return 1;
+    if (computed === "cancelled") return 1;
+    if (c.isNegativeTest) return 1;
+    return 2;
+  };
+
+  return [...cases].sort((a, b) => {
+    const ra = signalRank(a);
+    const rb = signalRank(b);
+    if (ra !== rb) return ra - rb;
+    return (a.title || "").localeCompare(b.title || "");
+  });
+}
+
+/**
+ * Centralized error handling for mutations
+ */
+export function handleMutationError(error: unknown, action: string) {
+  console.error(`Failed to ${action}:`, error);
+  toast.error(getBillingErrorMessage(error, `Failed to ${action}`));
+}
+
+/**
+ * Centralized success toast
+ */
+export function handleMutationSuccess(message: string) {
+  toast.success(message);
+}
+
+/**
+ * Format a percentage
+ */
+export function formatPercentage(value: number): string {
+  return `${Math.round(value)}%`;
+}
+
+/**
+ * Format token count
+ */
+export function formatTokens(tokens: number): string {
+  return tokens > 0 ? tokens.toLocaleString() : "—";
+}
+
+/**
+ * Left `border-l-2` accents — parity with pre–#1602 `getIterationBorderColor` stripes
+ * (`bg-success/50`, `bg-destructive/50`, `bg-warning/50`, …).
+ */
+export function evalStatusLeftBorderClasses(result: string): string {
+  switch (result) {
+    case RESULT_STATUS.PASSED:
+      return "border-l-success/50";
+    case RESULT_STATUS.FAILED:
+      return "border-l-destructive/50";
+    case RESULT_STATUS.PENDING:
+    case "running":
+    case "grading":
+      return "border-l-warning/50";
+    case RESULT_STATUS.CANCELLED:
+      return "border-l-muted";
+    case "mixed":
+    // Amber, alongside the other "no verdict" states: an unmeasurable run is
+    // not a failing one.
+    case "inconclusive":
+      return "border-l-warning/50";
+    default:
+      return "border-l-muted-foreground/50";
+  }
+}
+
+/**
+ * Thin vertical strip fills — same opacity/hue as {@link evalStatusLeftBorderClasses}
+ * (`bg-success/50`, `bg-destructive/50`, `bg-warning/50`) so nested rows match parent rails.
+ */
+export function evalStatusMiniBarClasses(result: string): string {
+  switch (result) {
+    case RESULT_STATUS.PASSED:
+      return "bg-success/50";
+    case RESULT_STATUS.FAILED:
+      return "bg-destructive/50";
+    case RESULT_STATUS.PENDING:
+    case "running":
+    case "grading":
+      return "bg-warning/50 animate-pulse";
+    case RESULT_STATUS.CANCELLED:
+      return "bg-muted-foreground/50";
+    case "mixed":
+      return "bg-warning/50";
+    default:
+      return "bg-muted-foreground/50";
+  }
+}
+
+/** Left `border-l-*` for a suite overview row from `latestRun`. */
+export function evalOverviewEntryLeftBorderClass(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) return "border-l-transparent";
+  if (r.status === "running" || r.status === "pending") {
+    return evalStatusLeftBorderClasses(RESULT_STATUS.PENDING);
+  }
+  if (r.result === "passed") {
+    return evalStatusLeftBorderClasses(RESULT_STATUS.PASSED);
+  }
+  if (r.result === "failed") {
+    return evalStatusLeftBorderClasses(RESULT_STATUS.FAILED);
+  }
+  if (r.result === "inconclusive") {
+    return evalStatusLeftBorderClasses("inconclusive");
+  }
+  return "border-l-muted-foreground/35";
+}
+
+export function evalOverviewEntryMiniBarClass(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) return "bg-muted-foreground/25";
+  if (r.status === "running" || r.status === "pending") {
+    return "bg-warning/50 animate-pulse";
+  }
+  if (r.result === "passed") {
+    return "bg-success/50";
+  }
+  if (r.result === "failed") return "bg-destructive/50";
+  if (r.result === "inconclusive") return "bg-warning/50";
+  return "bg-muted-foreground/50";
+}
+
+/**
+ * Selected nested suite row — borders use the same `/50` rails as the parent
+ * {@link evalOverviewEntryLeftBorderClass}.
+ */
+/** Selected nested row: inset ring + tint so left status border stays the outcome rail. */
+export function evalOverviewEntrySelectedRowClass(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) {
+    return "bg-primary/10 ring-2 ring-primary/35 ring-inset";
+  }
+  if (r.status === "running" || r.status === "pending") {
+    return "bg-warning/10 ring-2 ring-warning/40 ring-inset";
+  }
+  if (r.result === "passed") {
+    return "bg-success/10 ring-2 ring-success/40 ring-inset";
+  }
+  if (r.result === "failed") {
+    return "bg-destructive/10 ring-2 ring-destructive/35 ring-inset";
+  }
+  return "bg-primary/10 ring-2 ring-primary/35 ring-inset";
+}
+
+export function evalOverviewEntryOutcomeTitle(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) return "No runs yet";
+  if (r.status === "running" || r.status === "pending") {
+    return "Run in progress";
+  }
+  if (r.result === "passed") return "Last run passed";
+  if (r.result === "failed") return "Last run failed";
+  // Deliberately not "failed": the last run did not measure enough to decide.
+  if (r.result === "inconclusive") return "Last run inconclusive";
+  return `Last run: ${r.status}`;
+}
+
+/** Short status label for compact list rows (sidebar). */
+export function evalOverviewEntryLastRunStatusLabel(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) return "No runs yet";
+  if (r.status === "running" || r.status === "pending") return "Running";
+  if (r.result === "passed") return "Passed";
+  if (r.result === "inconclusive") return "Inconclusive";
+  if (r.result === "failed" || r.status === "failed") return "Failed";
+  if (r.result === "cancelled" || r.status === "cancelled") {
+    return "Cancelled";
+  }
+  if (r.status === "completed") return "Completed";
+  return "Unknown";
+}
+
+/** Tailwind classes for {@link evalOverviewEntryLastRunStatusLabel}. */
+export function evalOverviewEntryLastRunStatusClass(
+  entry: EvalSuiteOverviewEntry,
+): string {
+  const r = entry.latestRun;
+  if (!r) return "text-muted-foreground";
+  if (r.status === "running" || r.status === "pending") {
+    return "text-warning";
+  }
+  if (r.result === "passed") return "text-success";
+  if (r.result === "inconclusive") return "text-warning";
+  if (r.result === "failed" || r.status === "failed") {
+    return "text-destructive";
+  }
+  if (r.result === "cancelled" || r.status === "cancelled") {
+    return "text-muted-foreground";
+  }
+  return "text-muted-foreground";
+}
+
+/** Normalize API trend points (0–1 or 0–100) to 0–100 integers. */
+export function toPercentEvalTrend(value: number): number {
+  const normalized = value <= 1 ? value * 100 : value;
+  return Math.max(0, Math.min(100, Math.round(normalized)));
+}
+
+export const SUITE_PASS_RATE_TREND_VISIBLE_SEGMENTS = 12;
+
+/** When history is longer than this, show a “+N” badge with a tooltip of older points. */
+export const SUITE_PASS_RATE_TREND_BADGE_THRESHOLD = 16;
+
+export type SuitePassRateTrendDisplay = {
+  percents: number[];
+  olderHiddenCount: number;
+  showOlderRunsBadge: boolean;
+  summaryLabel: string;
+  olderPercentsTooltip: string | null;
+};
+
+/**
+ * Prepare pass-rate trend for sidebar sparklines: last N segments, optional overflow badge, summary text.
+ */
+export function formatSuitePassRateTrendForDisplay(
+  rawTrend: number[] | undefined | null,
+): SuitePassRateTrendDisplay | null {
+  if (!rawTrend?.length) return null;
+  const len = rawTrend.length;
+  const slice = rawTrend.slice(-SUITE_PASS_RATE_TREND_VISIBLE_SEGMENTS);
+  const percents = slice.map(toPercentEvalTrend);
+  const olderHiddenCount = Math.max(
+    0,
+    len - SUITE_PASS_RATE_TREND_VISIBLE_SEGMENTS,
+  );
+  const showOlderRunsBadge = len > SUITE_PASS_RATE_TREND_BADGE_THRESHOLD;
+  let good = 0;
+  for (const p of percents) {
+    if (p >= 80) good += 1;
+  }
+  const worst = Math.min(...percents);
+  const summaryLabel =
+    percents.length >= 3
+      ? `${good}/${percents.length} ≥80% · min ${worst}%`
+      : "";
+  const olderSlice =
+    olderHiddenCount > 0
+      ? rawTrend
+          .slice(0, len - SUITE_PASS_RATE_TREND_VISIBLE_SEGMENTS)
+          .map(toPercentEvalTrend)
+      : [];
+  const olderPercentsTooltip =
+    olderSlice.length > 0
+      ? `Earlier runs (pass rate %): ${olderSlice.join(", ")}`
+      : null;
+  return {
+    percents,
+    olderHiddenCount,
+    showOlderRunsBadge,
+    summaryLabel,
+    olderPercentsTooltip,
+  };
+}
+
+/**
+ * Background class for legacy `w-1` strips (pre–#1602 iteration rows).
+ */
+export function getIterationBorderColor(result: string): string {
+  switch (result) {
+    case RESULT_STATUS.PASSED:
+      return "bg-success/50";
+    case RESULT_STATUS.FAILED:
+      return "bg-destructive/50";
+    case RESULT_STATUS.CANCELLED:
+      return "bg-muted";
+    case RESULT_STATUS.PENDING:
+    case "running":
+      return "bg-warning/50";
+    default:
+      return "bg-muted-foreground/50";
+  }
+}
+
+/**
+ * Get status dot color
+ */
+export function getStatusDotColor(result: string, status?: string): string {
+  if (result === RESULT_STATUS.PASSED) return "bg-success";
+  if (result === RESULT_STATUS.FAILED) return "bg-destructive";
+  if (result === RESULT_STATUS.CANCELLED) return "bg-muted-foreground";
+  if (result === RESULT_STATUS.PENDING || status === "pending")
+    return "bg-warning";
+  if (status === "running") return "bg-warning";
+  return "bg-muted-foreground";
+}
+
+/**
+ * Formatters object for convenient access
+ */
+export const formatters = {
+  time: formatTime,
+  duration: formatDuration,
+  runId: formatRunId,
+  percentage: formatPercentage,
+  tokens: formatTokens,
+} as const;
+
+/**
+ * Order runs for commit drilldown: failed first, then running/pending, then
+ * inconclusive, then passed, then other (same ordering as the former in-panel
+ * suite list, with the undecided runs ahead of the green ones because they are
+ * the ones still asking for attention).
+ */
+export function orderCommitGroupRunsByOutcome(
+  runs: EvalSuiteRun[],
+): EvalSuiteRun[] {
+  const failed: EvalSuiteRun[] = [];
+  const running: EvalSuiteRun[] = [];
+  const inconclusive: EvalSuiteRun[] = [];
+  const passed: EvalSuiteRun[] = [];
+  const notRun: EvalSuiteRun[] = [];
+
+  for (const run of runs) {
+    if (run.status === "running" || run.status === "pending") {
+      running.push(run);
+    } else if (run.result === "failed") {
+      failed.push(run);
+    } else if (run.result === "inconclusive") {
+      inconclusive.push(run);
+    } else if (run.result === "passed") {
+      passed.push(run);
+    } else {
+      notRun.push(run);
+    }
+  }
+  return [...failed, ...running, ...inconclusive, ...passed, ...notRun];
+}
+
+/**
+ * Metric-label source for a run: CI ('sdk') runs report "Pass Rate"
+ * (per-case summary), everything else — ui/api/schedule — "Accuracy"
+ * (per-iteration). Legacy runs without `source` fall back to the suite's
+ * creation provenance.
+ */
+export function getRunMetricSource(
+  run: { source?: EvalSuiteRun["source"] } | null | undefined,
+  suiteSource?: "ui" | "sdk",
+): "ui" | "sdk" {
+  return (run?.source ?? suiteSource) === "sdk" ? "sdk" : "ui";
+}
+
+/**
+ * Suite-scoped views (hero stats, runs-table header, chart grid) label by
+ * the newest run's source — a mixed suite reads as whatever it did last.
+ */
+export function getLatestRunMetricSource(
+  runs: EvalSuiteRun[],
+  suiteSource?: "ui" | "sdk",
+): "ui" | "sdk" {
+  let latest: EvalSuiteRun | null = null;
+  let latestTs = -1;
+  for (const run of runs) {
+    const ts = run.completedAt ?? run.createdAt ?? 0;
+    if (ts > latestTs) {
+      latest = run;
+      latestTs = ts;
+    }
+  }
+  return getRunMetricSource(latest, suiteSource);
+}
+
+/**
+ * Flatten recentRuns across all suites and group by commitSha.
+ * Runs without a commitSha go into a "manual" group.
+ */
+export function groupRunsByCommit(
+  overview: EvalSuiteOverviewEntry[],
+): CommitGroup[] {
+  const buckets = new Map<
+    string,
+    { runs: EvalSuiteRun[]; suiteMap: Map<string, string> }
+  >();
+
+  for (const entry of overview) {
+    for (const run of entry.recentRuns) {
+      const sha = run.ciMetadata?.commitSha?.trim() || "";
+      // Each manual run (no commit SHA) gets its own group keyed by run ID
+      const key = sha || `__manual__${run._id}`;
+      if (!buckets.has(key)) {
+        buckets.set(key, { runs: [], suiteMap: new Map() });
+      }
+      const bucket = buckets.get(key)!;
+      bucket.runs.push(run);
+      bucket.suiteMap.set(entry.suite._id, entry.suite.name);
+    }
+  }
+
+  const groups: CommitGroup[] = [];
+  for (const [key, { runs, suiteMap }] of buckets) {
+    const isManual = key.startsWith("__manual__");
+    const summary = {
+      total: runs.length,
+      passed: 0,
+      failed: 0,
+      running: 0,
+      inconclusive: 0,
+    };
+    let latestTimestamp = 0;
+    let branch: string | null = null;
+
+    for (const run of runs) {
+      const ts = run.completedAt ?? run.createdAt;
+      if (ts > latestTimestamp) latestTimestamp = ts;
+      if (!branch && run.ciMetadata?.branch) branch = run.ciMetadata.branch;
+      // `grading` counts as running: the trials are done but the verdict is
+      // not, and a commit whose only run is held must not fall through every
+      // bucket to `passed` below.
+      if (
+        run.status === "running" ||
+        run.status === "pending" ||
+        run.status === "grading"
+      )
+        summary.running++;
+      else if (run.result === "passed") summary.passed++;
+      else if (run.result === "failed") summary.failed++;
+      else if (run.result === "inconclusive") summary.inconclusive++;
+    }
+
+    let status: CommitGroup["status"];
+    if (summary.running > 0) status = "running";
+    else if (summary.failed > 0 && summary.passed > 0) status = "mixed";
+    else if (summary.failed > 0) status = "failed";
+    // Nothing failed AND nothing passed, but something was undecided: the
+    // commit has no verdict. Falling through to `passed` here is how an
+    // unmeasurable commit gets a green rail it never earned.
+    else if (summary.inconclusive > 0 && summary.passed === 0)
+      status = "inconclusive";
+    else status = "passed";
+
+    // For manual runs, use a unique ID so each gets its own page
+    const manualId = isManual ? key.replace("__manual__", "manual-") : null;
+
+    groups.push({
+      commitSha: isManual ? manualId! : key,
+      shortSha: isManual ? "Manual" : key.slice(0, 7),
+      branch: isManual ? null : branch,
+      timestamp: latestTimestamp,
+      status,
+      runs,
+      suiteMap,
+      summary,
+    });
+  }
+
+  // Sort by most recent first, manual always last
+  groups.sort((a, b) => {
+    if (a.commitSha.startsWith("manual-")) return 1;
+    if (b.commitSha.startsWith("manual-")) return -1;
+    return b.timestamp - a.timestamp;
+  });
+
+  return groups;
+}
+
+/**
+ * Format relative time for sidebar display
+ */
+export function formatRelativeTime(timestamp?: number): string {
+  if (!timestamp) return "No runs yet";
+  const now = Date.now();
+  const diff = now - timestamp;
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(timestamp).toLocaleDateString();
+}
+
+/**
+ * Group overview entries by tag and compute aggregated stats per tag.
+ */
+export function groupSuitesByTag(
+  overview: EvalSuiteOverviewEntry[],
+): TagGroupAggregate[] {
+  const buckets = new Map<string, EvalSuiteOverviewEntry[]>();
+
+  for (const entry of overview) {
+    const tags = entry.suite.tags;
+    if (!tags || tags.length === 0) {
+      const bucket = buckets.get("Untagged") ?? [];
+      bucket.push(entry);
+      buckets.set("Untagged", bucket);
+    } else {
+      for (const tag of tags) {
+        const bucket = buckets.get(tag) ?? [];
+        bucket.push(entry);
+        buckets.set(tag, bucket);
+      }
+    }
+  }
+
+  const groups: TagGroupAggregate[] = [];
+  for (const [tag, entries] of buckets) {
+    const totals = { passed: 0, failed: 0, runs: 0 };
+    for (const e of entries) {
+      totals.passed += e.totals.passed;
+      totals.failed += e.totals.failed;
+      totals.runs += e.totals.runs;
+    }
+    const total = totals.passed + totals.failed;
+    groups.push({
+      tag,
+      suiteCount: entries.length,
+      totals,
+      passRate: total > 0 ? Math.round((totals.passed / total) * 100) : 0,
+      entries,
+    });
+  }
+
+  // Sort alphabetically, "Untagged" last
+  groups.sort((a, b) => {
+    if (a.tag === "Untagged") return 1;
+    if (b.tag === "Untagged") return -1;
+    return a.tag.localeCompare(b.tag);
+  });
+
+  return groups;
+}
+
+/**
+ * Compute a percentile from a numeric series using linear interpolation.
+ * Returns `null` for empty input. `p` is 0..1 (e.g. 0.5, 0.95).
+ *
+ * Exposed for unit tests; prefer the higher-level `iterationLatencyP50` /
+ * `iterationLatencyP95` / `iterationTokensP50` / `iterationTokensP95`
+ * helpers below for inspector code paths.
+ */
+export function percentile(values: number[], p: number): number | null {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  // Sort first so the p<=0 / p>=1 short-circuits don't spread the whole
+  // array into Math.min / Math.max (blows up past ~100k args).
+  const sorted = [...values].sort((a, b) => a - b);
+  if (p <= 0) return sorted[0];
+  if (p >= 1) return sorted[sorted.length - 1];
+  const rank = (sorted.length - 1) * p;
+  const lo = Math.floor(rank);
+  const hi = Math.ceil(rank);
+  if (lo === hi) return sorted[lo];
+  const w = rank - lo;
+  return sorted[lo] * (1 - w) + sorted[hi] * w;
+}
+
+function iterationDurationMs(it: EvalIteration): number | null {
+  const start = it.startedAt;
+  const end = it.updatedAt;
+  if (typeof start !== "number" || typeof end !== "number") return null;
+  if (end < start) return null;
+  return end - start;
+}
+
+/** p50 of per-iteration durations (ms) across `completed` iterations. */
+export function iterationLatencyP50(items: EvalIteration[]): number | null {
+  const vals = items
+    .filter((it) => it.status === "completed")
+    .map(iterationDurationMs)
+    .filter((v): v is number => v !== null);
+  return percentile(vals, 0.5);
+}
+
+/** p95 of per-iteration durations (ms) across `completed` iterations. */
+export function iterationLatencyP95(items: EvalIteration[]): number | null {
+  const vals = items
+    .filter((it) => it.status === "completed")
+    .map(iterationDurationMs)
+    .filter((v): v is number => v !== null);
+  return percentile(vals, 0.95);
+}
+
+/** p50 of `tokensUsed` across `completed` iterations. */
+export function iterationTokensP50(items: EvalIteration[]): number | null {
+  const vals = items
+    .filter((it) => it.status === "completed")
+    .map((it) => it.tokensUsed)
+    .filter((v): v is number => typeof v === "number");
+  return percentile(vals, 0.5);
+}
+
+/** p95 of `tokensUsed` across `completed` iterations. */
+export function iterationTokensP95(items: EvalIteration[]): number | null {
+  const vals = items
+    .filter((it) => it.status === "completed")
+    .map((it) => it.tokensUsed)
+    .filter((v): v is number => typeof v === "number");
+  return percentile(vals, 0.95);
+}
+
+/** Total ordering on runs: `runNumber` primary, `createdAt` as tiebreaker. */
+export function compareRunsBySequence(
+  a: EvalSuiteRun,
+  b: EvalSuiteRun,
+): number {
+  return a.runNumber - b.runNumber || a.createdAt - b.createdAt;
+}
+
+/** Highest `runNumber` among completed runs (Convex `listTestSuiteRuns` is newest-first but we still sort defensively). */
+export function pickLatestCompletedRun(
+  runs: EvalSuiteRun[],
+): EvalSuiteRun | null {
+  const completed = runs.filter((r) => r.status === "completed");
+  if (completed.length === 0) {
+    return null;
+  }
+  return completed.reduce((best, r) =>
+    r.runNumber > best.runNumber ? r : best,
+  );
+}
+
+/**
+ * Does anything about this suite pin a sandbox image for its NEXT run?
+ *
+ * Two sources, both checked: the suite's own
+ * `environment.computerEnvironmentId` (the migration-era override) and any
+ * ATTACHED project environment's pin — env-backed suites resolve their image
+ * server-side at launch, so checking only the suite field would miss exactly
+ * the suites that increasingly carry the pin. Historical runs' frozen
+ * snapshot pins are deliberately NOT consulted here: they gate REPLAY of that
+ * run, not fresh runs (see `RunDetailPlaygroundActions`).
+ */
+export function evalSuitePinsSandboxImage(
+  suite: Pick<EvalSuite, "environment" | "environmentIds">,
+  attachedEnvironments:
+    | Array<{ environmentId: string; computerEnvironmentId?: string | null }>
+    | undefined,
+): boolean {
+  if (suite.environment?.computerEnvironmentId) return true;
+  return (suite.environmentIds ?? []).some((environmentId) =>
+    Boolean(
+      (attachedEnvironments ?? []).find(
+        (environment) => environment.environmentId === environmentId,
+      )?.computerEnvironmentId,
+    ),
+  );
+}
+
+// ── Cost ────────────────────────────────────────────────────────────────────
+//
+// One formatter, one em dash rule, one place to change either. Hoisted out of
+// `run-diff-view.tsx` when cost stopped being a diff-only concern and became
+// result data on iterations, cases, runs and the metric strip.
+
+/** The em dash every surface shows when no cost was observed. */
+export const COST_UNAVAILABLE = "—";
+
+/** The smallest amount four decimals can state without rounding to zero. */
+const SMALLEST_SHOWN_COST = 0.0001;
+
+/**
+ * A cost, in dollars.
+ *
+ * Sub-cent amounts get four decimals rather than rounding to `$0.00`: a
+ * single eval iteration frequently costs a fraction of a cent, and showing it
+ * as zero is the same lie as showing an unpriced one as zero.
+ *
+ * Below what four decimals can state, the answer is a BOUND (`<$0.0001`), not
+ * a rounded zero. Four decimals alone would print `$0.0000` for a real
+ * fraction of a cent — the same lie one decimal place further down, and the
+ * one place this surface must never tell. A bound stays true at any
+ * magnitude and stays short enough for a table cell, which chasing the first
+ * significant digit of, say, 1e-9 would not.
+ */
+export function formatCost(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs > 0 && abs < SMALLEST_SHOWN_COST) {
+    // The bound points the way the number lies: a tiny negative is GREATER
+    // than -$0.0001, and `-<$0.0001` would read as neither.
+    const bound = `$${SMALLEST_SHOWN_COST.toFixed(4)}`;
+    return sign === "-" ? `>-${bound}` : `<${bound}`;
+  }
+  if (abs > 0 && abs < 0.01) {
+    return `${sign}$${abs.toFixed(4)}`;
+  }
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
+/**
+ * A cost that may not exist. `undefined` / `null` render as an em dash,
+ * NEVER as `$0.00`.
+ *
+ * This is the single rule that keeps the whole surface honest, and it is the
+ * same one the organization Usage card already applies: a cost we did not
+ * observe must not be presented as a cost of nothing.
+ */
+export function formatCostOrDash(value: number | null | undefined): string {
+  return typeof value === "number" ? formatCost(value) : COST_UNAVAILABLE;
+}
+
+/**
+ * Mean of the values that WERE measured, or `null` when none were. Callers
+ * decide which iterations count as measured before handing them over — a
+ * missing reading is not a zero.
+ */
+export function average(values: readonly number[]): number | null {
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+}
+
+/**
+ * Compact metric numbers for the run matrix and case workspace tiles:
+ * `1240` → `1.2k`, `2000` → `2k`, `1500000` → `1.5m`, `18` → `18`,
+ * `1.75` → `1.8`.
+ *
+ * Lowercase units on purpose (the matrix toggle's design), which is why this
+ * is not `Intl.NumberFormat`'s compact notation. It still has to carry the
+ * millions step the way that formatter did: without it a long agent run's
+ * token average renders as `1500k` and overflows the fixed-width tile.
+ */
+export function compactMetric(value: number): string {
+  const unit = (divisor: number, suffix: string) =>
+    `${(value / divisor).toFixed(1).replace(/\.0$/, "")}${suffix}`;
+  return value >= 1_000_000_000
+    ? unit(1_000_000_000, "b")
+    : value >= 1_000_000
+      ? unit(1_000_000, "m")
+      : value >= 1000
+        ? unit(1000, "k")
+        : Number.isInteger(value)
+          ? value.toLocaleString()
+          : value.toFixed(1);
+}
+
+/**
+ * Why this row has no cost, phrased for the person reading it.
+ *
+ * Returns `null` when a cost IS present and needs no explanation — except for
+ * a runner-reported one, which is real but not ours, and says so.
+ */
+export function costUnavailableReason(
+  basis: EvalIterationCostBasis | undefined,
+  /**
+   * The cost that IS on screen, when there is one.
+   *
+   * Without it a trial priced by an older writer — a number, but no basis
+   * recorded — got "No cost was recorded for this trial." hovering over its
+   * own price. The runner note still applies to a present cost, because that
+   * one explains whose measurement it is rather than why it is missing.
+   */
+  cost?: number | null,
+): string | null {
+  if (basis?.source === "sdk_runner") {
+    return "Reported by your runner — MCPJam did not price this run.";
+  }
+  if (typeof cost === "number") return null;
+  if (basis?.status === "estimated") return null;
+  switch (basis?.reason) {
+    case "no_pricing":
+      return "Not an MCPJam-billed model, so there is no cost to report.";
+    case "harness_mixed_models":
+      return "Harness runs mix models within a turn; their cost arrives with billed attribution.";
+    case "no_tokens":
+      return "This iteration reported no token usage.";
+    default:
+      return "No cost was recorded for this iteration.";
+  }
+}
+
+/** True when a cost figure came from a customer's runner, not from MCPJam. */
+export function isRunnerReportedCost(
+  basis: EvalIterationCostBasis | undefined,
+): boolean {
+  return basis?.source === "sdk_runner";
+}
+
+/**
+ * Total cost across iterations, with the COVERAGE that produced it.
+ *
+ * Coverage travels with the sum because the two are only meaningful
+ * together: summing the priced iterations and skipping the rest yields a
+ * number indistinguishable from a complete one, which is exactly how a
+ * partially-priced run reads as a cheap run.
+ *
+ * `totalUsd` is null when nothing was priced — not 0.
+ *
+ * A RUNNER-REPORTED iteration is INCLUDED in the total and flagged, rather
+ * than dropped. The money was spent, so excluding it would understate what
+ * the run cost — and would make the total disagree with the very rows a
+ * reader can see summing to it. What it must not do is pass silently as
+ * MCPJam's own measurement, which is what `hasRunnerReported` is for.
+ */
+export function sumIterationCost(
+  iterations: Array<Pick<EvalIteration, "usage">>,
+): {
+  totalUsd: number | null;
+  costedIterations: number;
+  totalIterations: number;
+  /** True when any contributing figure came from a customer's own runner. */
+  hasRunnerReported: boolean;
+} {
+  let totalUsd: number | null = null;
+  let costedIterations = 0;
+  let hasRunnerReported = false;
+  for (const iteration of iterations) {
+    const cost = iteration.usage?.estimatedCostUsd;
+    if (typeof cost !== "number") continue;
+    totalUsd = (totalUsd ?? 0) + cost;
+    costedIterations += 1;
+    if (isRunnerReportedCost(iteration.usage?.costBasis)) {
+      hasRunnerReported = true;
+    }
+  }
+  return {
+    totalUsd,
+    costedIterations,
+    totalIterations: iterations.length,
+    hasRunnerReported,
+  };
+}
+
+/** Per-iteration costs, for percentiles. Uncosted iterations are omitted. */
+export function iterationCosts(
+  iterations: Array<Pick<EvalIteration, "usage">>,
+): number[] {
+  return iterations
+    .map((iteration) => iteration.usage?.estimatedCostUsd)
+    .filter((value): value is number => typeof value === "number");
+}
+
+/**
+ * Statuses a run can still be cancelled from.
+ *
+ * Mirrors the backend gate in `cancelSuiteRunRows` (Convex `testSuites.ts`),
+ * which rejects anything else with `Cannot cancel run with status: …`.
+ * `grading` counts: the trials are done but the gating judge is still billing.
+ */
+export function isRunCancellable(run: { status?: string | null }): boolean {
+  return (
+    run.status === "pending" ||
+    run.status === "running" ||
+    run.status === "grading"
+  );
+}
+
+/**
+ * Ids of every still-cancellable run in `runs` — what a Cancel button hands to
+ * `handleCancelRun`. A launch fans out into one run per client-model pairing,
+ * so cancelling a launch means cancelling all of them.
+ */
+export function cancellableRunIds(
+  runs: readonly { _id: string; status?: string | null }[],
+): string[] {
+  return runs.filter(isRunCancellable).map((run) => run._id);
+}
+
+/**
+ * An environment suite's launchable targets (archived or missing
+ * environments dropped), or `null` for a legacy suite / an older backend
+ * that does not report them.
+ */
+export function suiteEnvironmentTargets(suite: {
+  environmentIds?: string[];
+  environmentTargets?: EvalSuite["environmentTargets"];
+}): NonNullable<EvalSuite["environmentTargets"]> | null {
+  if (!suite.environmentIds?.length || !suite.environmentTargets) return null;
+  return suite.environmentTargets.filter((target) => !target.unavailable);
+}
+
+/**
+ * Whether a run of this suite would connect any server. An environment suite
+ * answers from its environments (a group's servers, or a pinned plugin that
+ * contributes some), never from its legacy fields, which its runs do not
+ * read; a legacy suite answers from those fields. An environment suite whose
+ * environments this backend does not describe is not blocked here: the launch
+ * checks its servers itself.
+ */
+export function suiteHasRunnableServers(
+  suite: Parameters<typeof getEffectiveSuiteServers>[0] & {
+    environmentIds?: string[];
+    source?: EvalSuite["source"];
+  },
+): boolean {
+  // An SDK suite without environments runs in a project environment picked
+  // at launch; the run dialog checks that one has servers.
+  if (suite.source === "sdk" && !suite.environmentIds?.length) return true;
+  if (suite.environmentIds?.length) {
+    const targets = suiteEnvironmentTargets(suite);
+    return (
+      targets === null ||
+      targets.some(
+        (target) =>
+          target.serverNames.length > 0 || target.pluginVersionCount > 0,
+      )
+    );
+  }
+  return getEffectiveSuiteServers(suite).length > 0;
+}
+
+/**
+ * Which environment case generation authors against. Generating against the
+ * union of a mixed suite's tools would write cases no single environment can
+ * run, so a suite whose environments differ must name one.
+ */
+export type GenerationEnvironmentTarget =
+  | { kind: "legacy" }
+  | { kind: "environment"; environmentId: string }
+  | {
+      kind: "choose";
+      targets: NonNullable<EvalSuite["environmentTargets"]>;
+    }
+  | { kind: "none"; reason: string };
+
+export function generationEnvironmentTarget(
+  suite: {
+    environmentIds?: string[];
+    environmentTargets?: EvalSuite["environmentTargets"];
+  },
+  preferredEnvironmentId?: string | null,
+): GenerationEnvironmentTarget {
+  if (!suite.environmentIds?.length) return { kind: "legacy" };
+  const targets = suiteEnvironmentTargets(suite);
+  if (!targets) {
+    return {
+      kind: "none",
+      reason:
+        "This suite's environments are still loading, or this deployment can't describe them yet.",
+    };
+  }
+  const runnable = targets.filter(
+    (target) => target.serverNames.length > 0 || target.pluginVersionCount > 0,
+  );
+  if (runnable.length === 0) {
+    return {
+      kind: "none",
+      reason:
+        "None of this suite's environments has servers. Pick a server group in suite settings.",
+    };
+  }
+  const preferred = preferredEnvironmentId
+    ? runnable.find((target) => target.environmentId === preferredEnvironmentId)
+    : undefined;
+  if (preferred) {
+    return { kind: "environment", environmentId: preferred.environmentId };
+  }
+  // One server set across every environment (same group, no plugin pins):
+  // any of them exposes exactly the tools the others do.
+  const uniform =
+    runnable.every((target) => target.pluginVersionCount === 0) &&
+    new Set(runnable.map((target) => target.serverAttachmentId ?? "")).size ===
+      1;
+  if (runnable.length === 1 || uniform) {
+    return { kind: "environment", environmentId: runnable[0]!.environmentId };
+  }
+  return { kind: "choose", targets: runnable };
+}
+
+/**
+ * The environments a person picks between to generate cases for this suite,
+ * or `null` when there is nothing to pick: a legacy suite, a single runnable
+ * environment, or several that connect the same servers.
+ */
+export function generationEnvironmentChoices(suite: {
+  environmentIds?: string[];
+  environmentTargets?: EvalSuite["environmentTargets"];
+}): NonNullable<EvalSuite["environmentTargets"]> | null {
+  const target = generationEnvironmentTarget(suite);
+  return target.kind === "choose" ? target.targets : null;
+}
+
+/**
+ * The environment generation should send for this suite, given the saved
+ * pick: the picked (or only) environment, or `undefined` for a legacy suite.
+ * A suite that still needs a pick also answers `undefined`; the server then
+ * refuses the ambiguity instead of guessing.
+ */
+export function generationEnvironmentId(
+  suite: {
+    environmentIds?: string[];
+    environmentTargets?: EvalSuite["environmentTargets"];
+  },
+  preferredEnvironmentId?: string | null,
+): string | undefined {
+  const target = generationEnvironmentTarget(suite, preferredEnvironmentId);
+  return target.kind === "environment" ? target.environmentId : undefined;
+}
+
+type EnvironmentTarget = NonNullable<EvalSuite["environmentTargets"]>[number];
+
+/** A person-readable name for one of a suite's environments. */
+export function environmentTargetLabel(target: EnvironmentTarget): string {
+  if (target.name?.trim()) return target.name.trim();
+  return [target.hostName ?? "Client", target.modelId]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** What an environment connects, for a picker's second line. */
+export function environmentTargetServersLabel(
+  target: EnvironmentTarget,
+): string {
+  const plugins =
+    target.pluginVersionCount > 0
+      ? `${target.pluginVersionCount} plugin${
+          target.pluginVersionCount === 1 ? "" : "s"
+        }`
+      : "";
+  return (
+    [target.serverNames.join(", "), plugins].filter(Boolean).join(" + ") ||
+    "No servers"
+  );
+}
+
+/**
+ * Resolve the environment an agent's generate request names (its id, or its
+ * name as shown, ignoring case) for this suite. A legacy suite takes no
+ * environment; an environment suite whose environments connect different
+ * servers needs one, from the request or the person's saved pick.
+ */
+export function resolveGenerationEnvironmentRequest(
+  suite: {
+    environmentIds?: string[];
+    environmentTargets?: EvalSuite["environmentTargets"];
+  },
+  reference: string | undefined,
+  savedEnvironmentId: string | undefined,
+): { environmentId?: string } | { error: string } {
+  const requested = reference?.trim();
+  if (!suite.environmentIds?.length) {
+    return requested
+      ? { error: "it does not run environments. Omit 'environment'." }
+      : {};
+  }
+  const targets = suiteEnvironmentTargets(suite) ?? [];
+  const list = targets.map(environmentTargetLabel).join(", ");
+  let preferred = savedEnvironmentId;
+  if (requested) {
+    const needle = requested.toLowerCase();
+    const labelMatches = targets.filter(
+      (target) => environmentTargetLabel(target).toLowerCase() === needle,
+    );
+    const byId = targets.find((target) => target.environmentId === requested);
+    // Two environments can share a name. Picking the first would generate
+    // for whichever server set happens to sort first; make the caller say.
+    if (!byId && labelMatches.length > 1) {
+      return {
+        error: `more than one of its environments is named "${requested}". Name one by ID: ${labelMatches
+          .map((target) => target.environmentId)
+          .join(", ")}.`,
+      };
+    }
+    const match = byId ?? labelMatches[0];
+    if (!match) {
+      return {
+        error: `it has no environment "${requested}". Its environments: ${
+          list || "none"
+        }.`,
+      };
+    }
+    if (match.serverNames.length === 0 && match.pluginVersionCount === 0) {
+      return {
+        error: `its environment "${environmentTargetLabel(
+          match,
+        )}" has no servers. Pick a server group for it in suite settings.`,
+      };
+    }
+    preferred = match.environmentId;
+  }
+  const target = generationEnvironmentTarget(suite, preferred);
+  if (target.kind === "environment") {
+    return { environmentId: target.environmentId };
+  }
+  if (target.kind === "choose") {
+    return {
+      error: `its environments connect different servers. Name the one to generate for with 'environment': ${target.targets
+        .map(environmentTargetLabel)
+        .join(", ")}.`,
+    };
+  }
+  if (target.kind === "none") return { error: target.reason };
+  return {};
+}

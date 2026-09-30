@@ -1,0 +1,73 @@
+/**
+ * Shared route handler functions for resources, prompts, and tools.
+ *
+ * Pure operations come from the SDK's dedicated operations entrypoint, while
+ * inspector-specific listTools adds toolsMetadata and tokenCount.
+ *
+ * Used by both web/ and mcp/ route sets.
+ */
+
+import type { CacheMode, MCPClientManager } from "@mcpjam/sdk";
+import {
+  listResources,
+  readResource,
+  listPrompts,
+  listPromptsMulti,
+  getPrompt,
+  listTools as listToolsBase,
+} from "@mcpjam/sdk/operations";
+import {
+  countToolsTokens,
+  mapModelIdToTokenizerBackend,
+} from "./tokenizer-helpers.js";
+
+type Manager = InstanceType<typeof MCPClientManager>;
+
+export {
+  listResources,
+  readResource,
+  listPrompts,
+  listPromptsMulti,
+  getPrompt,
+};
+
+/**
+ * Inspector-enriched listTools: adds toolsMetadata and optional tokenCount
+ * on top of the SDK's pure listTools.
+ */
+export async function listTools(
+  manager: Manager,
+  params: {
+    serverId: string;
+    modelId?: string;
+    cursor?: string;
+    cacheMode?: CacheMode;
+  },
+) {
+  const result = await listToolsBase(manager, {
+    serverId: params.serverId,
+    cursor: params.cursor,
+    cacheMode: params.cacheMode,
+  });
+
+  const toolsMetadata = manager.getAllToolsMetadata(params.serverId);
+
+  const tokenizerModel = params.modelId
+    ? mapModelIdToTokenizerBackend(params.modelId)
+    : undefined;
+  const tokenCountError =
+    params.modelId && tokenizerModel === null
+      ? "Could not pre-calculate tool description tokens for this model."
+      : undefined;
+  const tokenCount =
+    params.modelId && !tokenCountError
+      ? await countToolsTokens(result.tools, params.modelId)
+      : undefined;
+
+  return {
+    ...result,
+    toolsMetadata,
+    tokenCount,
+    tokenCountError,
+  };
+}

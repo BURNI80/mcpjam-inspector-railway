@@ -1,0 +1,699 @@
+import { Hono } from "hono";
+import fixPath from "fix-path";
+import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
+import { webBodyLimit } from "./middleware/web-body-limit.js";
+import { v1BodyLimit } from "./middleware/v1-body-limit.js";
+import { logger } from "hono/logger";
+import { logger as appLogger } from "./utils/logger.js";
+import { serveStatic } from "@hono/node-server/serve-static";
+import { isSpaDocumentRequest } from "./utils/spa-document-request.js";
+import { readFileSync } from "fs";
+import { dirname } from "path";
+import { fileURLToPath } from "url";
+
+// Import routes
+import mcpRoutes from "./routes/mcp/index.js";
+import appsRoutes from "./routes/apps/index.js";
+import webRoutes from "./routes/web/index.js";
+import internalServerConnections from "./routes/internal/server-connections.js";
+import internalEvalJudgeCompletions from "./routes/internal/eval-judge-completions.js";
+import internalChatStageDerivations from "./routes/internal/chat-stage-derivations.js";
+import internalAgentTurns from "./routes/internal/agent-turns.js";
+import internalComputerBrowserDebug from "./routes/internal/computer-browser-debug.js";
+import computerBrowserPanel from "./routes/web/computer-browser-panel.js";
+import { createComputerBrowserStreamWsHandler } from "./routes/web/computer-browser-stream.js";
+import {
+  createComputerBrowserFramesWsHandler,
+  killBrowserFrameSockets,
+  shutdownBrowserFrameSockets,
+} from "./routes/web/computer-browser-frames.js";
+import { logGradingEngineModeOnce } from "./services/evals/grading-mode.js";
+import v1Routes from "./routes/v1/index.js";
+import cliAuthRoutes from "./routes/cli-auth/index.js";
+import slackLinkRoutes from "./routes/slack-link/index.js";
+import surfaceLinkRoutes from "./routes/surface-link/index.js";
+import relayRoutes, { relayBodyLimit } from "./routes/relay.js";
+import { registerXaaClientMetadataRoute } from "./routes/xaa-client-metadata.js";
+import { registerXaaConfidentialCimdRoute } from "./routes/xaa-confidential-cimd.js";
+import { createXaaWebRouter } from "./routes/web/xaa.js";
+import workosAuthkitRoutes from "./routes/workos-authkit.js";
+import { resolveWorkosApiBaseUrl } from "./services/workos-api-base.js";
+import { MCPClientManager } from "@mcpjam/sdk";
+import { initElicitationCallback } from "./routes/mcp/elicitation.js";
+import { rpcLogBus } from "./services/rpc-log-bus.js";
+import { progressStore } from "./services/progress-store.js";
+import { cacheEventLogger } from "./utils/cache-events.js";
+import { startProcessVitalsSampler } from "./utils/process-vitals.js";
+import { inspectorCommandBus } from "./services/inspector-command-bus.js";
+import { CORS_OPTIONS, HOSTED_MODE, ALLOWED_HOSTS } from "./config.js";
+import { inAppBrowserMiddleware } from "./middleware/in-app-browser.js";
+import path from "path";
+
+// Security imports
+import {
+  generateSessionToken,
+  validateToken,
+} from "./services/session-token.js";
+import {
+  mayServeGuestBootstrap,
+  isAllowedHost,
+} from "./utils/localhost-check.js";
+import { getActiveTunnelDomains } from "./services/tunnel-registry.js";
+import {
+  appendGuestSessionSetCookie,
+  buildGuestBootstrapScript,
+  mintGuestSessionForDocument,
+} from "./routes/web/guest-session-shared.js";
+import {
+  sessionAuthMiddleware,
+  scrubTokenFromUrl,
+} from "./middleware/session-auth.js";
+import { originValidationMiddleware } from "./middleware/origin-validation.js";
+import {
+  documentScriptNonce,
+  securityHeadersMiddleware,
+  withScriptNonce,
+} from "./middleware/security-headers.js";
+import { indexingHeadersMiddleware } from "./middleware/indexing-headers.js";
+import {
+  getInspectorClientRuntimeConfigScript,
+  loadInspectorEnv,
+  warnOnConvexDevMisconfiguration,
+} from "./env.js";
+import { startHostedModelCatalogRefresh } from "./services/hosted-model-catalog.js";
+import { startRevokedSessionCache } from "./services/revoked-session-cache.js";
+import { startGuestAuthProvisioningInBackground } from "./utils/convex-guest-auth-sync.js";
+import { startLocalBrowserRenderingSetupInBackground } from "./utils/browser-rendering-setup.js";
+import { startLocalHarnessJanitor } from "./utils/harness/local/scratch-janitor.js";
+import { reportLocalHarnessRuntimeStatusInBackground } from "./utils/harness/local/runtime-install.js";
+import { fetchRemoteGuestJwks } from "./utils/guest-session-source.js";
+import { INSPECTOR_MCP_RETRY_POLICY } from "./utils/mcp-retry-policy.js";
+import { negotiationTelemetryLogger } from "./utils/negotiation-telemetry.js";
+import { initXAAIdpKeyPair, setXaaIdpLogger } from "@mcpjam/sdk";
+import { requestLogContextMiddleware } from "./middleware/request-log-context.js";
+import {
+  applyHostedPartition,
+  mountHostedOpenRoutes,
+} from "./middleware/hosted-partition.js";
+import { registerSelfFetch } from "./utils/self-app.js";
+import { getInspectorFrontendUrl } from "./utils/inspector-frontend-url.js";
+import { initComputersStartup } from "./utils/computers/remote-data-plane.js";
+import { createNodeWebSocket } from "@hono/node-ws";
+import { createComputerTerminalWsHandler } from "./routes/web/computer-terminal.js";
+import {
+  createLocalComputerTerminalWsHandler,
+  killLocalComputerTerminals,
+  shutdownLocalComputerTerminals,
+} from "./routes/web/local-computer-terminal.js";
+import {
+  createLocalBrowserFramesWsHandler,
+  killLocalBrowserFrameSockets,
+  shutdownLocalBrowserFrameSockets,
+} from "./routes/web/local-browser-frames.js";
+import {
+  killLocalBrowserSessions,
+  shutdownLocalBrowserSessions,
+} from "./services/browserd/local/local-browser-session.js";
+import {
+  createWebMcpFramesWsHandler,
+  killWebMcpFrameSockets,
+  shutdownWebMcpFrameSockets,
+} from "./routes/web/webmcp-frames.js";
+import { createComputerUploadHandler } from "./routes/web/computer-upload.js";
+import { buildHealthMeta } from "./utils/health-payload.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+export async function createHonoApp() {
+  // Load environment variables early so route handlers can read CONVEX_HTTP_URL
+  const loadedEnv = loadInspectorEnv(__dirname);
+  warnOnConvexDevMisconfiguration(loadedEnv);
+  // One line, after the env is loaded: which grading-engine mode this process
+  // could reach. An operator debugging "why are there no score rows" should
+  // find the answer in the log, not in a flag dashboard.
+  logGradingEngineModeOnce();
+
+  // Under Electron this process IS the main process, and it is the one that
+  // ran out of heap in INSPECTOR-ELECTRON-W3 with no session telemetry at all.
+  // Started here rather than in `src/main.ts` so the npm-package server gets it
+  // too, and so the sampler sits next to the buffers it reports on.
+  startProcessVitalsSampler();
+
+  // Ensure PATH includes user shell paths so child processes (e.g., npx) can be found
+  // This is crucial when launched from GUI apps (Electron) where PATH is minimal
+  try {
+    fixPath();
+  } catch {}
+
+  // Generate session token for API authentication
+  generateSessionToken();
+  setXaaIdpLogger(appLogger);
+  initXAAIdpKeyPair();
+
+  // Warm the hosted-model catalog (seed ∪ backend /v1/models) so billing
+  // dispatch classifies newly-added hosted models correctly. Memoized.
+  startHostedModelCatalogRefresh();
+  // The revoked-session list (MJ-011). Mirror of the call in server/index.ts:
+  // loads in the background, idempotent, a no-op without the service token.
+  startRevokedSessionCache();
+
+  startGuestAuthProvisioningInBackground();
+  startLocalBrowserRenderingSetupInBackground();
+  // Reports whether a local-harness runtime pack is present. Deliberately
+  // only REPORTS: a 515 MB agent runtime for a feature behind a flag, a
+  // kill switch and a consent grant is installed when the user asks, never
+  // at startup and never during a session start.
+  reportLocalHarnessRuntimeStatusInBackground();
+  if (!HOSTED_MODE) void startLocalHarnessJanitor();
+  // Mirror of the call in server/index.ts — both production entries must
+  // wire this up so the Electron/embedded path also gets a working Computer
+  // tab. Memoized, so it's harmless if a process ever ran both. AWAITED (the
+  // factory is async for exactly this): synchronous gates read
+  // `isComputersDataPlaneConfigured()`, which is only truthful once the
+  // credential bootstrap has resolved — no requests before that.
+  await initComputersStartup();
+
+  const app = new Hono();
+  // Computer terminal WebSocket support (Project Computers). Mirror of
+  // server/index.ts — the Electron/embedded entry must wire the SAME upgrade
+  // handler so the Computer tab's Shell + drag-and-drop upload work here too.
+  // `injectWebSocket` is returned to the caller (src/main.ts) to attach to the
+  // node server, exactly as server/index.ts calls it on its own server.
+  const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
+  const strictModeResponse = (c: any, path: string) =>
+    c.json(
+      {
+        code: "FEATURE_NOT_SUPPORTED",
+        message: `${path} is disabled in hosted mode`,
+      },
+      410,
+    );
+  const isElectron = process.env.ELECTRON_APP === "true";
+  const isProduction = process.env.NODE_ENV === "production";
+  const isPackaged = process.env.IS_PACKAGED === "true";
+  const frontendUrl = getInspectorFrontendUrl({
+    isElectron,
+    isPackaged,
+    isProduction,
+  });
+
+  // Create the MCPJam client manager instance and wire RPC logging to SSE bus
+  const mcpClientManager = new MCPClientManager(
+    {},
+    {
+      retryPolicy: INSPECTOR_MCP_RETRY_POLICY,
+      rpcLogger: ({ direction, message, serverId }) => {
+        rpcLogBus.publish({
+          serverId,
+          direction,
+          timestamp: new Date().toISOString(),
+          message,
+        });
+      },
+      // HTTP-exchange capture (headers only). A separate SDK channel from
+      // `rpcLogger`: from 2026-07-28 the routing/cross-check metadata a
+      // `-32020 HeaderMismatch` is about lives in HTTP headers, which the
+      // JSON-RPC body log cannot show. Every era is captured — the legacy
+      // session/resumption headers are just as debuggable.
+      httpLogger: (exchange) => {
+        rpcLogBus.publish({
+          kind: "http",
+          serverId: exchange.serverId,
+          timestamp: new Date().toISOString(),
+          exchange,
+        });
+      },
+      progressHandler: ({
+        serverId,
+        progressToken,
+        progress,
+        total,
+        message,
+      }) => {
+        // Store progress for UI access using the real progressToken from the notification
+        progressStore.publish({
+          serverId,
+          progressToken,
+          progress,
+          total,
+          message,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      // SEP-2549 cache-serve provenance — a channel SEPARATE from rpcLogger
+      // (see server/utils/cache-events.ts). Routes opt in per-request via
+      // `withCacheEventCapture`; this callback is a no-op outside that scope.
+      cacheEventLogger,
+      // Auto-negotiation outcome telemetry (always-on negotiation).
+      negotiationOutcomeLogger: negotiationTelemetryLogger("local-inspector"),
+    },
+  );
+
+  // Initialize elicitation callback immediately so tasks/result calls work
+  // without needing to hit the elicitation endpoints first
+  initElicitationCallback(mcpClientManager);
+
+  if (process.env.DEBUG_MCP_SELECTION === "1") {
+    appLogger.debug("[mcpjam][boot] DEBUG_MCP_SELECTION enabled");
+  }
+
+  // Middleware to inject the client manager into context
+  app.use("*", async (c, next) => {
+    c.mcpClientManager = mcpClientManager;
+    await next();
+  });
+
+  // Request log context (mounted BEFORE the security stack so that 401s from
+  // session auth, 403s from origin validation, and hosted-mode 410 partition
+  // responses are still observed in Axiom — those are exactly the requests
+  // SREs want to see during an outage or attack).
+  app.use("/api/*", requestLogContextMiddleware);
+
+  // ===== SECURITY MIDDLEWARE STACK =====
+  // Order matters: headers -> origin validation -> strict partition -> session auth
+
+  // 1. Security headers (always applied)
+  app.use("*", securityHeadersMiddleware);
+
+  // 1b. Indexing directive. Host-scoped, so it is its own middleware rather
+  // than another line in the security headers — see indexing-headers.ts.
+  app.use("*", indexingHeadersMiddleware);
+
+  // 2. Origin validation (blocks CSRF/DNS rebinding)
+  app.use("*", originValidationMiddleware);
+
+  // 3. Hosted mode partition blocks legacy API families (health + public
+  // catalog exempt). Shared with server/index.ts via applyHostedPartition —
+  // keep the allowlist in middleware/hosted-partition.ts, not inline here.
+  if (HOSTED_MODE) {
+    applyHostedPartition(app);
+  }
+
+  // 4. Session authentication (blocks unauthorized API requests)
+  app.use("*", sessionAuthMiddleware);
+
+  // ===== END SECURITY MIDDLEWARE =====
+
+  // Middleware - only enable HTTP request logging in dev mode or when --verbose is passed
+  const enableHttpLogs =
+    process.env.NODE_ENV !== "production" ||
+    process.env.VERBOSE_LOGS === "true";
+  if (enableHttpLogs) {
+    // Use custom print function to scrub session tokens from logged URLs
+    app.use(
+      "*",
+      logger((message) => {
+        appLogger.info(scrubTokenFromUrl(message));
+      }),
+    );
+  }
+  // Load-bearing for the header middleware above, not only for CORS. See the
+  // same mount in server/index.ts: raw-`Response` handlers only carry the
+  // headers prepared by `c.header()` because `cors()` materializes `c.res`.
+  app.use("*", cors(CORS_OPTIONS));
+
+  // Hosted web APIs enforce a 1MB max JSON body — except the cloud-skills
+  // folder upload, which is multipart and bounded by the service caps. Audio
+  // transcription gets its own larger cap inside the helper. See
+  // `webBodyLimit`.
+  app.use("/api/web/*", webBodyLimit());
+
+  // API Routes
+  if (!HOSTED_MODE) {
+    app.route("/api/apps", appsRoutes);
+    app.route("/api/mcp", mcpRoutes);
+  } else {
+    // Only the hosted-open paths (health + public model catalog) are mounted;
+    // the rest of /api/mcp and /api/apps stays 410'd by applyHostedPartition.
+    // Mirror of server/index.ts — both entries share mountHostedOpenRoutes.
+    mountHostedOpenRoutes(app);
+  }
+  // Construct after loadInspectorEnv() so hosted confidential CIMD observes
+  // Inspector dotenv configuration and malformed configured keys fail startup.
+  app.route("/api/web/xaa", createXaaWebRouter());
+  // Backend → inspector doorbell for connection-request work. Gated by its own
+  // service-token middleware, carries no user identity, and needs none — the
+  // request id in the body is a selector, not authorization. Mounted ahead of
+  // /api/web so it never inherits that family's bearer middleware.
+  // Mirror of the mount in server/index.ts.
+  app.route("/api/internal/server-connections", internalServerConnections);
+  // Backend → inspector doorbell for a finished judge. Same shape and the same
+  // service-token gate; the route resolves the grading-engine mode itself and
+  // no-ops at `off`/`shadow`, because the backend rings this on every judge
+  // save without consulting the flag. Mirror of the mount in server/index.ts.
+  app.route("/api/internal/evals", internalEvalJudgeCompletions);
+  // Backend → inspector doorbell for a chat session whose chain inputs moved.
+  // Same service-token gate and the same body-carries-no-authority rule as the
+  // judge doorbell above — the ring is a wake-up, and the pass claims from the
+  // backend's own queue rather than from anything the caller named.
+  app.route("/api/internal/chat-stage", internalChatStageDerivations);
+  app.route("/api/internal/agent-turns", internalAgentTurns);
+  // W1 hosted-browser debug probe. Mounted ONLY when explicitly enabled — it
+  // provisions a desktop and boots browserd end to end — and, like the other
+  // internal routes, gated by the service token. Mirror of the mount in
+  // server/index.ts.
+  if (process.env.COMPUTER_BROWSER_DEBUG_ENABLED === "1") {
+    app.route(
+      "/api/internal/computer-browser-debug",
+      internalComputerBrowserDebug,
+    );
+  }
+  app.route("/api/web", webRoutes);
+  // Browser Panel data plane (W4): watch the browser an agent is driving, and
+  // take control when a login or a challenge needs a person. Auth is the
+  // Convex-minted browser token, so it is mounted like the other computer
+  // routes rather than inside the web router's session auth. Dark until the
+  // W7 exposure gate: the panel is only reachable once a desktop computer
+  // exists, and nothing links to it yet. Mirror of the mount in server/index.ts.
+  app.route("/api/web/computers/browser", computerBrowserPanel);
+
+  // Computer terminal WebSocket + file upload (Project Computers). Registered
+  // directly on the root app because the WS upgrade handler comes from
+  // `createNodeWebSocket`; the upload route carries its own 30MB bodyLimit (the
+  // global /api/web/* 1MB cap excludes this path). Mirror of the mount in
+  // server/index.ts — both production entries must wire this up, else the
+  // Electron/embedded entry 404s these paths. When computers aren't configured
+  // the handlers return a clean 503 (not a raw 404).
+  app.get(
+    "/api/web/computers/terminal",
+    createComputerTerminalWsHandler(upgradeWebSocket),
+  );
+  // Browser panel stream (W4b). Mirror of the mount in server/index.ts — see
+  // there for why the RFB proxy exists and why it is not hosted-only.
+  app.get(
+    "/api/web/computers/browser/stream",
+    createComputerBrowserStreamWsHandler(upgradeWebSocket),
+  );
+  // The PAGE, from the daemon's own screencast — the rail's pane. The
+  // stream above is the whole DESKTOP over RFB, and both stay: one is for
+  // watching alongside the local engine, the other for taking the machine.
+  app.get(
+    "/api/web/computers/browser/frames",
+    createComputerBrowserFramesWsHandler(upgradeWebSocket),
+  );
+  // LOCAL computer terminal WebSocket ("This machine"). Never mounted hosted.
+  // Mirror of the mount in server/index.ts.
+  if (!HOSTED_MODE) {
+    app.get(
+      "/api/web/computers/local-terminal",
+      createLocalComputerTerminalWsHandler(upgradeWebSocket),
+    );
+    app.get(
+      "/api/web/computers/local-browser/frames",
+      createLocalBrowserFramesWsHandler(upgradeWebSocket),
+    );
+  }
+  // WebMCP Inspector frame stream WebSocket. Never mounted hosted — there is no
+  // local browser there to stream. Mirror of the mount in server/index.ts.
+  if (!HOSTED_MODE) {
+    app.get(
+      "/api/web/webmcp/sessions/:id/frames",
+      createWebMcpFramesWsHandler(upgradeWebSocket),
+    );
+  }
+  app.post(
+    "/api/web/computers/upload",
+    bodyLimit({
+      maxSize: 30 * 1024 * 1024,
+      onError: (c) =>
+        c.json(
+          { ok: false, error: "Upload exceeds the 30MB request limit." },
+          413,
+        ),
+    }),
+    createComputerUploadHandler(),
+  );
+
+  // Hosted public API (v1). Same 1MB JSON cap as /api/web (with the eval
+  // artifact upload carved out; see `v1BodyLimit`); the canonical
+  // resource-oriented routes wrap the same core helpers and emit the v1
+  // envelope. Read-only diagnostics first; mutating ops land behind the
+  // X-MCPJam-Approval flow in a follow-up.
+  app.use("/api/v1/*", v1BodyLimit());
+  app.route("/api/v1", v1Routes);
+
+  // Fail the deploy, not the user's first sign-in: `WORKOS_API_BASE_URL` is a
+  // loopback-only test hook, and this is the earliest point that can refuse a
+  // value which would otherwise send the admin API key to another host. Unset
+  // (every deployment) this is a no-op.
+  resolveWorkosApiBaseUrl(process.env);
+
+  // Mounted in every runtime, hosted included — see the mirror of this mount
+  // in server/index.ts for why the gate had to go.
+  app.route("/user_management", workosAuthkitRoutes);
+
+  // CLI OAuth bridge (mcpjam cloud login). Public front-channel routes — no session
+  // auth (see session-auth.ts UNPROTECTED_PREFIXES) and no tokens returned;
+  // disabled (501) unless CLI_AUTH_STATE_SECRET + CLI_AUTH_PUBLIC_ORIGIN are
+  // set. Mirror of the mount in server/index.ts — both production entries
+  // must wire this up.
+  app.route("/api/cli/auth", cliAuthRoutes);
+
+  // Slack account-link bridge. Public front-channel like the CLI bridge (no
+  // session auth — the user is not signed in yet; that is what the flow
+  // establishes), and 501 unless the Slack/WorkOS client credentials and
+  // SLACK_LINK_STATE_SECRET are configured. Mirror of the mount in
+  // server/index.ts — both production entries must wire this up.
+  app.route("/api/slack/link", slackLinkRoutes);
+  app.route("/api/surface-link", surfaceLinkRoutes);
+
+  // Same-origin PostHog reverse proxy (ad-blocker resilience). Deliberately
+  // OUTSIDE /api so it bypasses session auth (analytics flows before any
+  // session exists), and mounted before the static/SPA fallback, whose
+  // catch-all only skips /api/* and would otherwise swallow /relay GETs
+  // with index.html. Mirror of the mount in server/index.ts — both
+  // production entries must wire this up.
+  // Mounted on BOTH prefixes — see RELAY_MOUNT_PREFIXES in routes/relay.ts:
+  // /tlm is the alias new clients use because Railway's edge 403s GETs under
+  // /relay/static and /relay/array on hosted; /relay stays for old builds.
+  app.use("/relay/*", relayBodyLimit());
+  app.route("/relay", relayRoutes);
+  app.use("/tlm/*", relayBodyLimit());
+  app.route("/tlm", relayRoutes);
+
+  // XAA Client ID Metadata Document. Also deliberately OUTSIDE /api (the
+  // target authorization server fetches it anonymously) and mounted before
+  // the static/SPA fallback. Mirror of the mount in server/index.ts — both
+  // production entries must wire this up.
+  registerXaaClientMetadataRoute(app);
+  registerXaaConfidentialCimdRoute(app);
+
+  // Health check
+  app.get("/health", (c) => {
+    return c.json({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      hasActiveClient: inspectorCommandBus.hasActiveClient(),
+      frontend: frontendUrl,
+      ...buildHealthMeta(),
+    });
+  });
+
+  // Guest JWT JWKS compatibility endpoint — public, no auth required.
+  // The canonical JWKS now lives on Convex; Inspector proxies it here.
+  app.get("/guest/jwks", async () => {
+    const response = await fetchRemoteGuestJwks();
+    if (!response) {
+      return Response.json(
+        { error: "Guest JWKS unavailable" },
+        {
+          status: 503,
+          headers: {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    return new Response(await response.text(), {
+      status: response.status,
+      headers: {
+        "Cache-Control":
+          response.headers.get("cache-control") || "public, max-age=300",
+        "Content-Type":
+          response.headers.get("content-type") || "application/json",
+      },
+    });
+  });
+
+  // Validate a credential delivered by the launcher. Never disclose one over HTTP.
+  app.get("/api/session-token", (c) => {
+    c.header("Cache-Control", "no-store");
+    if (HOSTED_MODE) return strictModeResponse(c, "/api/session-token");
+    const authorization = c.req.header("X-MCP-Session-Auth");
+    if (
+      authorization?.startsWith("Bearer ") &&
+      validateToken(authorization.slice(7))
+    ) {
+      return c.json({ ok: true });
+    }
+    if (!isAllowedHost(c.req.header("Host"), ALLOWED_HOSTS)) {
+      return c.json({ code: "HOST_NOT_ALLOWED" }, 403);
+    }
+    return c.json(
+      {
+        code: "ACCESS_LINK_REQUIRED",
+        hint: "Open the link printed in your terminal. If you use @mcpjam/cli, update it.",
+      },
+      401,
+    );
+  });
+
+  // Static hosting / dev redirect behavior
+  if (isProduction || (isElectron && isPackaged)) {
+    // Production (web) or Electron packaged build: serve files from bundled client
+    let root = "./dist/client";
+    if (isElectron && isPackaged) {
+      root = path.resolve(process.env.ELECTRON_RESOURCES_PATH!, "client");
+    }
+
+    // Serve static assets (JS, CSS, images) - no token injection needed
+    app.use("/assets/*", serveStatic({ root }));
+
+    // In-app browser redirect: detect embedded WebViews (LinkedIn, Facebook, etc.)
+    // and serve a redirect page before the SPA loads, since Google OAuth blocks
+    // sign-in from in-app browsers with `disallowed_useragent`.
+    app.use("/*", inAppBrowserMiddleware);
+
+    // Serve all static files from client root (images, svgs, etc.)
+    // This handles files like /mcp_jam_light.png, /favicon.ico, etc.
+    //
+    // Document requests fall THROUGH to the injecting handler below — mirror
+    // of the guard in server/index.ts. See isSpaDocumentRequest.
+    const clientStaticFiles = serveStatic({ root });
+    app.use("/*", async (c, next) => {
+      if (isSpaDocumentRequest(c.req.path)) {
+        return next();
+      }
+      return clientStaticFiles(c, next);
+    });
+
+    // For HTML pages, inject the session token (only for localhost requests)
+    app.get("/*", async (c) => {
+      const reqPath = c.req.path;
+
+      // Don't intercept API routes
+      if (reqPath.startsWith("/api/")) {
+        return c.notFound();
+      }
+
+      try {
+        const indexPath = path.join(root, "index.html");
+        let html = readFileSync(indexPath, "utf-8");
+
+        const host = c.req.header("Host");
+        const forwardedHost = c.req.header("X-Forwarded-Host");
+        // Every inline script written into the document carries this
+        // response's nonce (see middleware/security-headers.ts).
+        const scriptNonce = documentScriptNonce(c);
+
+        const runtimeConfigScript = getInspectorClientRuntimeConfigScript();
+        if (runtimeConfigScript) {
+          html = html.replace(
+            "</head>",
+            `${withScriptNonce(runtimeConfigScript, scriptNonce)}</head>`,
+          );
+        }
+
+        // Guest bootstrap blob: mint a guest bearer server-side and inject it
+        // so a cold guest boots with a token already in hand. Gated on
+        // production + hosted + a host allowlist that includes the hosted app
+        // host(s) (mayServeGuestBootstrap), mirroring the session-token
+        // discipline. Wrapped in its own try/catch so a mint failure never
+        // 500s the document.
+        if (
+          process.env.NODE_ENV === "production" &&
+          HOSTED_MODE &&
+          mayServeGuestBootstrap({
+            host,
+            forwardedHost,
+            allowedHosts: ALLOWED_HOSTS,
+            activeTunnelDomains: getActiveTunnelDomains(),
+          })
+        ) {
+          try {
+            const { session, setCookies } = await mintGuestSessionForDocument(
+              c,
+            );
+            if (session && session.expiresAt > Date.now()) {
+              const bootstrapScript = withScriptNonce(
+                buildGuestBootstrapScript(session),
+                scriptNonce,
+              );
+              html = html.replace("</head>", `${bootstrapScript}</head>`);
+              for (const cookie of setCookies) {
+                appendGuestSessionSetCookie(c, cookie);
+              }
+            }
+          } catch (error) {
+            appLogger.warn(
+              "[guest-bootstrap] document mint failed; serving without blob",
+              { error: error instanceof Error ? error.message : String(error) },
+            );
+          }
+        }
+
+        // The document may embed a per-guest bearer; never let a
+        // shared/browser cache replay one guest's blob to another.
+        c.header("Cache-Control", "no-store");
+
+        return c.html(html);
+      } catch (error) {
+        appLogger.error("Error serving index.html:", error);
+        return c.text("Internal Server Error", 500);
+      }
+    });
+  } else if (isElectron && !isPackaged) {
+    // Electron development: redirect any front-end route to the renderer dev server
+    app.get("/*", (c) => {
+      const target = new URL(c.req.path, frontendUrl).toString();
+      return c.redirect(target, 307);
+    });
+  } else {
+    // Development mode - in-app browser redirect + API
+    app.use("/*", inAppBrowserMiddleware);
+    app.get("/", (c) => {
+      return c.json({
+        message: "MCPJam API Server",
+        environment: "development",
+        frontend: frontendUrl,
+      });
+    });
+  }
+
+  // In-process self-dispatch for the workspace built-in tools' platform
+  // client (see utils/self-app.ts) — their /api/v1 calls skip the network.
+  registerSelfFetch((request) => app.fetch(request));
+
+  // Return `injectWebSocket` alongside the app so the caller (src/main.ts) can
+  // attach the WS upgrade handler to its node server — same as server/index.ts.
+  // The two PTY-cleanup hooks ride along for the same reason: the Electron entry
+  // owns this process's lifecycle and must kill live local PTYs itself
+  // (server.close() does not close established sockets). `shutdown…` latches
+  // and belongs on a real quit; `kill…` does not and belongs on
+  // `window-all-closed`, which on macOS is followed by a server RESTART.
+  return {
+    app,
+    injectWebSocket,
+    shutdownLocalComputerTerminals,
+    killLocalComputerTerminals,
+    // A local agent browser is a real Chromium this process started. Nothing
+    // else will close it: it is not a child of the request that opened it, and
+    // `server.close()` knows nothing about it. Same latching/non-latching pair
+    // and same reason as the PTYs above.
+    shutdownLocalBrowserSessions,
+    killLocalBrowserSessions,
+    shutdownLocalBrowserFrameSockets,
+    killLocalBrowserFrameSockets,
+    // The frame sockets need the same pair for the same reason: an established
+    // WebSocket outlives `server.close()`, and `window-all-closed` on macOS is
+    // followed by a RESTART, so its variant must not latch.
+    shutdownWebMcpFrameSockets,
+    killWebMcpFrameSockets,
+    shutdownBrowserFrameSockets,
+    killBrowserFrameSockets,
+  };
+}

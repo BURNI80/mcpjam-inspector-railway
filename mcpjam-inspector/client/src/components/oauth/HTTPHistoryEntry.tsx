@@ -1,0 +1,273 @@
+/**
+ * HTTPHistoryEntry Component
+ * Displays a consolidated HTTP request/response pair in a Chrome DevTools-style format
+ */
+
+import { useMemo, useState } from "react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
+import { ScrollableJsonView } from "@/components/ui/json-editor";
+import { cn } from "@/lib/utils";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@mcpjam/design-system/collapsible";
+import {
+  isUnauthenticatedProbeChallenge,
+  type LogErrorDetails,
+} from "@mcpjam/sdk/browser";
+import type { HttpEntryView } from "@/lib/http-entry-views";
+
+interface HTTPHistoryEntryProps {
+  method: string;
+  url: string;
+  status?: number;
+  statusText?: string;
+  duration?: number;
+  requestHeaders?: Record<string, string>;
+  requestBody?: any;
+  responseHeaders?: Record<string, string>;
+  responseBody?: any;
+  error?: LogErrorDetails;
+  step?: string;
+  defaultOpen?: boolean;
+  /**
+   * Which half of the exchange this card presents. "full" (default) is the
+   * classic combined view. "request" renders only the request side — with a
+   * muted "response → next step" hint when the response exists but is
+   * presented under the paired received-step card. "response" renders the
+   * status line and response side; method/url remain in the card header only.
+   */
+  view?: HttpEntryView;
+}
+
+export function HTTPHistoryEntry({
+  method,
+  url,
+  status,
+  statusText,
+  duration,
+  requestHeaders,
+  requestBody,
+  responseHeaders,
+  responseBody,
+  error,
+  step,
+  defaultOpen = false,
+  view = "full",
+}: HTTPHistoryEntryProps) {
+  const [isExpanded, setIsExpanded] = useState(defaultOpen);
+  const showRequestSections = view !== "response";
+  const showResponseSections = view !== "request";
+
+  // Determine status color
+  const getStatusColor = (statusCode?: number) => {
+    if (!statusCode) return "text-muted-foreground";
+    if (statusCode >= 200 && statusCode < 300)
+      return "text-green-600 dark:text-green-400";
+    if (statusCode >= 300 && statusCode < 400)
+      return "text-yellow-600 dark:text-yellow-400";
+    if (statusCode >= 400 && statusCode < 500)
+      return "text-red-600 dark:text-red-400";
+    if (statusCode >= 500) return "text-red-700 dark:text-red-500";
+    return "text-muted-foreground";
+  };
+
+  // Format duration
+  const formatDuration = (ms?: number) => {
+    if (ms === undefined) return "";
+    return ` (${ms}ms)`;
+  };
+
+  const statusColor = getStatusColor(status);
+  const isPending = status === undefined && !error;
+  // In the request-only view the response is rendered under the paired
+  // received-step card, so status is shown (and styled) there instead.
+  const deferredResponse = view === "request" && status !== undefined;
+  const isExpectedAuthChallenge = isUnauthenticatedProbeChallenge({
+    step,
+    status,
+    statusText,
+    wwwAuthenticateHeader: responseHeaders?.["www-authenticate"],
+  });
+  const hasError =
+    view === "request"
+      ? Boolean(error)
+      : Boolean(error) ||
+        (!!status && status >= 400 && !isExpectedAuthChallenge);
+  const errorMessage = useMemo(() => {
+    if (error?.message) return error.message;
+    if (
+      view !== "request" &&
+      status &&
+      status >= 400 &&
+      !isExpectedAuthChallenge
+    ) {
+      return statusText || `HTTP ${status}`;
+    }
+    return undefined;
+  }, [error?.message, status, statusText, isExpectedAuthChallenge, view]);
+
+  return (
+    <Collapsible
+      open={isExpanded}
+      onOpenChange={setIsExpanded}
+      className={cn(
+        "border rounded-lg bg-card shadow-sm hover:shadow-md transition-all duration-200 overflow-hidden",
+        hasError ? "border-red-400 dark:border-red-500" : "border-border",
+      )}
+    >
+      <CollapsibleTrigger className="w-full">
+        <div
+          className={cn(
+            "px-3 py-2 flex items-center gap-2 cursor-pointer hover:bg-muted/50 transition-colors",
+            hasError && "bg-red-50/50 dark:bg-red-950/20",
+          )}
+        >
+          <div className="flex-shrink-0">
+            {isExpanded ? (
+              <ChevronDown className="h-3 w-3 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="h-3 w-3 text-muted-foreground" />
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 flex-1 min-w-0 text-left">
+            <span className="text-xs font-mono font-medium text-foreground flex-shrink-0">
+              {method}
+            </span>
+            <span className="text-xs font-mono text-muted-foreground truncate">
+              {url}
+            </span>
+            {deferredResponse ? (
+              <span className="text-xs text-muted-foreground flex-shrink-0">
+                response → next step
+              </span>
+            ) : isPending ? (
+              <span className="text-xs text-yellow-600 dark:text-yellow-400 flex-shrink-0">
+                pending...
+              </span>
+            ) : (
+              <>
+                <span
+                  className={cn("text-xs font-mono flex-shrink-0", statusColor)}
+                >
+                  {status}
+                </span>
+                <span
+                  className={cn("text-xs font-mono flex-shrink-0", statusColor)}
+                >
+                  {statusText}
+                </span>
+                {duration !== undefined && (
+                  <span className="text-xs text-muted-foreground flex-shrink-0">
+                    {formatDuration(duration)}
+                  </span>
+                )}
+              </>
+            )}
+            {hasError && errorMessage && (
+              <span className="text-xs text-red-600 dark:text-red-400 flex-shrink-0 flex items-center gap-1">
+                <AlertTriangle className="h-3 w-3" />
+                {errorMessage}
+              </span>
+            )}
+          </div>
+        </div>
+      </CollapsibleTrigger>
+
+      <CollapsibleContent>
+        <div className="border-t bg-muted/20">
+          <div className="p-3 space-y-3">
+            {hasError && errorMessage && (
+              <div className="text-xs text-red-600 dark:text-red-400 flex items-center gap-1">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+            {showRequestSections && (
+              <div>
+                <div className="text-xs font-medium text-muted-foreground mb-1">
+                  Request URL
+                </div>
+                <ScrollableJsonView
+                  value={{ url }}
+                  containerClassName="rounded-sm bg-background/60 p-2 max-h-[200px]"
+                />
+              </div>
+            )}
+
+            {/* Request Headers */}
+            {showRequestSections &&
+              requestHeaders &&
+              Object.keys(requestHeaders).length > 0 && (
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground mb-1">
+                    Request Headers
+                  </div>
+                  <ScrollableJsonView
+                    value={requestHeaders}
+                    containerClassName="rounded-sm bg-background/60 p-2 max-h-[200px]"
+                  />
+                </div>
+              )}
+
+            {/* Request Body */}
+            {showRequestSections && requestBody && (
+              <div>
+                <div className="text-xs font-medium text-muted-foreground mb-1">
+                  Request Body
+                </div>
+                <ScrollableJsonView
+                  value={requestBody}
+                  containerClassName="rounded-sm bg-background/60 p-2 max-h-[300px]"
+                />
+              </div>
+            )}
+
+            {/* Response Headers */}
+            {showResponseSections &&
+              responseHeaders &&
+              Object.keys(responseHeaders).length > 0 && (
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground mb-1">
+                    Response Headers
+                  </div>
+                  <ScrollableJsonView
+                    value={responseHeaders}
+                    containerClassName="rounded-sm bg-background/60 p-2 max-h-[200px]"
+                  />
+                </div>
+              )}
+
+            {/* Response Body */}
+            {showResponseSections && responseBody && (
+              <div>
+                <div className="text-xs font-medium text-muted-foreground mb-1">
+                  Response Body
+                </div>
+                <ScrollableJsonView
+                  value={responseBody}
+                  containerClassName="rounded-sm bg-background/60 p-2 max-h-[300px]"
+                />
+              </div>
+            )}
+
+            {/* Deferred / pending state message */}
+            {deferredResponse ? (
+              <div className="text-xs text-muted-foreground italic">
+                Response shown on the next step.
+              </div>
+            ) : (
+              isPending && (
+                <div className="text-xs text-muted-foreground italic">
+                  Waiting for response...
+                </div>
+              )
+            )}
+          </div>
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}

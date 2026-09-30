@@ -1,0 +1,244 @@
+import type { AuthInfo } from "@modelcontextprotocol/server";
+import type { JWTPayload } from "jose";
+import { handleMcpRequest } from "./server.js";
+import {
+  GUEST_ISSUER,
+  OAUTH_DISCOVERY_HEADERS,
+  normalizeIssuer,
+  resourceIdentifier,
+  verifyBearerToken,
+  type VerifyConfig,
+} from "./auth.js";
+
+const LANDING_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MCPJam MCP</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
+      code { background: #f4f4f5; padding: 0.1rem 0.35rem; border-radius: 0.25rem; }
+    </style>
+  </head>
+  <body>
+    <h1>MCPJam MCP</h1>
+    <p>This is the MCPJam remote MCP server. Connect an MCP client to <code>/mcp</code>.</p>
+    <p>Source: <a href="https://github.com/MCPJam/inspector">github.com/MCPJam/inspector</a></p>
+  </body>
+</html>
+`;
+
+function protectedResourceMetadata(origin: string, issuer: string) {
+  return {
+    // Shared with the audience check in `verifyBearerToken` — we must accept
+    // exactly the identifier we advertise here.
+    resource: resourceIdentifier(origin),
+    authorization_servers: [issuer],
+    bearer_methods_supported: ["header"],
+  };
+}
+
+/**
+ * CORS for `/mcp`. The v2 handler is deliberately validation-free — it emits
+ * no CORS headers and does not answer OPTIONS — where `McpAgent.serve()` used
+ * to do both, so this file now owns the whole preflight contract.
+ *
+ * The allow-list is every non-safelisted header the official MCP client sends
+ * to this endpoint, and each one is load-bearing for a browser client: a
+ * request header absent here fails the preflight before the worker ever sees
+ * it. `mcp-method`/`mcp-name` in particular are NOT optional — the v2 client
+ * derives them from the message body on *every* modern-era request. The
+ * 2025-era pair (`mcp-session-id`, `last-event-id`) stays listed so a legacy
+ * browser client is not blocked either, even though this stateless endpoint
+ * issues no session id and answers `405` to the GET stream those would ride
+ * on. `expose-headers` covers what a client reads back off the response.
+ */
+const MCP_CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+  "access-control-allow-headers": [
+    "authorization",
+    "content-type",
+    "accept",
+    "mcp-protocol-version",
+    "mcp-method",
+    "mcp-name",
+    "mcp-session-id",
+    "last-event-id",
+  ].join(", "),
+  "access-control-expose-headers": "mcp-session-id, WWW-Authenticate",
+};
+
+function withMcpCors(response: Response): Response {
+  const withCors = new Response(response.body, response);
+  for (const [header, value] of Object.entries(MCP_CORS_HEADERS)) {
+    withCors.headers.set(header, value);
+  }
+  return withCors;
+}
+
+/**
+ * The verified bearer in the shape the v2 handler passes through to the server
+ * factory. Only `token` is read downstream; `clientId` is required by the type
+ * and set to our own WorkOS client id — not the caller's, which for a
+ * third-party OAuth client we never learn (a guest token likewise has no
+ * client of its own) — and the claims ride along in `extra` for
+ * future per-principal behavior. `expiresAt` carries the token's own `exp`
+ * (seconds since epoch, the same unit `AuthInfo` uses) — `verifyBearerToken`
+ * has already enforced it, so this just keeps the pass-through faithful for
+ * any consumer that checks.
+ */
+function toAuthInfo(
+  verified: { token: string; payload: JWTPayload },
+  clientId: string,
+): AuthInfo {
+  return {
+    token: verified.token,
+    clientId,
+    scopes: [],
+    ...(typeof verified.payload.exp === "number"
+      ? { expiresAt: verified.payload.exp }
+      : {}),
+    extra: { claims: verified.payload },
+  };
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const origin = url.origin;
+
+    const issuer = normalizeIssuer(env.AUTHKIT_DOMAIN);
+    if (!issuer) {
+      return new Response("Server misconfigured: AUTHKIT_DOMAIN is not set", {
+        status: 500,
+      });
+    }
+    // The token's `aud` and the issuer→JWKS allow-list are both keyed on the
+    // WorkOS client id (public — also shipped to the browser as
+    // VITE_WORKOS_CLIENT_ID), so the worker must know it to verify forwarded
+    // AuthKit tokens. See `authkitIssuerJwks` in auth.ts.
+    const clientId = env.WORKOS_CLIENT_ID;
+    if (!clientId) {
+      return new Response("Server misconfigured: WORKOS_CLIENT_ID is not set", {
+        status: 500,
+      });
+    }
+
+    const isWellKnown = url.pathname.startsWith("/.well-known/");
+    if (isWellKnown && request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...OAUTH_DISCOVERY_HEADERS,
+          "access-control-allow-methods": "GET, OPTIONS",
+          "access-control-allow-headers": "authorization, content-type",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/.well-known/oauth-protected-resource/mcp" ||
+        url.pathname === "/.well-known/oauth-protected-resource")
+    ) {
+      return Response.json(protectedResourceMetadata(origin, issuer), {
+        headers: OAUTH_DISCOVERY_HEADERS,
+      });
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/.well-known/oauth-authorization-server"
+    ) {
+      const upstreamUrl = new URL(
+        "/.well-known/oauth-authorization-server",
+        issuer,
+      );
+      let upstream: Response;
+      try {
+        upstream = await fetch(upstreamUrl);
+      } catch {
+        return Response.json(
+          { error: "Authorization server discovery unavailable" },
+          { status: 502, headers: OAUTH_DISCOVERY_HEADERS },
+        );
+      }
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: {
+          ...OAUTH_DISCOVERY_HEADERS,
+          "content-type":
+            upstream.headers.get("content-type") ?? "application/json",
+        },
+      });
+    }
+
+    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: { ...MCP_CORS_HEADERS, "access-control-max-age": "86400" },
+        });
+      }
+
+      // Killswitch: when locked down, the server is AuthKit-only — guest
+      // tokens are not accepted and anonymous (tokenless) connections are
+      // refused with the normal 401 → OAuth challenge.
+      const lockedDown = env.MCPJAM_NONPROD_LOCKDOWN === "true";
+
+      // Guest verification is enabled only when a guest JWKS URL is configured
+      // (and not locked down). Absent it, guest tokens fall through to the
+      // AuthKit allow-list and are rejected.
+      const guest: VerifyConfig["guest"] =
+        !lockedDown && env.MCPJAM_GUEST_JWKS_URL
+          ? { issuer: GUEST_ISSUER, jwksUrl: env.MCPJAM_GUEST_JWKS_URL }
+          : undefined;
+
+      // Pass-through auth: the v2 handler verifies nothing itself, so this
+      // stays the single place a bearer is checked. `authInfo` left undefined
+      // means anonymous — the factory then mints a guest lazily, on first tool
+      // execution rather than at connect/tools/list.
+      let authInfo: AuthInfo | undefined;
+      if (request.headers.has("authorization")) {
+        // A bearer was presented → it must verify (AuthKit or guest). A
+        // present-but-invalid token still 401s; we never downgrade it to an
+        // anonymous guest.
+        const result = await verifyBearerToken(
+          request,
+          { clientId, authkitDomain: env.AUTHKIT_DOMAIN, guest },
+          origin,
+        );
+        if (!result.ok) return withMcpCors(result.response);
+        authInfo = toAuthInfo(result.verified, clientId);
+      } else if (lockedDown) {
+        // Tokenless + locked down → preserve the 401 → OAuth challenge.
+        const result = await verifyBearerToken(
+          request,
+          { clientId, authkitDomain: env.AUTHKIT_DOMAIN },
+          origin,
+        );
+        // verifyBearerToken returns the 401 missing-token response here.
+        if (!result.ok) return withMcpCors(result.response);
+        authInfo = toAuthInfo(result.verified, clientId);
+      }
+
+      // No `parsedBody`: nothing above reads the request body, so there is no
+      // first read to hand the handler — let it read the raw request. The
+      // handler does no path routing of its own, so `/mcp/...` is served too.
+      return withMcpCors(
+        await handleMcpRequest(request, env, authInfo ? { authInfo } : undefined),
+      );
+    }
+
+    if (url.pathname === "/" && request.method === "GET") {
+      return new Response(LANDING_PAGE, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+} satisfies ExportedHandler<Env>;

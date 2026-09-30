@@ -1,0 +1,152 @@
+/**
+ * `@mcpjam/sdk/host-config` — public host configuration API.
+ *
+ * Build a host with the `Host` class:
+ *
+ * ```ts
+ * import { Host } from "@mcpjam/sdk/host-config"; // or from "@mcpjam/sdk"
+ * const host = new Host({ style: "mcpjam", model: "anthropic/claude-sonnet-4-6" })
+ *   .requireServer("srv_abc");
+ * host.mcp.protocolVersion = "2025-11-25";
+ * const json = host.toJSON();
+ * ```
+ *
+ * The internal canonicalizer/hash (and the storage-row vocabulary they use)
+ * are deliberately not exported — `Host.toJSON()` is the public seam.
+ * Content-addressed storage is a first-party SDK↔backend concern handled via
+ * `@mcpjam/sdk/host-config/internal`; see `./types.ts`.
+ */
+
+export { cancellationLeafForVersion } from "./types.js";
+export {
+  Host,
+  isHostJson,
+  snapshotHostSource,
+  assertHostServersKnown,
+  resolveKnownServerIds,
+} from "./host.js";
+export type { HostServerRegistry, HostSource } from "./host.js";
+export { HostRuntime } from "./host-runtime.js";
+export type {
+  HostRuntimeDefaults,
+  HostRuntimeManager,
+} from "./host-runtime.js";
+export type {
+  HostInit,
+  HostJson,
+  HostMcp,
+  HostComputer,
+  HostServerOverride,
+  HostSkillSelection,
+  HostConnectionDefaults,
+  HostStyleId,
+  Harness,
+  McpProtocolVersion,
+  McpToolResultImageRendering,
+  McpToolResultImageRenderingPolicy,
+  McpToolResultImageRenderPlacement,
+  ModelVisibleMcpToolResults,
+  ServerId,
+  CspDomainSet,
+  OpenAiAppsCapabilities,
+  McpAppsCapabilities,
+  ToolParamHeaderMirroring,
+  PaginationTraversalMode,
+  MrtrSupport,
+} from "./public-types.js";
+
+// Tasks PRODUCT policy (`com.mcpjam/tasks`). Kept apart from the wire
+// extension on purpose: nothing here produces a capability value, and
+// `com.mcpjam/tasks` is never advertised to a server. The wire declaration is
+// always `io.modelcontextprotocol/tasks: {}`, and it lives in `tasks-ext.ts`.
+export {
+  MCPJAM_TASKS_POLICY_EXTENSION_ID,
+  readTasksPolicy,
+  describeInvalidTasksPolicy,
+  setTasksPolicy,
+  clearTasksPolicy,
+  taskModeForSurface,
+  surfaceMayDeclareTasks,
+} from "./tasks-policy.js";
+export type {
+  TasksPolicy,
+  TaskMode,
+  TaskSurface,
+} from "./tasks-policy.js";
+
+// Saved model selection: model + credential source + connection reference +
+// settings + fallback, beside the bare `modelId`. Pure and browser-safe.
+export {
+  MODEL_SELECTION_SOURCES,
+  MODEL_REASONING_EFFORTS,
+  MODEL_SELECTION_FALLBACK_PROVIDERS,
+  MODEL_SELECTION_PURPOSES,
+  MODEL_SELECTION_TEMPERATURE_MIN,
+  MODEL_SELECTION_TEMPERATURE_MAX,
+  ModelSelectionValidationError,
+  validateModelSelection,
+  isModelSelection,
+  assertModelSelection,
+  selectionFromLegacyModelId,
+  isLegacySelection,
+  selectionKey,
+  defaultFallbackForPurpose,
+} from "./model-selection.js";
+export {
+  reasoningEffortProviderOptions,
+  selectionConfigKey,
+  selectionIfMatches,
+  supportedReasoningEfforts,
+} from "./reasoning-effort.js";
+export type {
+  ReasoningEffortProviderOptions,
+  ReasoningEffortRoute,
+  SupportedReasoningEffortsInput,
+} from "./reasoning-effort.js";
+export type {
+  ModelSelection,
+  ModelSelectionSource,
+  ModelConnectionRef,
+  ModelReasoningEffort,
+  ModelSelectionSettings,
+  ModelSelectionFallback,
+  ModelSelectionFallbackProvider,
+  LegacyModelSelection,
+  RequestedModelSelection,
+  ModelSelectionPurpose,
+  ModelSelectionIssue,
+  ModelSelectionIssueCode,
+  ModelSelectionValidation,
+} from "./model-selection.js";
+
+// Execution record reader + provenance formatting (reads what a run ran on).
+export {
+  EXECUTION_RAILS,
+  EXECUTION_DEVIATION_KINDS,
+  PROVIDER_DEFAULT_MAX_OUTPUT_TOKENS,
+  MAX_EXECUTION_ATTEMPTS,
+  readExecutionRecord,
+  executionRailLabel,
+  executionDeviationTitle,
+  describeExecutionRoute,
+  describeMaxOutputTokens,
+  describeExecutionSettings,
+  describeExecutionModel,
+  formatExecutionProvenanceLine,
+  describeExecutionRequest,
+  describeExecutionAttempts,
+  summarizeExecutionRecord,
+  formatExecutionDeviationLine,
+} from "./execution-record.js";
+export type {
+  ExecutionRecord,
+  ExecutionRail,
+  KnownExecutionRail,
+  ExecutionOffering,
+  ExecutionAttempt,
+  ExecutionAttemptOutcome,
+  ExecutionDeviation,
+  ExecutionDeviationKind,
+  KnownExecutionDeviationKind,
+  ExecutionProvenanceSummary,
+} from "./execution-record.js";

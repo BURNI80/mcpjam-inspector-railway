@@ -1,0 +1,520 @@
+/**
+ * Server configuration constants
+ */
+
+// Server port - can be overridden via environment variable
+export const SERVER_PORT = process.env.SERVER_PORT
+  ? parseInt(process.env.SERVER_PORT, 10)
+  : 6274;
+
+// Server hostname
+export const SERVER_HOSTNAME =
+  process.env.ENVIRONMENT === "dev" ? "localhost" : "127.0.0.1";
+
+// Local server address for tunneling
+export const LOCAL_SERVER_ADDR = `http://localhost:${SERVER_PORT}`;
+
+// Hosted mode for cloud deployments (Railway, etc.)
+// Uses VITE_ prefix so the same variable works for both server and client build
+export const HOSTED_MODE = process.env.VITE_MCPJAM_HOSTED_MODE === "true";
+
+/**
+ * Local computer engine (agents running bash on the machine that runs this
+ * inspector) — server-side kill switch, enforced independently of any client
+ * flag: the engine resolver, the consent routes, and the local terminal all
+ * check it. FORCED off in hosted mode regardless of env — a hosted server
+ * must never execute model-driven commands on itself. `MCPJAM_LOCAL_COMPUTER_ENABLED=false`
+ * is the emergency/managed-install off switch; default is on for local
+ * inspectors (the per-user gate is the consent capability, not this flag).
+ */
+/**
+ * The local agent BROWSER's server-side stop, separate from the shell's.
+ *
+ * Default ON like the shell (a self-hosted user asked for this by running the
+ * inspector on their own machine), forced off hosted, and independent of
+ * `MCPJAM_LOCAL_COMPUTER_ENABLED` so an operator can disable one capability
+ * without the other — driving a browser and running shell commands are
+ * different amounts of trust.
+ */
+export const LOCAL_BROWSER_ENABLED =
+  !HOSTED_MODE && process.env.MCPJAM_LOCAL_BROWSER_ENABLED !== "false";
+
+export const LOCAL_COMPUTER_ENABLED =
+  !HOSTED_MODE && process.env.MCPJAM_LOCAL_COMPUTER_ENABLED !== "false";
+
+/**
+ * Local AI SDK harness execution (an official vendor harness running as a
+ * supervised process on the machine that runs this inspector) — server-side
+ * kill switch, enforced independently of any client flag.
+ *
+ * Enabled by default on local deployments, but routing also requires a
+ * released, verified pack, lifecycle conformance, account rollout, and durable
+ * project authorization. Otherwise existing clients retain cloud execution.
+ *
+ * FORCED off in hosted mode regardless of env: a hosted server must never
+ * start a vendor harness on itself.
+ */
+export const LOCAL_HARNESS_ENABLED =
+  !HOSTED_MODE && process.env.MCPJAM_LOCAL_HARNESS_ENABLED !== "false";
+
+/**
+ * Scheduled eval runs — the deployment switch over ENABLING one, enforced on
+ * the write path rather than on the screen.
+ *
+ * Default OFF. Schedule has not been thoroughly tested, and the PostHog flag
+ * `scheduled-evals-enabled` only hides the UI: `PATCH .../eval-suites/:id/
+ * schedule` is reachable by any API-key holder, and the SDK client, the
+ * `set_eval_suite_schedule` MCP tool, `mcpjam cloud eval schedule` and
+ * proposal execution all self-dispatch through it. One switch here is what
+ * makes "not yet tested" true for every writer instead of only the screen.
+ *
+ * GATES ENABLING ONLY, ON THE ROUTE — `enabled: false` passes through
+ * untouched. Precedent is the `trace-destinations` flag: delete, pause and
+ * disable stay ungated so an org that loses the feature can still switch a
+ * live one off. A gate that strands a running schedule with no way to stop it
+ * is the worse failure.
+ *
+ * THE AGENT IS STRICTER, and it is worth being plain about the asymmetry: the
+ * org policy withholds `set_eval_suite_schedule` outright (see
+ * `org-agent-policy.ts`), so the agent loses DISABLE as well as enable. That
+ * set gates by operation name and cannot read an argument, so the choice there
+ * is between an agent that can still enable and one that can do neither. The
+ * route above is what keeps a live schedule stoppable — by a person, through
+ * the API or the CLI.
+ *
+ * NOT the only gate, and not the one that stops a schedule already running:
+ * `SCHEDULED_EVALS_ENABLED` on the Convex deployment refuses every writer
+ * including the UI's direct mutation, and `SCHEDULED_EVALS_WORKER_ENABLED`
+ * stops execution.
+ */
+export const SCHEDULED_EVALS_WRITE_ENABLED =
+  process.env.MCPJAM_SCHEDULED_EVALS_WRITE_ENABLED === "true";
+
+/**
+ * WebMCP Inspector (a managed browser the user points at a page, so its WebMCP
+ * tools can be listed and invoked) — server-side kill switch, in BOTH modes.
+ * `MCPJAM_WEBMCP_INSPECTOR_ENABLED=false` is the emergency/managed-install off
+ * switch; default is on.
+ *
+ * This no longer forces off in hosted mode. It used to, because the browser
+ * ran on the machine running this inspector and a hosted replica must never
+ * open one — but a hosted session does not open a browser here at all: it
+ * drives one on the member's own MCPJam computer through browserd. WHERE the
+ * browser runs is now a per-session decision (`transport`), so the deployment
+ * mode is the wrong place to decide it. What hosted mode does still forbid is
+ * a LOCAL browser, and the route refuses that explicitly rather than by being
+ * unreachable.
+ *
+ * Hosted reachability is a second, independent gate — see
+ * `webmcpInspectorHostedEnabled` — and client visibility follows the
+ * deployment's `local-browser-enabled` / `hosted-browser-enabled` rollout.
+ */
+export const WEBMCP_INSPECTOR_ENABLED =
+  process.env.MCPJAM_WEBMCP_INSPECTOR_ENABLED !== "false";
+
+/**
+ * May a hosted replica serve the WebMCP Inspector at all?
+ *
+ * A SEPARATE environment variable from `HOSTED_BROWSER_TOOLS_ENABLED`, and
+ * that separation is the whole point. Both switches lead to the same hosted
+ * browser, but they expose it to different consumers: this one lets a PERSON
+ * drive their own page from the inspector, while `HOSTED_BROWSER_TOOLS_ENABLED`
+ * hands six `browser_*` tools to a MODEL. The inspector's blast radius is one
+ * member's own tab; the catalog's includes co-tenancy with bash and approval
+ * threading on four chat surfaces. Rolling the first out must never imply the
+ * second, and one shared variable would make it imply exactly that.
+ *
+ * READ AT CALL TIME, like `hostedBrowserEnabled`: flipped per-process in
+ * staging and per-test, and a module constant would freeze whatever the
+ * environment said when the module first loaded.
+ */
+export function webmcpInspectorHostedEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return HOSTED_MODE && env.MCPJAM_WEBMCP_INSPECTOR_HOSTED_ENABLED === "1";
+}
+
+/**
+ * Can a WebMCP Inspector SESSION exist on this deployment at all?
+ *
+ * The kill switch and the hosted-reachability switch, composed — the same
+ * question the inspector router answers with a 404, asked by anything that
+ * must not offer a capability the session behind it cannot provide. The chat
+ * routes ask it before advertising a page's tools to a model: a turn that
+ * offered them where no session can exist would strand on a call nothing can
+ * fulfil.
+ *
+ * Lives HERE rather than in the router so a caller can ask without importing
+ * a Hono app.
+ */
+export function webmcpInspectorReachable(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!WEBMCP_INSPECTOR_ENABLED) return false;
+  return !HOSTED_MODE || webmcpInspectorHostedEnabled(env);
+}
+
+/**
+ * Is the hosted browser (E2B Desktop + browserd) reachable at all?
+ *
+ * The dark switch the hosted runtime ships behind until the durable backend
+ * exposure gate opens (W7). READ AT CALL TIME, not captured at import: this is
+ * flipped per-process in staging and per-test, and a module constant would
+ * freeze whatever the environment happened to say when the module first
+ * loaded.
+ *
+ * Two callers must agree on it — the built-in tool registry, which decides
+ * whether the MODEL gets browser tools, and the WebMCP Inspector route, which
+ * decides whether a person may run their inspector session on a hosted
+ * browser. Both reserve a desktop computer and both bill for it, so a second
+ * copy of this literal is how one of them stays reachable after the other is
+ * turned off.
+ */
+export function hostedBrowserEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env.HOSTED_BROWSER_TOOLS_ENABLED === "1";
+}
+
+/**
+ * How a page's WebMCP tools reach the model.
+ *
+ *   - `first_class` (default) — each page tool is its own server-executed
+ *     `webmcp_*` model tool: the page's schema advertised verbatim, arguments
+ *     validated before any command leaves this process, an ordinary approval
+ *     pill, and a binding that names the exact registration on the exact
+ *     document generation it was listed from.
+ *   - `verbs` — the pre-first-class behaviour, for a deployment that needs to
+ *     go back: the model calls `browser_webmcp_invoke` by name with an untyped
+ *     `input`, and nothing validates it (Chrome does not check an invocation
+ *     against the registered `inputSchema` either).
+ *
+ * A MODE rather than a boolean because the rollback has to be exact, and
+ * because the two positions are no longer "new thing on/off" — `verbs` is a
+ * named behaviour somebody may deliberately choose, not merely an absence.
+ *
+ * READ AT CALL TIME, like `hostedBrowserEnabled` beside it: flipped
+ * per-process in staging and per-test, and a module constant would freeze
+ * whatever the environment said when this module first loaded.
+ */
+/**
+ * Redact credential-shaped strings in browser messages (errors, console,
+ * network failures) sent to the model; never page content. Defaults on;
+ * `MCPJAM_BROWSER_SHAPE_REDACTION=0` disables it.
+ */
+export function browserShapeRedactionEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env.MCPJAM_BROWSER_SHAPE_REDACTION !== "0";
+}
+
+/**
+ * Let a model type a credential it has not been shown: `{{secret:NAME}}`.
+ * Defaults off because enabling it changes tool descriptions the model reads.
+ * Read at call time so it can be flipped per process or per test.
+ */
+export function browserSecretPlaceholdersEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env.MCPJAM_BROWSER_SECRET_PLACEHOLDERS === "1";
+}
+
+export type WebmcpPageToolsMode = "verbs" | "first_class";
+
+export function webmcpPageToolsMode(
+  env: NodeJS.ProcessEnv = process.env,
+): WebmcpPageToolsMode {
+  // DEFAULTS ON. The dark period is over: a page's tools reach the model as
+  // real tools unless a deployment says otherwise, and `verbs` is the rollback
+  // — one environment variable, no deploy, and the six `browser_*` tools come
+  // back exactly as they were.
+  return env.MCPJAM_WEBMCP_PAGE_TOOLS === "verbs" ? "verbs" : "first_class";
+}
+
+/**
+ * Feed model-visible widget→host tool calls (recorded by Interact steps) to the
+ * eval model as a per-turn system-prompt addendum, so the model reasons over a
+ * widget interaction on its next turn (the headless analogue of Playground's
+ * browser-side addToolOutput + auto-continue). Reuses the same server-side
+ * mechanism Playground uses for `ui/update-model-context`. OFF by default: it
+ * changes what the model sees, so existing eval verdicts shouldn't shift until a
+ * suite opts in. App-only (`visibility:["app"]`) calls are never included.
+ */
+export const EVAL_WIDGET_MODEL_CONTEXT =
+  process.env.MCPJAM_EVAL_WIDGET_MODEL_CONTEXT === "true";
+
+// Exact origins allowed for hosted web routes and CORS
+export const WEB_ALLOWED_ORIGINS = (process.env.WEB_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
+
+const CLIENT_PORT = process.env.CLIENT_PORT || "5173";
+
+const DEFAULT_CORS_ORIGINS = [
+  `http://localhost:${CLIENT_PORT}`, // Vite dev server
+  "http://localhost:8080", // Electron renderer dev server
+  `http://localhost:${SERVER_PORT}`, // Hono server
+  `http://127.0.0.1:${SERVER_PORT}`, // Hono server production
+  "https://staging.mcpjam.com", // Hosted deployment
+];
+
+// CORS origins:
+// - Hosted mode: exact allowlist from WEB_ALLOWED_ORIGINS (if provided).
+// - Local mode: defaults + WEB_ALLOWED_ORIGINS (to support local testing with hosted origins).
+export const CORS_ORIGINS =
+  HOSTED_MODE && WEB_ALLOWED_ORIGINS.length > 0
+    ? WEB_ALLOWED_ORIGINS
+    : Array.from(new Set([...DEFAULT_CORS_ORIGINS, ...WEB_ALLOWED_ORIGINS]));
+
+/**
+ * The shared `cors()` options BOTH production entry points use — `server/app.ts`
+ * (Electron / embedded) and `server/index.ts` (the standalone and hosted server,
+ * which is what `npm run dev:server` and the packaged binary run). They used to
+ * inline the same literal separately, which is how `exposeHeaders` landed on one
+ * of them and not the other.
+ *
+ * Neither exposed header is CORS-safelisted, so without this the browser hides
+ * both from JS on any cross-origin call — which `npm run dev` is, with the
+ * client on 5173 and the server on 6274. The error card reads `x-request-id` to
+ * give a stackless 5xx something reportable, and `use-chat-session` already
+ * reads `x-mcpjam-error-origin`; both were silently undefined off the hosted
+ * same-origin path.
+ */
+export const CORS_OPTIONS = {
+  origin: CORS_ORIGINS,
+  credentials: true,
+  exposeHeaders: ["x-request-id", "x-mcpjam-error-origin", "X-MCPJam-Session"],
+};
+
+// Hosted web route timeouts (ms). Defined in `shared/` so the client can read
+// the same numbers to DESCRIBE what a hosted run does (the eval settings
+// Connection card names the call timeout); every server importer keeps
+// importing them from here.
+export {
+  WEB_CONNECT_TIMEOUT_MS,
+  WEB_CALL_TIMEOUT_MS,
+  WEB_STREAM_TIMEOUT_MS,
+} from "../shared/hosted-web-timeouts.js";
+// Imported as well as re-exported: `MRTR_CONTINUATION_LEASE_TTL_MS` below is
+// derived from the call timeout, and a re-export does not bind the name here.
+import { WEB_CALL_TIMEOUT_MS } from "../shared/hosted-web-timeouts.js";
+
+// ── Hosted elicitation (MCP 2025-11-25) ─────────────────────────────────────
+// An elicitation blocks a `tools/call` on a HUMAN, so these are human-scale.
+// They do not extend how long a *server* may take to respond: the SDK's
+// elicitation-aware timeout only stops the clock while an elicitation is
+// pending (see `elicitationTimeoutExtensionMs`), so a hung server still dies
+// at WEB_STREAM_TIMEOUT_MS of its own activity.
+
+/** How long the user has to answer a form before we resolve `{action:"cancel"}`. */
+export const ELICITATION_FORM_TTL_MS = 5 * 60_000;
+/** How long the user has to consent to (or decline) opening a URL. */
+export const ELICITATION_URL_CONSENT_TTL_MS = 2 * 60_000;
+/** Convex rendezvous poll cadence while a tool call is blocked. */
+export const ELICITATION_POLL_INTERVAL_MS = 1_000;
+/** Jitter added per poll so replicas don't synchronize (scheduled-evals idiom). */
+export const ELICITATION_POLL_JITTER_MS = 250;
+/** Consecutive poll transport failures tolerated before resolving `cancel`. */
+export const ELICITATION_POLL_MAX_FAILURES = 5;
+/**
+ * Deadline for a single Convex service-route call (poll/ack/cancel). These are
+ * tiny reads/writes; anything slower is a stall. Unbounded, a hung Convex would
+ * park the poll loop forever — the tool call would outlive its TTL and
+ * end-of-stream cleanup would block behind it.
+ */
+export const ELICITATION_SERVICE_ROUTE_TIMEOUT_MS = 10_000;
+/**
+ * Total suspended-time budget granted to ONE tool call across all of its
+ * sequential elicitations. Slack over the longest single TTL so a form answered
+ * at the last second still lands.
+ */
+export const ELICITATION_TIMEOUT_EXTENSION_MS =
+  ELICITATION_FORM_TTL_MS + 30_000;
+
+// ── Hosted MRTR continuation transport (MCP 2026-07-28 §12.5) ────────────────
+//
+// A suspended `input_required` operation is durably parked in Convex (PR3a) and
+// resumed on a fresh request. Unlike legacy elicitation the worker does NOT
+// block, so the TTL can be generous — it bounds how long a human has to answer
+// across a whole round before the continuation is expired and scrubbed.
+/** How long a suspended MRTR continuation survives awaiting a human answer. */
+export const MRTR_CONTINUATION_TTL_MS = 10 * 60_000;
+/** Deadline for a single Convex continuation-store call. */
+export const MRTR_CONTINUATION_ROUTE_TIMEOUT_MS = 10_000;
+/**
+ * Lease TTL for a single resume claim; a resume that stalls past this is swept.
+ *
+ * DERIVED, not a round number: one resume leg can legally spend
+ * `claim + submit + mark-wire-started + (finalize | resuspend)` store calls at
+ * the full route deadline each, plus one MCP leg at the full call timeout. A
+ * flat 60s lease is exactly that worst case, so a slow-but-legal side-effecting
+ * resume could lose its lease *after* the wire left and before it could
+ * finalize — the store would 409 an operation that actually executed. Keep the
+ * headroom term below any time this budget or `WEB_CALL_TIMEOUT_MS` grows.
+ *
+ * (`heartbeatContinuation` in `utils/mrtr-continuation-state.ts` is the other
+ * half of the frozen PR3a contract and stays unused by design: PR3b's leg is
+ * bounded by the budget above. A PR5 leg that can outrun this — a long-running
+ * task-backed operation — must heartbeat rather than widen this constant.)
+ */
+export const MRTR_CONTINUATION_LEASE_TTL_MS =
+  4 * MRTR_CONTINUATION_ROUTE_TIMEOUT_MS + WEB_CALL_TIMEOUT_MS + 60_000;
+/**
+ * Hard byte cap on the serialized opaque `resumeState` blob (the encoded
+ * `MrtrOperationState`). Oversized state is rejected at the codec, never
+ * silently truncated — a truncated blob would deserialize to a corrupt
+ * operation and re-drive the wrong request.
+ */
+export const MRTR_RESUME_STATE_MAX_BYTES = 128 * 1024;
+/** Per-field cap for the safe display carried to the browser (message, schema). */
+export const MRTR_DISPLAY_FIELD_MAX_BYTES = 16 * 1024;
+/** Cap on a single browser-submitted response's serialized content. */
+export const MRTR_RESPONSE_CONTENT_MAX_BYTES = 64 * 1024;
+/**
+ * How long an MRTR route waits for connection teardown before answering the
+ * browser anyway. Teardown is cleanup, never the outcome: once a round has been
+ * persisted (suspend) or a leg has already gone out (resume), the response must
+ * not be held hostage by a transport that is slow to close. Comfortably above
+ * the upstream stdio transport's own ~4s close budget, which is the slowest
+ * close path any connection here can take.
+ */
+export const MRTR_TEARDOWN_TIMEOUT_MS = 5_000;
+
+// Hosted app origin the LOCAL inspector server forwards XAA hosted-issuer
+// mint requests to (server-to-server; hosted CORS blocks the browser from
+// calling it directly). Override for staging. Never derived from a request.
+export const MCPJAM_HOSTED_ORIGIN =
+  process.env.MCPJAM_HOSTED_ORIGIN?.replace(/\/+$/, "") ||
+  "https://app.mcpjam.com";
+
+/**
+ * Public origin a SELF-HOSTED deployment is reached at, for links the server
+ * puts in API replies (e.g. an import's `reviewUrl`).
+ *
+ * Without it those links name `localhost`, which is right for the local
+ * inspector and wrong for a deployment someone else opens. Hosted mode uses
+ * `MCPJAM_HOSTED_ORIGIN` instead. Never derived from a request.
+ */
+export const MCPJAM_PUBLIC_ORIGIN =
+  process.env.MCPJAM_PUBLIC_ORIGIN?.replace(/\/+$/, "") || null;
+
+// Admin-controlled host allowlist (comma-separated), honored in both modes.
+// These hosts are accepted as request Origins. Hosted deployments also use
+// this list for guest bootstrap delivery. Local session credentials are never
+// served over HTTP; allowlisted local browsers still need an access link.
+/**
+ * Parse a raw `MCPJAM_ALLOWED_HOSTS` value into normalized entries. Exported so
+ * the token gate (`ALLOWED_HOSTS` below, a module-load snapshot) and the origin
+ * gate (which re-reads `process.env` per request) share ONE parser and can't
+ * silently diverge on how entries are split/normalized.
+ */
+export function parseAllowedHosts(raw: string | undefined): string[] {
+  return raw
+    ? raw
+        .split(",")
+        .map((h) => h.trim().toLowerCase())
+        .filter((h) => h.length > 0)
+    : [];
+}
+
+export const ALLOWED_HOSTS = parseAllowedHosts(
+  process.env.MCPJAM_ALLOWED_HOSTS,
+);
+
+// Vanity domains whose root path ("/") should land on the host-compare
+// showcase ("Can I use" for MCP hosts). Override via env if more are added.
+export const CANIUSE_LANDING_HOSTS = new Set(
+  (process.env.CANIUSE_LANDING_HOSTS ?? "caniuse.dev,www.caniuse.dev")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => h.length > 0),
+);
+
+// Vanity domains whose root path ("/") should land on the conformance-score
+// runner. score.mcpjam.com is this same service under another name — no
+// separate deploy — so the only thing it needs is a root redirect. Deep links
+// (`/results/<token>`) pass through untouched.
+export const SCORE_LANDING_HOSTS = new Set(
+  (process.env.SCORE_LANDING_HOSTS ?? "score.mcpjam.com,www.score.mcpjam.com")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => h.length > 0),
+);
+
+/** A bare DNS hostname: dot-separated labels of letters, digits, and hyphens. */
+const BARE_HOSTNAME =
+  /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
+
+/**
+ * The hostnames in a SANDBOX_HOSTS value, lowercased, with anything that is
+ * not one dropped.
+ *
+ * The partition compares against a `Host` header with its port stripped, so an
+ * entry carrying a scheme, a port, or a path can never match it. Kept, such an
+ * entry would leave that hostname serving the whole app while
+ * `resolveSandboxIsolation` still answered "ok" — an isolation nobody checked,
+ * which is the exact failure this file exists to make loud. Dropped, a value
+ * of nothing but malformed entries reports "unset" and the boot check says so.
+ */
+function parseSandboxHosts(raw: string): Set<string> {
+  return new Set(
+    raw
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter((h) => BARE_HOSTNAME.test(h)),
+  );
+}
+
+// DNS names that serve the MCP Apps widget sandbox and nothing else. The
+// sandbox is a second hostname on THIS service rather than a separate deploy,
+// so without a partition the origin whose whole job is holding untrusted
+// widget content also serves the app shell, its bundle, and /api. See
+// middleware/sandbox-host-partition.ts for what the partition allows.
+//
+// Rollback is SANDBOX_HOSTS="" on the service: an empty set partitions nothing.
+export const SANDBOX_HOSTS = parseSandboxHosts(
+  process.env.SANDBOX_HOSTS ?? "sandbox.mcpjam.com,sandbox-staging.mcpjam.com",
+);
+
+/**
+ * Whether widget content is isolated from the app, as far as the DEPLOY can
+ * tell.
+ *
+ *   "ok"          — at least one sandbox hostname, none of them the app's own.
+ *   "same-origin" — the app's own host is listed as a sandbox host. Widgets
+ *                   share cookies and storage with the app, and the partition
+ *                   makes that hostname stop serving the app.
+ *   "unset"       — no sandbox hostname is configured, or MCPJAM_HOSTED_ORIGIN
+ *                   could not be parsed to compare against. Either way the
+ *                   isolation is unconfirmed.
+ */
+export type SandboxIsolationStatus = "ok" | "same-origin" | "unset";
+
+/**
+ * A browser cannot answer this. A page served at sandbox.mcpjam.com with
+ * SANDBOX_ORIGIN=https://sandbox.mcpjam.com is indistinguishable, from inside
+ * the tab, from an app.mcpjam.com deploy pointing its sandbox at itself — and
+ * only the second is a regression. Which hostname the app was supposed to be
+ * served as is known to the process and to nothing else, which is why the
+ * check lives on the server.
+ */
+export function resolveSandboxIsolation(
+  sandboxHosts: ReadonlySet<string> = SANDBOX_HOSTS,
+  hostedOrigin: string = MCPJAM_HOSTED_ORIGIN,
+): SandboxIsolationStatus {
+  if (sandboxHosts.size === 0) {
+    return "unset";
+  }
+
+  let appHost: string;
+  try {
+    appHost = new URL(hostedOrigin).hostname.toLowerCase();
+  } catch {
+    // A hosted origin we cannot parse (a bare hostname, say) is a comparison
+    // we cannot make. Reporting "ok" would claim an isolation nobody checked.
+    return "unset";
+  }
+
+  return sandboxHosts.has(appHost) ? "same-origin" : "ok";
+}

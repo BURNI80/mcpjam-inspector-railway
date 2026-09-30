@@ -1,0 +1,16 @@
+# Railway service config for mcpjam-soundcheck.
+#
+# The Railway service is configured with:
+#   - Root directory: /            (monorepo root)
+#   - Builder:        RAILPACK
+#
+# Railpack builds from the monorepo root, so `engines` in soundcheck/package.json
+# does not choose its Node version. It currently reuses the previously installed
+# Node 22; set RAILPACK_NODE_VERSION on the service to pin it explicitly.
+
+[build]
+buildCommand = "npm run build -w @mcpjam/soundcheck"
+
+[deploy]
+startCommand = "npm run start -w @mcpjam/soundcheck"
+restartPolicyType = "ON_FAILURE"

@@ -1,0 +1,60 @@
+import { cn } from "@/lib/utils";
+import { useJsonTreeState } from "./use-json-tree-state";
+import { JsonTreeNode } from "./json-tree-node";
+
+interface JsonTreeViewProps {
+  value: unknown;
+  className?: string;
+  height?: string | number;
+  maxHeight?: string | number;
+  defaultExpandDepth?: number;
+  collapsedPaths?: Set<string>;
+  onCollapseChange?: (paths: Set<string>) => void;
+  collapseStringsAfterLength?: number;
+  onCopy?: (value: string) => void;
+}
+
+export function JsonTreeView({
+  value,
+  className,
+  height,
+  maxHeight,
+  defaultExpandDepth,
+  collapsedPaths: controlledCollapsedPaths,
+  onCollapseChange,
+  collapseStringsAfterLength,
+  onCopy,
+}: JsonTreeViewProps) {
+  // The hook takes the value so defaultExpandDepth applies on the first render.
+  const { isCollapsed, toggleCollapse } = useJsonTreeState({
+    value,
+    defaultExpandDepth,
+    initialCollapsedPaths: controlledCollapsedPaths,
+    onCollapseChange,
+  });
+
+  return (
+    <div
+      className={cn(
+        "p-3 text-xs overflow-auto select-text cursor-text",
+        className,
+        // pl-7 must come after className to ensure space for collapse toggles
+        "pl-7",
+      )}
+      style={{
+        fontFamily: "var(--font-code)",
+        ...(height != null ? { height } : {}),
+        ...(maxHeight != null ? { maxHeight } : {}),
+      }}
+    >
+      <JsonTreeNode
+        value={value}
+        path="root"
+        isCollapsed={isCollapsed}
+        toggleCollapse={toggleCollapse}
+        collapseStringsAfterLength={collapseStringsAfterLength}
+        onCopy={onCopy}
+      />
+    </div>
+  );
+}

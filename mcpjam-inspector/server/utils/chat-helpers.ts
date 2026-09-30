@@ -1,0 +1,439 @@
+import { listBaseServers } from "./mcp-connections.js";
+import { ModelDefinition } from "@/shared/types";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createAzure } from "@ai-sdk/azure";
+import { createDeepSeek } from "@ai-sdk/deepseek";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createMistral } from "@ai-sdk/mistral";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createXai } from "@ai-sdk/xai";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { createOllama } from "ollama-ai-provider-v2";
+import type { ModelMessage } from "@ai-sdk/provider-utils";
+import {
+  isChatGPTAppTool,
+  isMcpAppTool,
+  scrubMetaFromToolResult,
+  scrubMetaAndStructuredContentFromToolResult,
+  type MCPClientManager,
+} from "@mcpjam/sdk";
+
+export interface BaseUrls {
+  ollama?: string;
+  azure?: string;
+  /**
+   * Amazon Bedrock regional runtime endpoint, e.g.
+   * https://bedrock-runtime.us-east-1.amazonaws.com.
+   * When omitted, the provider derives it from the AWS_REGION env var.
+   */
+  bedrock?: string;
+}
+
+export interface CustomProviderConfig {
+  name: string;
+  protocol: string;
+  baseUrl: string;
+  modelIds: string[];
+  apiKey?: string;
+}
+
+export const createLlmModel = (
+  modelDefinition: ModelDefinition,
+  apiKey: string,
+  baseUrls?: BaseUrls,
+  customProviders?: CustomProviderConfig[],
+) => {
+  if (!modelDefinition?.id || !modelDefinition?.provider) {
+    throw new Error(
+      `Invalid model definition: ${JSON.stringify(modelDefinition)}`,
+    );
+  }
+  switch (modelDefinition.provider) {
+    case "anthropic":
+      return createAnthropic({ apiKey })(modelDefinition.id);
+    case "openai":
+      return createOpenAI({ apiKey })(modelDefinition.id);
+    case "deepseek":
+      return createDeepSeek({ apiKey })(modelDefinition.id);
+    case "google":
+      return createGoogleGenerativeAI({ apiKey })(modelDefinition.id);
+    case "ollama": {
+      const raw = baseUrls?.ollama || "http://127.0.0.1:11434/api";
+      const normalized = /\/api\/?$/.test(raw)
+        ? raw
+        : `${raw.replace(/\/+$/, "")}/api`;
+      return createOllama({ baseURL: normalized })(modelDefinition.id);
+    }
+    case "mistral":
+      return createMistral({ apiKey })(modelDefinition.id);
+    case "openrouter":
+      return createOpenRouter({
+        apiKey,
+        headers: {
+          "HTTP-Referer": "https://www.mcpjam.com/",
+          "X-Title": "MCPJam",
+        },
+      })(modelDefinition.id);
+    case "xai":
+      return createXai({ apiKey })(modelDefinition.id);
+    case "bedrock":
+      // Bearer-token (API key) auth. The endpoint comes from baseUrls.bedrock
+      // when set; otherwise the provider derives it from AWS_REGION.
+      return createAmazonBedrock({
+        apiKey,
+        ...(baseUrls?.bedrock && { baseURL: baseUrls.bedrock }),
+      })(modelDefinition.id);
+    case "azure": {
+      const azureBaseUrl = baseUrls?.azure ?? "";
+      // Extract resourceName from the Azure base URL so the SDK doesn't fall
+      // back to the AZURE_RESOURCE_NAME env var and throw when it's missing.
+      // Supports both:
+      //   https://<resource>.openai.azure.com/openai
+      //   https://<resource>.cognitiveservices.azure.com/openai
+      const azureResourceMatch = azureBaseUrl.match(
+        /https?:\/\/([^.]+)\.(openai|cognitiveservices)\.azure\.com/i,
+      );
+      const resourceName = azureResourceMatch?.[1];
+      // The deployment: the row's explicit `nativeModelId` when it has one
+      // (an org Azure deployment row), else the row id as before. Never the
+      // row id with its `azure/` prefix stripped.
+      const deployment =
+        modelDefinition.nativeModelId?.trim() || String(modelDefinition.id);
+      return createAzure({
+        apiKey,
+        ...(resourceName ? { resourceName } : { baseURL: azureBaseUrl }),
+      })(deployment);
+    }
+    case "custom": {
+      const providerName = modelDefinition.customProviderName;
+      if (!providerName) {
+        throw new Error(
+          `Custom provider model missing customProviderName: ${modelDefinition.id}`,
+        );
+      }
+      const cp = customProviders?.find((p) => p.name === providerName);
+      if (!cp) {
+        throw new Error(`Custom provider not found: ${providerName}`);
+      }
+      // Strip the "custom:<providerName>:" namespace prefix to get the raw model ID
+      // Client sends id as "custom:<providerName>:<modelId>" to avoid clashes with built-in models
+      const rawModelId = String(modelDefinition.id).startsWith("custom:")
+        ? String(modelDefinition.id).split(":").slice(2).join(":")
+        : String(modelDefinition.id);
+      // Use the custom provider's apiKey, falling back to the runtime apiKey
+      const resolvedApiKey = cp.apiKey || apiKey || "";
+      if (cp.protocol === "anthropic-compatible") {
+        return createAnthropic({
+          apiKey: resolvedApiKey,
+          baseURL: cp.baseUrl,
+        })(rawModelId);
+      }
+      // Default: openai-compatible
+      // Always use .chat() (Chat Completions API) since virtually all
+      // OpenAI-compatible providers implement /chat/completions
+      return createOpenAI({
+        apiKey: resolvedApiKey,
+        baseURL: cp.baseUrl,
+      }).chat(rawModelId);
+    }
+    default:
+      throw new Error(
+        `Unsupported provider: ${modelDefinition.provider} for model: ${modelDefinition.id}`,
+      );
+  }
+};
+
+const ANTHROPIC_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+function readRecordString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" && candidate.length > 0
+    ? candidate
+    : undefined;
+}
+
+export const isAnthropicCompatibleModel = (
+  modelDefinition: ModelDefinition,
+  customProviders?: CustomProviderConfig[],
+): boolean => {
+  if (modelDefinition.provider === "anthropic") {
+    return true;
+  }
+  if (modelDefinition.provider === "custom") {
+    const providerName = modelDefinition.customProviderName;
+    if (!providerName) return false;
+    const cp = customProviders?.find((p) => p.name === providerName);
+    return cp?.protocol === "anthropic-compatible";
+  }
+  return false;
+};
+
+export const getInvalidAnthropicToolNames = (toolNames: string[]): string[] => {
+  return toolNames.filter((name) => !ANTHROPIC_TOOL_NAME_PATTERN.test(name));
+};
+
+/**
+ * Tool availability is per-turn. If a server disconnects, older tool-call /
+ * tool-result transcript parts for that server should not be sent back to the
+ * model on the next request.
+ */
+export const scrubUnavailableToolHistoryForBackend = (
+  messages: ModelMessage[],
+  availableToolNames: Iterable<string>,
+  /**
+   * Names whose history stays even though the tool is not advertised now.
+   *
+   * For tools that are EXPECTED to come and go within a conversation — a
+   * page's WebMCP tools exist only while that page is open. The model called
+   * `webmcp_add_topping` on the pizza page; the record of having done so is
+   * how it knows the topping is there, and scrubbing it because the browser
+   * has since moved on would make the model repeat the call or deny it ever
+   * happened. An absent tool of any name is refused as "Tool not found" if
+   * called again, so keeping the history admits no ungated execution.
+   */
+  keepHistoryFor?: (toolName: string) => boolean,
+): ModelMessage[] => {
+  const available = new Set(
+    Array.from(availableToolNames).filter(
+      (name): name is string => typeof name === "string" && name.length > 0,
+    ),
+  );
+  const isAvailable = (name: string) =>
+    available.has(name) || keepHistoryFor?.(name) === true;
+
+  if (messages.length === 0) {
+    return messages;
+  }
+
+  const staleToolCallIds = new Set<string>();
+  const approvalIdToToolCallId = new Map<string, string>();
+
+  for (const msg of messages) {
+    if (
+      !msg ||
+      (msg.role !== "assistant" && msg.role !== "tool") ||
+      !Array.isArray((msg as any).content)
+    ) {
+      continue;
+    }
+
+    for (const part of (msg as any).content as unknown[]) {
+      const partType = readRecordString(part, "type");
+      if (!partType) continue;
+
+      const toolCallId = readRecordString(part, "toolCallId");
+      const toolName =
+        readRecordString(part, "toolName") ?? readRecordString(part, "name");
+
+      if (
+        (partType === "tool-call" || partType === "tool-result") &&
+        toolCallId &&
+        toolName &&
+        !isAvailable(toolName)
+      ) {
+        staleToolCallIds.add(toolCallId);
+      }
+
+      if (partType === "tool-approval-request") {
+        const approvalId = readRecordString(part, "approvalId");
+        if (approvalId && toolCallId) {
+          approvalIdToToolCallId.set(approvalId, toolCallId);
+        }
+      }
+    }
+  }
+
+  const staleApprovalIds = new Set<string>();
+  for (const [approvalId, toolCallId] of approvalIdToToolCallId.entries()) {
+    if (staleToolCallIds.has(toolCallId)) {
+      staleApprovalIds.add(approvalId);
+    }
+  }
+
+  return messages.flatMap((msg) => {
+    if (
+      !msg ||
+      (msg.role !== "assistant" && msg.role !== "tool") ||
+      !Array.isArray((msg as any).content)
+    ) {
+      return [msg];
+    }
+
+    const originalContent = (msg as any).content as unknown[];
+    const filteredContent = originalContent.filter((part) => {
+      const partType = readRecordString(part, "type");
+      if (!partType) return true;
+
+      if (partType === "tool-call" || partType === "tool-result") {
+        if (available.size === 0) return false;
+
+        const toolCallId = readRecordString(part, "toolCallId");
+        const toolName =
+          readRecordString(part, "toolName") ?? readRecordString(part, "name");
+
+        if (toolCallId && staleToolCallIds.has(toolCallId)) {
+          return false;
+        }
+
+        if (toolName && !isAvailable(toolName)) {
+          return false;
+        }
+
+        return true;
+      }
+
+      if (partType === "tool-approval-request") {
+        if (available.size === 0) return false;
+
+        const approvalId = readRecordString(part, "approvalId");
+        const toolCallId = readRecordString(part, "toolCallId");
+        if (
+          (approvalId && staleApprovalIds.has(approvalId)) ||
+          (toolCallId && staleToolCallIds.has(toolCallId))
+        ) {
+          return false;
+        }
+        return true;
+      }
+
+      if (partType === "tool-approval-response") {
+        if (available.size === 0) return false;
+
+        const approvalId = readRecordString(part, "approvalId");
+        if (approvalId && staleApprovalIds.has(approvalId)) {
+          return false;
+        }
+        return true;
+      }
+
+      return true;
+    });
+
+    if (filteredContent.length === 0) {
+      return [];
+    }
+
+    if (filteredContent.length === originalContent.length) {
+      return [msg];
+    }
+
+    return [{ ...msg, content: filteredContent } as ModelMessage];
+  });
+};
+
+export const scrubMcpAppsToolResultsForBackend = (
+  messages: ModelMessage[],
+  mcpClientManager: MCPClientManager,
+  selectedServers?: string[] | string,
+): ModelMessage[] => {
+  const serverIds = Array.isArray(selectedServers)
+    ? selectedServers
+    : selectedServers
+    ? [selectedServers]
+    : listBaseServers(mcpClientManager);
+  const metaByServer = new Map<string, Record<string, any>>();
+  for (const serverId of serverIds) {
+    metaByServer.set(serverId, mcpClientManager.getAllToolsMetadata(serverId));
+  }
+  const shouldScrub = (toolName?: string, serverId?: string): boolean => {
+    if (!toolName) return false;
+    if (serverId) {
+      return isMcpAppTool(metaByServer.get(serverId)?.[toolName]);
+    }
+    for (const metaMap of metaByServer.values()) {
+      if (isMcpAppTool(metaMap?.[toolName])) return true;
+    }
+    return false;
+  };
+
+  return messages.map((msg) => {
+    if (!msg || msg.role !== "tool" || !Array.isArray((msg as any).content)) {
+      return msg;
+    }
+    const content = (msg as any).content.map((part: any) => {
+      if (part?.type !== "tool-result") return part;
+      const toolName = part.toolName ?? part.name;
+      if (!shouldScrub(toolName, part.serverId)) return part;
+      const nextPart = { ...part };
+      if (nextPart.output?.type === "json") {
+        nextPart.output = {
+          ...nextPart.output,
+          value: scrubMetaAndStructuredContentFromToolResult(
+            nextPart.output.value,
+          ),
+        };
+      }
+      if ("result" in nextPart) {
+        nextPart.result = scrubMetaAndStructuredContentFromToolResult(
+          nextPart.result,
+        );
+      }
+      return nextPart;
+    });
+    return { ...msg, content } as ModelMessage;
+  });
+};
+
+export const scrubChatGPTAppsToolResultsForBackend = (
+  messages: ModelMessage[],
+  mcpClientManager: MCPClientManager,
+  selectedServers?: string[] | string,
+): ModelMessage[] => {
+  const serverIds = Array.isArray(selectedServers)
+    ? selectedServers
+    : selectedServers
+    ? [selectedServers]
+    : listBaseServers(mcpClientManager);
+  const metaByServer = new Map<string, Record<string, any>>();
+  for (const serverId of serverIds) {
+    metaByServer.set(serverId, mcpClientManager.getAllToolsMetadata(serverId));
+  }
+  const shouldScrub = (toolName?: string, serverId?: string): boolean => {
+    if (!toolName) return false;
+    if (serverId) {
+      return isChatGPTAppTool(metaByServer.get(serverId)?.[toolName]);
+    }
+    for (const metaMap of metaByServer.values()) {
+      if (isChatGPTAppTool(metaMap?.[toolName])) return true;
+    }
+    return false;
+  };
+
+  const scrubPayload = (payload: unknown): unknown => {
+    if (!payload || typeof payload !== "object") return payload;
+    const withoutMeta = scrubMetaFromToolResult(payload as any);
+    if (!("structuredContent" in (withoutMeta as Record<string, unknown>))) {
+      return withoutMeta;
+    }
+    const { structuredContent: _removed, ...rest } = withoutMeta as Record<
+      string,
+      unknown
+    >;
+    return rest;
+  };
+
+  return messages.map((msg) => {
+    if (!msg || msg.role !== "tool" || !Array.isArray((msg as any).content)) {
+      return msg;
+    }
+    const content = (msg as any).content.map((part: any) => {
+      if (part?.type !== "tool-result") return part;
+      const toolName = part.toolName ?? part.name;
+      if (!shouldScrub(toolName, part.serverId)) return part;
+      const nextPart = { ...part };
+      if (nextPart.output?.type === "json") {
+        nextPart.output = {
+          ...nextPart.output,
+          value: scrubPayload(nextPart.output.value),
+        };
+      }
+      if ("result" in nextPart) {
+        nextPart.result = scrubPayload(nextPart.result);
+      }
+      return nextPart;
+    });
+    return { ...msg, content } as ModelMessage;
+  });
+};

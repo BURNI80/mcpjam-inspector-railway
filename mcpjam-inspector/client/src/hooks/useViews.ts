@@ -1,0 +1,317 @@
+import { useCallback, useMemo } from "react";
+import { useQuery, useMutation } from "convex/react";
+import { useDbUserReady } from "@/contexts/db-user-ready-context";
+import { useArtifactQuery } from "@/lib/artifact-urls";
+import { shouldQueryProjectId, type RemoteServer } from "./useProjects";
+import { useConvexBlobUpload } from "./use-convex-blob-upload";
+
+/**
+ * The query has not run YET — as opposed to having run and found nothing.
+ *
+ * A skipped query reports `isLoading: false` with an empty list, which reads
+ * as "answered, and empty". Computed from the same inputs as `enableQuery` so
+ * it is true on the very first render: `isEnsuringUser` is not, since it
+ * starts `false` and is raised inside an effect.
+ */
+function queryWillRunLater(
+  isAuthenticated: boolean,
+  authLoading: boolean,
+  isUserReady: boolean,
+  projectId: string | null,
+): boolean {
+  if (!shouldQueryProjectId(projectId)) return false;
+  // Auth still resolving reads as signed OUT, so without this the first
+  // renders of a signed-in session call the skipped query's empty list an
+  // answer — the same defect one layer further out.
+  if (authLoading) return true;
+  return isAuthenticated && !isUserReady;
+}
+
+// Type definitions matching backend
+export type ViewProtocol = "mcp-apps" | "openai-apps";
+
+// Re-exported from the shared module so the playground hook, eval
+// fanout, and synthetic runner all reference the same definitions.
+// See `shared/widget-snapshot.ts` for the source of truth. The
+// `import type` brings the names into local scope so type references
+// below (`defaultContext: DisplayContext`, `widgetCsp?: WidgetCsp`)
+// resolve — `export type { ... }` alone is a pure re-export and does
+// not create a local binding.
+import type {
+  SharedChatWidgetDisplayContext as DisplayContext,
+  SharedChatWidgetCsp as WidgetCsp,
+} from "@/shared/widget-snapshot";
+
+export type { DisplayContext, WidgetCsp };
+
+export type ServerInfo = {
+  name: string;
+  iconUrl?: string;
+};
+
+// Base view type
+export interface ViewBase {
+  _id: string;
+  projectId: string;
+  serverId: string;
+  name: string;
+  description?: string;
+  toolName: string;
+  toolState: "output-available" | "output-error";
+  toolInput: unknown;
+  toolOutputUrl: string | null;
+  toolErrorText?: string;
+  toolMetadata?: unknown;
+  prefersBorder?: boolean;
+  tags?: string[];
+  category?: string;
+  defaultContext?: DisplayContext;
+  createdBy: string;
+  updatedBy?: string;
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Whether the cached widget HTML blob (`widgetHtmlUrl`) was
+   * captured with the OpenAI Apps SDK `window.openai` shim injected.
+   * Surfaced from the backend `mcpAppViews` / `openaiAppViews` row.
+   * Absent on pre-feature rows (`undefined` → renderer falls back to
+   * the live host's compat flag for non-cached fetches).
+   */
+  injectedOpenAiCompat?: boolean;
+}
+
+// MCP-specific view
+export interface McpAppView extends ViewBase {
+  protocol: "mcp-apps";
+  resourceUri: string;
+  toolsMetadata?: unknown;
+  widgetCsp?: WidgetCsp;
+  widgetPermissions?: unknown;
+  widgetPermissive?: boolean;
+  /** URL to cached widget HTML for offline rendering */
+  widgetHtmlUrl?: string | null;
+}
+
+// OpenAI-specific view
+export interface OpenaiAppView extends ViewBase {
+  protocol: "openai-apps";
+  outputTemplate: string;
+  serverInfo?: ServerInfo;
+  widgetState?: unknown;
+  /** URL to cached widget HTML for offline rendering */
+  widgetHtmlUrl?: string | null;
+}
+
+// Union type for any view
+export type AnyView = McpAppView | OpenaiAppView;
+
+// Query hook for fetching views
+export function useViewQueries({
+  isAuthenticated,
+  projectId,
+}: {
+  isAuthenticated: boolean;
+  projectId: string | null;
+}) {
+  const enableQuery = isAuthenticated && shouldQueryProjectId(projectId);
+  const queryProjectId = projectId?.trim() ?? "";
+
+  // Each view carries short-lived artifact links (tool output, widget HTML).
+  const views = useArtifactQuery<AnyView[]>(
+    "views:listAllByProject",
+    enableQuery ? { projectId: queryProjectId } : "skip",
+  );
+
+  const isLoading = enableQuery && views === undefined;
+
+  // Sort by updatedAt (most recent first)
+  const sortedViews = useMemo(() => {
+    if (!views) return [];
+    return [...views].sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [views]);
+
+  // Group views by server
+  const viewsByServer = useMemo(() => {
+    if (!views) return new Map<string, AnyView[]>();
+    const grouped = new Map<string, AnyView[]>();
+    for (const view of views) {
+      const existing = grouped.get(view.serverId) || [];
+      grouped.set(view.serverId, [...existing, view]);
+    }
+    return grouped;
+  }, [views]);
+
+  // Group views by category
+  const viewsByCategory = useMemo(() => {
+    if (!views) return new Map<string, AnyView[]>();
+    const grouped = new Map<string, AnyView[]>();
+    for (const view of views) {
+      const category = view.category || "Uncategorized";
+      const existing = grouped.get(category) || [];
+      grouped.set(category, [...existing, view]);
+    }
+    return grouped;
+  }, [views]);
+
+  // Group views by protocol
+  const viewsByProtocol = useMemo(() => {
+    if (!views)
+      return { mcp: [] as McpAppView[], openai: [] as OpenaiAppView[] };
+    return {
+      mcp: views.filter((v): v is McpAppView => v.protocol === "mcp-apps"),
+      openai: views.filter(
+        (v): v is OpenaiAppView => v.protocol === "openai-apps",
+      ),
+    };
+  }, [views]);
+
+  return {
+    views,
+    sortedViews,
+    viewsByServer,
+    viewsByCategory,
+    viewsByProtocol,
+    isLoading,
+    hasViews: (views?.length ?? 0) > 0,
+  };
+}
+
+// Mutation hook for view operations
+export function useViewMutations() {
+  // MCP mutations — canonical write path per SEP-1865. All saved views
+  // live in mcpAppViews after the Phase B backfill; the legacy
+  // openaiAppViews table is being dropped in backend Phase C2.
+  const createMcpView = useMutation("mcpAppViews:create" as any);
+  const updateMcpView = useMutation("mcpAppViews:update" as any);
+  const removeMcpView = useMutation("mcpAppViews:remove" as any);
+  const upload = useConvexBlobUpload();
+  // A view's cached blobs go through the backend's upload route (MJ-006); the
+  // storage id it returns is what `create`/`update` take.
+  const uploadMcpViewBlob = useCallback(
+    (body: Blob | string, contentType: string) =>
+      upload({ purpose: "mcp-app-view" }, body, contentType),
+    [upload],
+  );
+
+  return {
+    createMcpView,
+    updateMcpView,
+    removeMcpView,
+    uploadMcpViewBlob,
+  };
+}
+
+// Hook to get servers for a project (for server ID resolution)
+export function useProjectServers({
+  isAuthenticated,
+  authLoading = false,
+  projectId,
+}: {
+  isAuthenticated: boolean;
+  /** Convex auth has not settled yet. Optional: absent means it has. */
+  authLoading?: boolean;
+  projectId: string | null;
+}) {
+  const isUserReady = useDbUserReady();
+  const enableQuery =
+    isAuthenticated && isUserReady && shouldQueryProjectId(projectId);
+  const queryProjectId = projectId?.trim() ?? "";
+
+  const servers = useQuery(
+    "servers:getProjectServers" as any,
+    enableQuery ? ({ projectId: queryProjectId } as any) : "skip",
+  ) as RemoteServer[] | undefined;
+
+  const isLoading = enableQuery && servers === undefined;
+  /** Told apart by the hook that owns the skip, not by every caller. */
+  const isBootstrapping = queryWillRunLater(
+    isAuthenticated,
+    authLoading,
+    isUserReady,
+    projectId,
+  );
+
+  // Create a map for quick lookup by name
+  const serversByName = useMemo(() => {
+    if (!servers) return new Map<string, string>();
+    const map = new Map<string, string>();
+    for (const server of servers) {
+      map.set(server.name, server._id);
+    }
+    return map;
+  }, [servers]);
+
+  // Create a map for reverse lookup by ID
+  const serversById = useMemo(() => {
+    if (!servers) return new Map<string, string>();
+    const map = new Map<string, string>();
+    for (const server of servers) {
+      map.set(server._id, server.name);
+    }
+    return map;
+  }, [servers]);
+
+  return {
+    servers,
+    serversByName,
+    serversById,
+    isLoading,
+    isBootstrapping,
+  };
+}
+
+export function useProjectServerAttachments({
+  isAuthenticated,
+  authLoading = false,
+  projectId,
+}: {
+  isAuthenticated: boolean;
+  /** Convex auth has not settled yet. Optional: absent means it has. */
+  authLoading?: boolean;
+  projectId: string | null;
+}) {
+  const isUserReady = useDbUserReady();
+  const enableQuery =
+    isAuthenticated && isUserReady && shouldQueryProjectId(projectId);
+  const queryProjectId = projectId?.trim() ?? "";
+
+  const serverAttachments = useQuery(
+    "serverAttachments:listServerAttachments" as any,
+    enableQuery ? ({ projectId: queryProjectId } as any) : "skip",
+  ) as Array<{
+    _id: string;
+    name: string;
+    serverIds: string[];
+    resolvedServerNames: string[];
+    createdAt: number;
+    updatedAt: number;
+  }> | undefined;
+
+  const isLoading = enableQuery && serverAttachments === undefined;
+  /** See `useProjectServers`: a skipped query is not an answer. */
+  const isBootstrapping = queryWillRunLater(
+    isAuthenticated,
+    authLoading,
+    isUserReady,
+    projectId,
+  );
+
+  return {
+    serverAttachments: serverAttachments ?? [],
+    isLoading,
+    isBootstrapping,
+  };
+}
+
+// Server mutation for creating servers
+export function useServerMutations() {
+  const createServer = useMutation("servers:createServer" as any);
+  const createServerIfMissing = useMutation(
+    "servers:createServerIfMissing" as any,
+  );
+
+  return {
+    createServer,
+    createServerIfMissing,
+  };
+}

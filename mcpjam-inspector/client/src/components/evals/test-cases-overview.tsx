@@ -1,0 +1,1204 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useConvex, useQuery } from "convex/react";
+import { track } from "@/lib/analytics";
+import { Circle, Loader2, Play, Plus, Puzzle, Sparkles, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@mcpjam/design-system/button";
+import { Checkbox } from "@mcpjam/design-system/checkbox";
+import { EmptyState } from "@/components/ui/empty-state";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@mcpjam/design-system/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@mcpjam/design-system/tooltip";
+import { getBillingErrorMessage } from "@/lib/billing-entitlements";
+import { cn } from "@/lib/utils";
+import {
+  EVAL_DESTRUCTIVE_BUTTON_CLASS,
+  EVAL_FAILED_BADGE_CLASS,
+  EVAL_LOW_PASS_RATE_TEXT_CLASS,
+} from "./constants";
+import { ImportClaimBadge } from "./import-claim-badge";
+import { ITERATION_RESULT_BADGE_BASE } from "./iteration-result-presentation";
+import { computeIterationResult } from "./pass-criteria";
+import {
+  formatRelativeTime,
+  getEffectiveSuiteServers,
+  suiteHasRunnableServers,
+} from "./helpers";
+import type { EvalCase, EvalIteration, EvalSuite, EvalSuiteRun } from "./types";
+import { isModelFree } from "@/shared/steps";
+import {
+  getDefaultTestCaseModelValue,
+  getRunnableCaseModels,
+} from "./single-test-case-runner";
+import { QuickCaseRunCostEstimateHint } from "./run-cost-estimate-hint";
+import type { SuiteOverviewView } from "@/lib/eval-route-types";
+import {
+  caseListCardClassName,
+  CaseListColumnHeaders,
+} from "./case-list-shared";
+import { CrossHostDashboard } from "./cross-host/cross-host-dashboard";
+import {
+  useCrossHostData,
+  formatHostFallback,
+  type CrossHostEnvironment,
+} from "./cross-host/use-cross-host-data";
+import { HostCell } from "./cross-host/host-cell";
+import { HostChip } from "@/components/hosts/host-chip";
+import { evalSurfaceHeaderClass } from "./eval-surface-chrome";
+
+function iterationRecencyTs(iter: EvalIteration): number {
+  return iter.updatedAt ?? iter.startedAt ?? iter.createdAt ?? 0;
+}
+
+interface TestCasesOverviewProps {
+  suite: {
+    _id: string;
+    name: string;
+    environment?: { servers?: string[] };
+    /** Host attachments drive the "By host" matrix; absent on minimal callers. */
+    hostAttachments?: EvalSuite["hostAttachments"];
+    /**
+     * Attached project environments. Present ⇒ single-case quick-run routes to
+     * "Run all" instead of running, which suppresses the per-case credit
+     * estimate (an estimate beside a control that won't run misleads).
+     */
+    environmentIds?: string[];
+  };
+  cases: EvalCase[];
+  allIterations: EvalIteration[];
+  /**
+   * Suite runs, required to build the cross-host matrix. Optional because
+   * minimal callers don't need it; the matrix only renders when host
+   * attachments exist, which implies runs.
+   */
+  runs?: EvalSuiteRun[];
+  runsViewMode: SuiteOverviewView;
+  onViewModeChange: (value: SuiteOverviewView) => void;
+  onTestCaseClick: (testCaseId: string) => void;
+  clickHint?: string;
+  runTrendData: Array<{
+    runId: string;
+    runIdDisplay: string;
+    passRate: number;
+    label: string;
+  }>;
+  modelStats: Array<{
+    model: string;
+    passRate: number;
+    passed: number;
+    failed: number;
+    total: number;
+  }>;
+  runsLoading: boolean;
+  onRunClick?: (runId: string) => void;
+  /** When set, each row shows a Run control (e.g. Explore / CI suite overview). */
+  onRunTestCase?: (testCase: EvalCase) => void;
+  runningTestCaseId?: string | null;
+  /** True while a suite rerun or run replay is in progress (disables per-case Run). */
+  blockTestCaseRuns?: boolean;
+  runTestCaseDisabledReason?: string | null;
+  /** Required for server connection gating when set; when omitted, server gating is skipped. */
+  connectedServerNames?: Set<string>;
+  /** Playground / contexts where switching to the runs table is not offered. */
+  hideViewModeSelect?: boolean;
+  /**
+   * When true, the case list fills the parent pane and scrolls in place instead
+   * of using a fixed max height (suite results split).
+   */
+  fillAvailableHeight?: boolean;
+  /**
+   * Replace the single "Last run" status column with one result column per
+   * attached client (the cross-host matrix, inline). Falls back to "Last run"
+   * when the suite has no client attachments. Used by the suite Cases tab so
+   * cases + per-client results are one surface, not two.
+   */
+  showClientResultColumns?: boolean;
+  /**
+   * When set, the Last run summary opens test detail focused on that iteration (one click).
+   */
+  onOpenLastRun?: (testCaseId: string, iterationId: string) => void;
+  /**
+   * When set (e.g. playground), show run-style selection + batch delete for test cases.
+   */
+  onDeleteTestCasesBatch?: (testCaseIds: string[]) => Promise<void>;
+  /** When true, the surrounding view is the direct-guest eval playground. */
+  isDirectGuest?: boolean;
+  /**
+   * Empty-state CTAs (Playground). When provided, the "No test cases yet" empty
+   * state shows Generate / New case buttons above the message — the same actions
+   * as the suite header, surfaced where the user is looking.
+   */
+  onGenerateTestCases?: () => void;
+  canGenerateTestCases?: boolean;
+  /** Why Generate is disabled (shown in its tooltip), mirroring the suite header. */
+  generateTestCasesDisabledReason?: string;
+  isGeneratingTestCases?: boolean;
+  onCreateTestCase?: () => void;
+  /** Run-once-then-adopt draft. Evaluate-only; omitted keeps the two-button empty state. */
+  onRecordTestCase?: () => void;
+  /**
+   * Evaluate (New) only: the empty state offers Generate / Record / Write and
+   * the CLI import pointer instead of Generate / New case.
+   *
+   * OFF by default. This table is shared with the shipped Evals tab, so the
+   * surface decides — see the same prop on `TestTemplateEditor`.
+   */
+  simpleCaseEditor?: boolean;
+  /**
+   * `namedHostId` → display name for hosts with no suite attachment — the
+   * resolved host of an environment-backed run, or a detached one. Owned by
+   * the parent (project host list) so this component stays queryless.
+   */
+  hostNamesById?: Map<string, string | null>;
+  /**
+   * The suite's project environments, owned by the parent for the same reason
+   * as `hostNamesById`. Without them a run can only be placed by its resolved
+   * host, so two model cells on one client share a column.
+   */
+  environments?: readonly CrossHostEnvironment[];
+  /**
+   * Iteration override the per-case Run control will send (quick-run state).
+   * Forwarded to the credit estimate so the number matches the run the button
+   * will actually launch.
+   */
+  quickRunIterationOverride?: number;
+}
+
+export function TestCasesOverview({
+  suite,
+  cases,
+  runs,
+  allIterations,
+  runsViewMode,
+  onViewModeChange,
+  onTestCaseClick,
+  clickHint = "Click on a case to view its run history and performance.",
+  hideViewModeSelect = false,
+  fillAvailableHeight = false,
+  showClientResultColumns = false,
+  onOpenLastRun,
+  onDeleteTestCasesBatch,
+  onRunTestCase,
+  runningTestCaseId = null,
+  blockTestCaseRuns = false,
+  runTestCaseDisabledReason = null,
+  connectedServerNames,
+  isDirectGuest = false,
+  onGenerateTestCases,
+  canGenerateTestCases = false,
+  generateTestCasesDisabledReason,
+  isGeneratingTestCases = false,
+  onCreateTestCase,
+  onRecordTestCase,
+  hostNamesById,
+  environments,
+  quickRunIterationOverride,
+  simpleCaseEditor = false,
+}: TestCasesOverviewProps) {
+  const simpleCaseEditorEnabled = simpleCaseEditor;
+  const convex = useConvex();
+  // A one-host matrix is pointless, so the cross-host view is only offered when
+  // the suite has >=2 host attachments. Same source useCrossHostData reads.
+  // An environment suite's per-case Run executes its environments (each
+  // environment's own model and servers), which the per-model quick-run
+  // estimate does not describe, so no estimate is shown beside it. Its servers
+  // resolve server-side: the browser's connections do not gate it.
+  const isEnvironmentSuite = (suite.environmentIds?.length ?? 0) > 0;
+  const hostAttachmentCount = suite.hostAttachments?.length ?? 0;
+  const canShowByHost = hostAttachmentCount >= 2;
+  const isByHostView = canShowByHost && runsViewMode === "runs";
+  const liveCases = useQuery(
+    "testSuites:listTestCases" as any,
+    { suiteId: suite._id } as any
+  ) as EvalCase[] | undefined;
+  const [hydratedIterations, setHydratedIterations] = useState<EvalIteration[]>(
+    []
+  );
+  const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(
+    new Set()
+  );
+  const [showBatchDeleteModal, setShowBatchDeleteModal] = useState(false);
+  const [isBatchDeleting, setIsBatchDeleting] = useState(false);
+
+  useEffect(() => {
+    if (!onDeleteTestCasesBatch) {
+      setSelectedCaseIds(new Set());
+      setShowBatchDeleteModal(false);
+    }
+  }, [onDeleteTestCasesBatch]);
+
+  const toggleCaseSelection = useCallback((testCaseId: string) => {
+    setSelectedCaseIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(testCaseId)) {
+        next.delete(testCaseId);
+      } else {
+        next.add(testCaseId);
+      }
+      return next;
+    });
+  }, []);
+
+  const effectiveCases = useMemo(() => {
+    if (!liveCases) {
+      return cases;
+    }
+
+    const liveCaseById = new Map(
+      liveCases.map((testCase) => [testCase._id, testCase] as const)
+    );
+    const mergedCases = cases.map((testCase) => ({
+      ...testCase,
+      ...(liveCaseById.get(testCase._id) ?? {}),
+    }));
+
+    for (const liveCase of liveCases) {
+      if (!cases.some((testCase) => testCase._id === liveCase._id)) {
+        mergedCases.push(liveCase);
+      }
+    }
+
+    return mergedCases;
+  }, [cases, liveCases]);
+
+  const toggleAllCases = useCallback(() => {
+    setSelectedCaseIds((prev) => {
+      if (prev.size === effectiveCases.length) {
+        return new Set();
+      }
+      return new Set(effectiveCases.map((c) => c._id));
+    });
+  }, [effectiveCases]);
+
+  const confirmBatchDeleteTestCases = useCallback(async () => {
+    if (!onDeleteTestCasesBatch) return;
+    const ids = Array.from(selectedCaseIds);
+    if (ids.length === 0) return;
+
+    setIsBatchDeleting(true);
+    try {
+      await onDeleteTestCasesBatch(ids);
+      setSelectedCaseIds(new Set());
+      setShowBatchDeleteModal(false);
+      toast.success(
+        `Deleted ${ids.length} test case${ids.length === 1 ? "" : "s"}`
+      );
+    } catch (error) {
+      console.error("Failed to delete test cases:", error);
+      toast.error(getBillingErrorMessage(error, "Failed to delete test cases"));
+    } finally {
+      setIsBatchDeleting(false);
+    }
+  }, [onDeleteTestCasesBatch, selectedCaseIds]);
+
+  useEffect(() => {
+    const localIterationIds = new Set(
+      allIterations.map((iteration) => iteration._id)
+    );
+    const localCaseIds = new Set(
+      allIterations
+        .map((iteration) => iteration.testCaseId)
+        .filter(
+          (testCaseId): testCaseId is string => typeof testCaseId === "string"
+        )
+    );
+    const casesNeedingHydration = effectiveCases.filter((testCase) => {
+      const missingSavedIteration =
+        typeof testCase.lastMessageRun === "string" &&
+        !localIterationIds.has(testCase.lastMessageRun);
+      const hasLocalIterations = localCaseIds.has(testCase._id);
+      return missingSavedIteration || !hasLocalIterations;
+    });
+
+    if (casesNeedingHydration.length === 0) {
+      setHydratedIterations((current) => (current.length === 0 ? current : []));
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      const fetched = await Promise.all(
+        casesNeedingHydration.map(async (testCase) => {
+          try {
+            const iterations = (await convex.query(
+              "testSuites:listTestIterations" as any,
+              { testCaseId: testCase._id } as any
+            )) as EvalIteration[] | undefined;
+
+            if (Array.isArray(iterations) && iterations.length > 0) {
+              return iterations;
+            }
+          } catch (error) {
+            console.error(
+              "Failed to hydrate test case iterations from listTestIterations:",
+              error
+            );
+          }
+
+          if (!testCase.lastMessageRun) {
+            return [];
+          }
+
+          try {
+            const iteration = (await convex.query(
+              "testSuites:getTestIteration" as any,
+              { iterationId: testCase.lastMessageRun } as any
+            )) as EvalIteration | null;
+            return iteration ? [iteration] : [];
+          } catch (error) {
+            console.error(
+              "Failed to hydrate saved iteration from getTestIteration:",
+              error
+            );
+            return [];
+          }
+        })
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      const deduped = new Map<string, EvalIteration>();
+      for (const iteration of [...allIterations, ...fetched.flat()]) {
+        if (iteration?._id) {
+          deduped.set(iteration._id, iteration);
+        }
+      }
+      setHydratedIterations(Array.from(deduped.values()));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [allIterations, convex, effectiveCases]);
+
+  const effectiveIterations = useMemo(() => {
+    const deduped = new Map<string, EvalIteration>();
+    for (const iteration of [...allIterations, ...hydratedIterations]) {
+      if (iteration?._id) {
+        deduped.set(iteration._id, iteration);
+      }
+    }
+    return Array.from(deduped.values());
+  }, [allIterations, hydratedIterations]);
+
+  // Per-case latest iteration by wall time (for “Last run”)
+  const testCaseStats = useMemo(() => {
+    return effectiveCases.map((testCase) => {
+      const caseIterations = effectiveIterations.filter(
+        (iter) => iter.testCaseId === testCase._id
+      );
+      let lastRunIteration: EvalIteration | null = null;
+      for (const iter of caseIterations) {
+        if (
+          !lastRunIteration ||
+          iterationRecencyTs(iter) >= iterationRecencyTs(lastRunIteration)
+        ) {
+          lastRunIteration = iter;
+        }
+      }
+      return {
+        testCase,
+        lastRunIteration,
+      };
+    });
+  }, [effectiveCases, effectiveIterations]);
+
+  // Per-client result columns (the cross-host matrix, inline in the case list)
+  // so cases + per-client outcomes are one surface. Falls back to the single
+  // "Last run" column when the suite has no current client attachments.
+  const crossHost = useCrossHostData(
+    suite as unknown as EvalSuite,
+    effectiveCases,
+    runs ?? [],
+    effectiveIterations,
+    { hostNamesById, environments },
+  );
+  const clientColumns = useMemo(
+    () =>
+      showClientResultColumns
+        ? crossHost.hostColumns.filter((col) => !col.isHistorical)
+        : [],
+    [showClientResultColumns, crossHost.hostColumns],
+  );
+  const showClientRail = clientColumns.length > 0;
+  const clientRailStyle = useMemo(
+    () => ({ gridTemplateColumns: `repeat(${clientColumns.length}, 9rem)` }),
+    [clientColumns.length],
+  );
+
+  const batchDelete = Boolean(onDeleteTestCasesBatch);
+  const showRunColumn = Boolean(onRunTestCase);
+  // Effective list = legacy `environment.servers` merged with any host
+  // attachments' `resolvedServerNames`. Without the merge, per-case Run
+  // buttons stay disabled on attachment-only suites (the current model).
+  const suiteServers = getEffectiveSuiteServers(suite);
+  const missingSuiteServers =
+    connectedServerNames == null
+      ? []
+      : suiteServers.filter(
+          (serverName) => !connectedServerNames.has(serverName)
+        );
+  const showPersistentBatchHeader =
+    batchDelete && hideViewModeSelect && testCaseStats.length > 0;
+  const showDisconnectedPlaygroundEmptyState =
+    hideViewModeSelect &&
+    testCaseStats.length === 0 &&
+    missingSuiteServers.length > 0;
+  const disconnectedPlaygroundServerName =
+    missingSuiteServers[0] ?? suiteServers[0] ?? "your server";
+
+  return (
+    <>
+      {/* Cases List */}
+      <div
+        className={cn(
+          // Empty state floats with no card border/background; the bordered
+          // card only frames an actual list of cases.
+          testCaseStats.length === 0 ? "flex flex-col" : caseListCardClassName,
+          fillAvailableHeight || isByHostView
+            ? "flex min-h-0 flex-1 flex-col overflow-hidden"
+            : "max-h-[600px]",
+        )}
+      >
+        {!isByHostView &&
+        batchDelete &&
+        (showPersistentBatchHeader || selectedCaseIds.size > 0) ? (
+          <div className="border-b px-4 py-2 shrink-0 bg-muted/50 flex items-center justify-between">
+            <div className="flex items-center gap-3 min-w-0">
+              {!isByHostView ? (
+                <Checkbox
+                  checked={selectedCaseIds.size === testCaseStats.length}
+                  onCheckedChange={toggleAllCases}
+                  aria-label="Select all cases"
+                  disabled={testCaseStats.length === 0}
+                />
+              ) : null}
+              <span className="text-xs font-medium truncate">Test Cases</span>
+            </div>
+            {selectedCaseIds.size > 0 ? (
+              <div className="flex items-center gap-2 shrink-0">
+                <span className="text-xs tabular-nums text-muted-foreground">
+                  {selectedCaseIds.size} selected
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-muted-foreground"
+                  onClick={() => setSelectedCaseIds(new Set())}
+                  disabled={isBatchDeleting}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  className={cn("h-8", EVAL_DESTRUCTIVE_BUTTON_CLASS)}
+                  onClick={() => setShowBatchDeleteModal(true)}
+                  disabled={isBatchDeleting}
+                >
+                  Delete
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        ) : !showDisconnectedPlaygroundEmptyState &&
+          !(
+            !isByHostView &&
+            hideViewModeSelect &&
+            testCaseStats.length === 0
+          ) ? (
+          <div
+            className={cn(
+              "shrink-0 flex items-center justify-between gap-3 border-b",
+              isByHostView ? "bg-muted/60 px-4 py-2.5" : "px-4 py-2"
+            )}
+          >
+            <div className="min-w-0">
+              {isByHostView ? (
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <h2 className="truncate text-base font-semibold leading-tight text-foreground sm:text-lg">
+                    Test cases
+                    <span className="ml-1.5 font-mono text-sm font-normal tabular-nums text-muted-foreground">
+                      · {effectiveCases.length}
+                    </span>
+                  </h2>
+                  <p className="text-[11px] text-muted-foreground">
+                    Pass rate, latency, and tokens per attached host
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">{clickHint}</p>
+              )}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {!hideViewModeSelect ? (
+                <div className="flex items-center rounded-md border bg-muted/40 p-0.5 gap-0.5">
+                  {(
+                    [
+                      { value: "runs", label: "Runs" },
+                      { value: "test-cases", label: "Cases" },
+                    ] as { value: SuiteOverviewView; label: string }[]
+                  ).map(({ value, label }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => onViewModeChange(value)}
+                      className={cn(
+                        "px-2 py-0.5 text-xs rounded transition-colors",
+                        runsViewMode === value
+                          ? "bg-background text-foreground shadow-sm font-medium"
+                          : "text-muted-foreground hover:text-foreground"
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        {isByHostView ? (
+          <div className="min-h-0 flex-1 overflow-y-auto bg-background">
+            <CrossHostDashboard
+              suite={suite as EvalSuite}
+              cases={effectiveCases}
+              runs={runs ?? []}
+              allIterations={allIterations}
+              expanded
+              onTestCaseClick={onTestCaseClick}
+              onDeleteTestCasesBatch={onDeleteTestCasesBatch}
+              hostNamesById={hostNamesById}
+              environments={environments}
+            />
+          </div>
+        ) : (
+          <>
+            {/* Column Headers */}
+            {testCaseStats.length > 0 ? (
+              showClientRail ? (
+                <div
+                  className={cn(
+                    "flex w-full items-center gap-2 px-4 py-2 text-xs font-medium text-muted-foreground",
+                    evalSurfaceHeaderClass,
+                  )}
+                >
+                  {batchDelete ? (
+                    <div className="w-7 shrink-0" aria-hidden />
+                  ) : null}
+                  <div className="min-w-0 flex-1 [min-width:120px]">
+                    Case name
+                  </div>
+                  <div className="grid shrink-0" style={clientRailStyle}>
+                    {clientColumns.map((col) => (
+                      <div
+                        key={col.columnKey ?? col.hostId}
+                        className="flex justify-center border-l border-border/40 px-2"
+                      >
+                        <div className="flex flex-col items-center gap-0.5">
+                          <HostChip
+                            name={col.hostName ?? formatHostFallback(col.hostId)}
+                            hostId={col.hostId}
+                            className="max-w-[8rem] border-border/70 bg-background/80 px-2 py-0.5 text-[10px] shadow-none"
+                          />
+                          {col.modelLabel ? (
+                            <span className="max-w-[8rem] truncate font-mono text-[9px] text-muted-foreground">
+                              {col.modelLabel}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {showRunColumn ? (
+                    <div className="w-7 shrink-0" aria-hidden />
+                  ) : null}
+                  {batchDelete ? (
+                    <div className="w-7 shrink-0" aria-hidden />
+                  ) : null}
+                </div>
+              ) : (
+                <CaseListColumnHeaders
+                  firstColumnLabel="Case name"
+                  secondColumnLabel="Last run"
+                  leadingGutter={batchDelete}
+                  trailingGutter={Number(showRunColumn) + Number(batchDelete)}
+                />
+              )
+            ) : null}
+
+            <div
+              className={cn(
+                "divide-y",
+                fillAvailableHeight || isByHostView
+                  ? "min-h-0 flex-1 overflow-y-auto"
+                  : "overflow-y-auto",
+              )}
+            >
+              {testCaseStats.length === 0 ? (
+                isGeneratingTestCases ? (
+                  <div className="flex min-h-[200px] flex-col items-center justify-center gap-3 px-4 py-12 text-sm text-muted-foreground">
+                    <Loader2 className="h-6 w-6 animate-spin" aria-hidden />
+                    <span>Generating test cases…</span>
+                  </div>
+                ) : showDisconnectedPlaygroundEmptyState ? (
+                  <EmptyState
+                    icon={Puzzle}
+                    title={`Connect to "${disconnectedPlaygroundServerName}" server to generate tests`}
+                    description="Playground can automatically generate test cases once a server is connected."
+                    className="h-auto min-h-[240px]"
+                  />
+                ) : hideViewModeSelect ? (
+                  <div className="flex min-h-[200px] flex-col items-center justify-center gap-4 px-4 py-12">
+                    {onGenerateTestCases || onCreateTestCase ? (
+                      <div className="flex flex-col items-center gap-3">
+                        <div className="flex items-center gap-2">
+                          {onGenerateTestCases ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex">
+                                  <Button
+                                    type="button"
+                                    variant="default"
+                                    className="h-11 gap-2 px-6 text-sm"
+                                    onClick={onGenerateTestCases}
+                                    disabled={
+                                      !canGenerateTestCases ||
+                                      isGeneratingTestCases
+                                    }
+                                    aria-busy={isGeneratingTestCases}
+                                  >
+                                    {isGeneratingTestCases ? (
+                                      <Loader2
+                                        className="h-4 w-4 shrink-0 animate-spin"
+                                        aria-hidden
+                                      />
+                                    ) : (
+                                      <Sparkles
+                                        className="h-4 w-4 shrink-0"
+                                        aria-hidden
+                                      />
+                                    )}
+                                    Generate
+                                  </Button>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent
+                                variant="muted"
+                                side="bottom"
+                                sideOffset={6}
+                              >
+                                {isGeneratingTestCases
+                                  ? "Generating test cases…"
+                                  : !canGenerateTestCases
+                                    ? generateTestCasesDisabledReason ??
+                                      "Configure suite servers before generating cases."
+                                    : "Generate suggested cases from your server's tools."}
+                              </TooltipContent>
+                            </Tooltip>
+                          ) : null}
+                          {simpleCaseEditorEnabled && onRecordTestCase ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="h-11 gap-2 px-6 text-sm"
+                              onClick={onRecordTestCase}
+                            >
+                              <Circle
+                                className="h-4 w-4 shrink-0"
+                                aria-hidden
+                              />
+                              Record
+                            </Button>
+                          ) : null}
+                          {onCreateTestCase ? (
+                            <Button
+                              type="button"
+                              variant={
+                                simpleCaseEditorEnabled ? "outline" : "default"
+                              }
+                              className="h-11 gap-2 px-6 text-sm"
+                              onClick={onCreateTestCase}
+                            >
+                              <Plus
+                                className="h-4 w-4 shrink-0"
+                                aria-hidden
+                              />
+                              {simpleCaseEditorEnabled ? "Write" : "New case"}
+                            </Button>
+                          ) : null}
+                        </div>
+                        {simpleCaseEditorEnabled ? (
+                          <p className="text-[11px] text-muted-foreground">
+                            Or import a suite file with{" "}
+                            <code className="font-mono">mcpjam cloud eval</code>
+                            .
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="px-4 py-12 text-center text-sm text-muted-foreground">
+                    No cases found.
+                  </div>
+                )
+              ) : (
+                testCaseStats.map(({ testCase, lastRunIteration }) => {
+                  // Per-client cells for this case + divergence tone: amber when
+                  // clients disagree, red when they all fail (mirrors the matrix).
+                  const byHost = crossHost.matrix.get(testCase._id);
+                  const cellsWithData = clientColumns
+                    .map((col) => byHost?.get(col.columnKey ?? col.hostId))
+                    .filter(
+                      (c): c is NonNullable<typeof c> => !!c && c.totalCount > 0,
+                    );
+                  const passFlags = cellsWithData.map(
+                    (c) => c.passCount >= c.totalCount,
+                  );
+                  const rowTone: "diverge" | "allfail" | null =
+                    cellsWithData.length >= 2
+                      ? passFlags.every(Boolean)
+                        ? null
+                        : passFlags.some(Boolean)
+                          ? "diverge"
+                          : "allfail"
+                      : null;
+                  const clientRail = showClientRail ? (
+                    <div className="grid shrink-0" style={clientRailStyle}>
+                      {clientColumns.map((col) => (
+                        <div
+                          key={col.columnKey ?? col.hostId}
+                          className="border-l border-border/40"
+                        >
+                          <HostCell data={byHost?.get(col.columnKey ?? col.hostId)} />
+                        </div>
+                      ))}
+                    </div>
+                  ) : null;
+                  const rowToneClass = cn(
+                    rowTone === "diverge" && "bg-warning/[0.05]",
+                    rowTone === "allfail" && "bg-destructive/[0.05]",
+                  );
+                  const hasConfiguredSuiteServers = isEnvironmentSuite
+                    ? suiteHasRunnableServers(suite)
+                    : suiteServers.length > 0;
+                  const missingServers =
+                    connectedServerNames == null || isEnvironmentSuite
+                      ? []
+                      : suiteServers.filter(
+                          (serverName) => !connectedServerNames.has(serverName)
+                        );
+                  const hasModels = Boolean(testCase.models?.length);
+                  // The models quick-run will REALLY execute. A case whose only
+                  // entries are malformed has `hasModels === true` but still
+                  // toasts "Add a model first", so the estimate keys off this
+                  // list, not the raw one.
+                  const runnableCaseModels = getRunnableCaseModels(testCase);
+                  // Render checks have no quick-run path (suite/schedule only);
+                  // keep the gate explicit rather than riding on their empty
+                  // models. Detect both legacy widget_probe and new unified
+                  // pinned-only cases.
+                  const isProbeCase = isModelFree(testCase.steps);
+                  const isThisCaseRunning = runningTestCaseId === testCase._id;
+                  const isAnotherCaseRunning =
+                    runningTestCaseId != null &&
+                    runningTestCaseId !== testCase._id;
+                  // Guests rely on the local persistent MCP manager; skip the
+                  // suite-server-connected gate and let the runner surface a
+                  // connection error if the server is actually missing.
+                  const serverGateBlocked =
+                    !isDirectGuest && missingServers.length > 0;
+                  const runDisabled =
+                    !onRunTestCase ||
+                    blockTestCaseRuns ||
+                    Boolean(runTestCaseDisabledReason) ||
+                    isAnotherCaseRunning ||
+                    isProbeCase ||
+                    !hasModels ||
+                    serverGateBlocked ||
+                    isThisCaseRunning;
+                  const disconnectedRunTooltip = serverGateBlocked
+                    ? "Connect and run."
+                    : runTestCaseDisabledReason;
+
+                  const lastRunResult = lastRunIteration
+                    ? computeIterationResult(lastRunIteration)
+                    : null;
+                  const lastRunLabel =
+                    lastRunResult === "passed"
+                      ? "Passed"
+                      : lastRunResult === "failed"
+                      ? "Failed"
+                      : lastRunResult === "cancelled"
+                      ? "Cancelled"
+                      : lastRunResult === "pending"
+                      ? "Running"
+                      : "Never run";
+                  const lastRunTimestamp = lastRunIteration
+                    ? lastRunIteration.updatedAt ??
+                      lastRunIteration.startedAt ??
+                      lastRunIteration.createdAt ??
+                      null
+                    : null;
+                  const caseTitle = testCase.title || "Untitled test case";
+                  const passBadge = (
+                    <span
+                      className="inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-success/50 text-foreground"
+                      aria-label="Passed"
+                    >
+                      Passed
+                    </span>
+                  );
+                  const failBadge = (
+                    <span
+                      className={cn(
+                        ITERATION_RESULT_BADGE_BASE,
+                        "tracking-wider",
+                        EVAL_FAILED_BADGE_CLASS
+                      )}
+                      aria-label="Failed"
+                    >
+                      Failed
+                    </span>
+                  );
+                  const lastRunSummary = lastRunIteration ? (
+                    <>
+                      {lastRunResult === "passed"
+                        ? passBadge
+                        : lastRunResult === "failed"
+                        ? failBadge
+                        : lastRunLabel}
+                      {lastRunTimestamp ? (
+                        <span className="font-normal">
+                          {" "}
+                          · {formatRelativeTime(lastRunTimestamp)}
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    "Never run"
+                  );
+                  const lastRunOpenable = Boolean(
+                    onOpenLastRun && lastRunIteration?._id
+                  );
+                  const lastRunAriaLabel =
+                    lastRunIteration && lastRunOpenable
+                      ? `View last run: ${lastRunLabel}${
+                          lastRunTimestamp
+                            ? ` · ${formatRelativeTime(lastRunTimestamp)}`
+                            : ""
+                        }`
+                      : undefined;
+
+                  const lastPart = (
+                    <div className="flex flex-1 min-w-0 justify-end items-center gap-2 max-w-[min(100%,20rem)]">
+                      {lastRunOpenable ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenLastRun!(testCase._id, lastRunIteration!._id);
+                          }}
+                          className="text-xs text-muted-foreground text-right tabular-nums rounded-sm hover:text-foreground hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+                          aria-label={lastRunAriaLabel}
+                        >
+                          {lastRunSummary}
+                        </button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground text-right tabular-nums">
+                          {lastRunSummary}
+                        </span>
+                      )}
+                    </div>
+                  );
+
+                  const caseAndLast = (
+                    <>
+                      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="min-w-0 truncate text-left text-xs font-semibold text-foreground">
+                          {caseTitle}
+                        </span>
+                        {testCase.lastSdkWriteAt != null ? (
+                          <span
+                            className="inline-flex shrink-0 items-center rounded border border-border/50 px-1 py-px text-[9px] font-medium uppercase tracking-wide text-muted-foreground"
+                            title="Synced from CI — the next CI report may overwrite manual edits"
+                          >
+                            CI
+                          </span>
+                        ) : null}
+                        <ImportClaimBadge claim={testCase.import} />
+                      </span>
+                      {showClientRail ? null : lastPart}
+                    </>
+                  );
+
+                  const caseRowClickTarget = (
+                    <div
+                      className="flex flex-1 min-w-0 items-center gap-3 cursor-pointer rounded-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+                      tabIndex={0}
+                      aria-label={`Open test case: ${caseTitle}`}
+                      onClick={() => onTestCaseClick(testCase._id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onTestCaseClick(testCase._id);
+                        }
+                      }}
+                    >
+                      {caseAndLast}
+                    </div>
+                  );
+
+                  const runButton = (
+                    <span className="inline-flex shrink-0">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        disabled={runDisabled}
+                        aria-label={`Run ${testCase.title || "test case"}`}
+                        aria-busy={isThisCaseRunning}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          if (runDisabled) return;
+                          track("run_selected_case_button_clicked", {
+                            location: "test_cases_overview",
+                            test_case_id: testCase._id,
+                          });
+                          onRunTestCase(testCase);
+                        }}
+                      >
+                        {isThisCaseRunning ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Play className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                    </span>
+                  );
+
+                  // Quick-run estimate. Hidden wherever quick-run REFUSES by
+                  // design: environment suites route to Run all, an empty model
+                  // list toasts "Add a model first", render checks run only with
+                  // the full suite, and a suite with no servers attached toasts
+                  // "Attach a client to this suite". Also hidden when the Run
+                  // control isn't offered. Matches `canRunSelectedCase` in
+                  // `TestCaseListSidebar` so the two surfaces agree.
+                  //
+                  // Deliberately NOT suppressed on merely-disconnected servers
+                  // (`serverGateBlocked`): that state resolves by connecting —
+                  // the row's own tooltip says "Connect and run." — and the
+                  // estimate is exactly right for the run that follows.
+                  const quickRunEstimateHint = (
+                    <QuickCaseRunCostEstimateHint
+                      suiteId={suite._id}
+                      caseId={testCase._id}
+                      models={runnableCaseModels}
+                      {...(quickRunIterationOverride !== undefined
+                        ? { runs: quickRunIterationOverride }
+                        : {})}
+                      suppressed={
+                        !showRunColumn ||
+                        !onRunTestCase ||
+                        isEnvironmentSuite ||
+                        isProbeCase ||
+                        runnableCaseModels.length === 0 ||
+                        // `handleRunTestCase` requires BOTH a non-empty runnable
+                        // list AND a well-formed `models[0]` — its default-model
+                        // check reads index 0 specifically, so a malformed first
+                        // entry with a valid second one still toasts "Add a model
+                        // first". Reuse that exact predicate rather than
+                        // re-deriving it.
+                        !getDefaultTestCaseModelValue(testCase) ||
+                        !hasConfiguredSuiteServers
+                      }
+                    />
+                  );
+
+                  const runControl =
+                    showRunColumn && onRunTestCase ? (
+                      isProbeCase ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>{runButton}</TooltipTrigger>
+                          <TooltipContent
+                            variant="muted"
+                            side="left"
+                            sideOffset={8}
+                            className="max-w-[16rem]"
+                          >
+                            Render checks run with the full suite or on its
+                            schedule.
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : !hasConfiguredSuiteServers ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>{runButton}</TooltipTrigger>
+                          <TooltipContent
+                            variant="muted"
+                            side="left"
+                            sideOffset={8}
+                            className="max-w-[16rem]"
+                          >
+                            Configure suite servers before running this case.
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : disconnectedRunTooltip ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>{runButton}</TooltipTrigger>
+                          <TooltipContent
+                            variant="muted"
+                            side="left"
+                            sideOffset={8}
+                            className="max-w-[16rem]"
+                          >
+                            {disconnectedRunTooltip}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : (
+                        runButton
+                      )
+                    ) : null;
+
+                  // Per-row delete: hover-revealed trash that reuses the batch
+                  // delete confirmation with this single case preselected. Keeps
+                  // deletion discoverable without forcing checkbox selection.
+                  const deleteControl = batchDelete ? (
+                    <span className="inline-flex shrink-0">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0 text-muted-foreground/40 transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:text-destructive"
+                        aria-label={`Delete ${caseTitle}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setSelectedCaseIds(new Set([testCase._id]));
+                          setShowBatchDeleteModal(true);
+                        }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </span>
+                  ) : null;
+
+                  if (batchDelete) {
+                    const isSelected = selectedCaseIds.has(testCase._id);
+                    return (
+                      <div
+                        key={testCase._id}
+                        data-testid={`test-case-row-${testCase._id}`}
+                        data-divergence={rowTone ?? undefined}
+                        className={cn(
+                          "group flex items-center gap-2 w-full px-4 py-2.5 transition-colors hover:bg-muted/50",
+                          rowToneClass,
+                        )}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          toggleCaseSelection(testCase._id);
+                        }}
+                      >
+                        <div className="flex justify-center w-7 shrink-0">
+                          <Checkbox
+                            checked={isSelected}
+                            onCheckedChange={() =>
+                              toggleCaseSelection(testCase._id)
+                            }
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Select case ${
+                              testCase.title || "Untitled test case"
+                            }`}
+                          />
+                        </div>
+                        {caseRowClickTarget}
+                        {clientRail}
+                        {quickRunEstimateHint}
+                        {runControl}
+                        {deleteControl}
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div
+                      key={testCase._id}
+                      data-testid={`test-case-row-${testCase._id}`}
+                      data-divergence={rowTone ?? undefined}
+                      className={cn(
+                        "group flex items-center gap-2 w-full px-4 py-2.5 transition-colors hover:bg-muted/50",
+                        rowToneClass,
+                      )}
+                    >
+                      {caseRowClickTarget}
+                      {clientRail}
+                      {quickRunEstimateHint}
+                      {runControl}
+                      {deleteControl}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      <Dialog
+        open={batchDelete && showBatchDeleteModal}
+        onOpenChange={(open) => {
+          if (batchDelete) setShowBatchDeleteModal(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Trash2
+                className={cn("h-5 w-5", EVAL_LOW_PASS_RATE_TEXT_CLASS)}
+              />
+              Delete {selectedCaseIds.size} test case
+              {selectedCaseIds.size !== 1 ? "s" : ""}
+            </DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete {selectedCaseIds.size} test case
+              {selectedCaseIds.size !== 1 ? "s" : ""}? This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowBatchDeleteModal(false)}
+              disabled={isBatchDeleting}
+            >
+              Cancel
+            </Button>
+            <Button
+              className={EVAL_DESTRUCTIVE_BUTTON_CLASS}
+              onClick={() => void confirmBatchDeleteTestCases()}
+              disabled={isBatchDeleting}
+            >
+              {isBatchDeleting ? "Deleting..." : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

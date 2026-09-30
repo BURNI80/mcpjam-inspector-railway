@@ -1,0 +1,359 @@
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { AlertTriangle } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
+import { ErrorBoundary } from "@/components/ui/error-boundary";
+import { expandJsonStringsInValue, useJsonEditor } from "./use-json-editor";
+import { JsonEditorView } from "./json-editor-view";
+import { JsonEditorEdit } from "./json-editor-edit";
+import { CodeMirrorJsonEditor } from "./codemirror-json-editor";
+import { JsonEditorToolbar } from "./json-editor-toolbar";
+import { JsonEditorStatusBar } from "./json-editor-status-bar";
+import type { JsonEditorProps, JsonEditorMode } from "./types";
+
+function stringifyValue(value: unknown): string {
+  if (value === undefined) {
+    return "null";
+  }
+
+  try {
+    return JSON.stringify(value, null, 2) ?? "null";
+  } catch {
+    return "null";
+  }
+}
+
+function JsonEditorErrorFallback() {
+  return (
+    <div className="flex items-center justify-center p-4 text-sm text-muted-foreground">
+      <AlertTriangle className="h-4 w-4 mr-2 text-destructive" />
+      Failed to render JSON content
+    </div>
+  );
+}
+
+/**
+ * View-only JSON with a plain `value` renders the tree without the edit
+ * buffer. The buffer keeps a serialized copy of `value` in state and updates
+ * it whenever `value` changes. A trace fed a new value on every streamed token
+ * (the Raw view, the timeline's detail pane) did that after every token's
+ * commit, and a fast stream can stack those into React's "Maximum update
+ * depth exceeded". View-only raw content still goes through the editor, which
+ * parses it. Turning `viewOnly` off mounts the editor from the current value.
+ */
+export function JsonEditor(props: JsonEditorProps) {
+  if (props.viewOnly && props.rawContent === undefined) {
+    return <ViewOnlyJson {...props} />;
+  }
+  return <EditableJsonEditor {...props} />;
+}
+
+function ViewOnlyJson({
+  value,
+  expandJsonStrings = false,
+  className,
+  height,
+  maxHeight,
+  collapsible = false,
+  defaultExpandDepth,
+  collapsedPaths,
+  onCollapseChange,
+  showLineNumbers = true,
+  collapseStringsAfterLength,
+  wrapLongLinesInView = true,
+}: JsonEditorProps) {
+  const viewValue = useMemo(
+    () => (expandJsonStrings ? expandJsonStringsInValue(value) : value),
+    [expandJsonStrings, value],
+  );
+
+  return (
+    <ErrorBoundary fallback={<JsonEditorErrorFallback />}>
+      <JsonEditorView
+        value={viewValue}
+        className={className}
+        height={height ?? "100%"}
+        maxHeight={maxHeight}
+        collapsible={collapsible}
+        defaultExpandDepth={defaultExpandDepth}
+        collapsedPaths={collapsedPaths}
+        onCollapseChange={onCollapseChange}
+        showLineNumbers={showLineNumbers}
+        collapseStringsAfterLength={collapseStringsAfterLength}
+        wrapLongLinesInView={wrapLongLinesInView}
+      />
+    </ErrorBoundary>
+  );
+}
+
+function EditableJsonEditor({
+  value,
+  onChange,
+  rawContent,
+  onRawChange,
+  mode: controlledMode,
+  onModeChange,
+  readOnly = false,
+  showModeToggle = true,
+  showToolbar = true,
+  allowMaximize = false,
+  height,
+  maxHeight,
+  className,
+  onValidationError,
+  collapsible = false,
+  defaultExpandDepth,
+  collapsedPaths,
+  onCollapseChange,
+  collapseStringsAfterLength,
+  viewOnly = false,
+  expandJsonStrings = false,
+  autoFormatOnEdit = true,
+  wrapLongLinesInEdit = false,
+  editSurface = "codemirror",
+  wrapLongLinesInView = true,
+  showLineNumbers = true,
+  toolbarLeftContent,
+  toolbarRightContent,
+  error,
+  showValidationErrorInStatusBar = true,
+}: JsonEditorProps) {
+  // Determine if we're in raw mode (string content) vs parsed mode
+  const isRawMode = rawContent !== undefined;
+
+  // Mode state (controlled or uncontrolled)
+  // Always call hooks to preserve hook order even in viewOnly mode
+  const [internalMode, setInternalMode] = useState<JsonEditorMode>("view");
+  const mode = readOnly ? "view" : (controlledMode ?? internalMode);
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  // Editor hook for edit mode
+  const editor = useJsonEditor({
+    initialValue: isRawMode ? undefined : value,
+    initialContent: isRawMode ? rawContent : undefined,
+    onChange,
+    onRawChange: isRawMode ? onRawChange : undefined,
+    onValidationError,
+    expandJsonStrings,
+  });
+
+  const sourceContent = isRawMode ? (rawContent ?? "") : editor.sourceContent;
+  const hasUnsavedChanges = editor.content !== sourceContent;
+  const previousModeRef = useRef<JsonEditorMode>(mode);
+  const hasMountedRef = useRef(false);
+  const viewValue = useMemo(() => {
+    if (isRawMode) {
+      return editor.getParsedValue();
+    }
+
+    return expandJsonStrings ? expandJsonStringsInValue(value) : value;
+  }, [editor.content, expandJsonStrings, isRawMode, value]);
+
+  useEffect(() => {
+    const previousMode = previousModeRef.current;
+    const isFirstRun = !hasMountedRef.current;
+
+    hasMountedRef.current = true;
+    previousModeRef.current = mode;
+
+    if (viewOnly || readOnly || !autoFormatOnEdit) {
+      return;
+    }
+
+    const enteredEditMode =
+      mode === "edit" && (isFirstRun || previousMode !== "edit");
+    if (!enteredEditMode || !editor.isValid) {
+      return;
+    }
+
+    editor.format();
+  }, [
+    mode,
+    editor.format,
+    editor.isValid,
+    autoFormatOnEdit,
+    readOnly,
+    viewOnly,
+  ]);
+
+  const handleModeChange = useCallback(
+    (newMode: JsonEditorMode) => {
+      if (readOnly) {
+        return;
+      }
+
+      // Warn before switching from edit to view if there are unsaved changes
+      if (mode === "edit" && newMode === "view" && hasUnsavedChanges) {
+        if (!editor.isValid) {
+          const confirmed = window.confirm(
+            "The JSON is invalid. Switching to view mode will lose your changes. Continue?",
+          );
+          if (!confirmed) return;
+          editor.reset();
+        }
+      }
+
+      setInternalMode(newMode);
+      onModeChange?.(newMode);
+    },
+    [mode, hasUnsavedChanges, editor, onModeChange, readOnly],
+  );
+
+  const handleCopy = useCallback(async () => {
+    let textToCopy: string;
+    if (mode === "edit") {
+      textToCopy = editor.content;
+    } else if (isRawMode) {
+      textToCopy = rawContent ?? "";
+    } else {
+      textToCopy = stringifyValue(value);
+    }
+
+    return copyToClipboard(textToCopy);
+  }, [mode, editor.content, value, isRawMode, rawContent]);
+
+  const handleEscape = useCallback(() => {
+    if (hasUnsavedChanges) {
+      const confirmed = window.confirm(
+        "You have unsaved changes. Discard them?",
+      );
+      if (!confirmed) return;
+    }
+    editor.reset();
+    setInternalMode("view");
+    onModeChange?.("view");
+  }, [hasUnsavedChanges, editor, onModeChange]);
+
+  const toggleMaximize = useCallback(() => {
+    setIsMaximized((prev) => !prev);
+  }, []);
+
+  // Lightweight render path for view-only mode (after all hooks to preserve hook order)
+  if (viewOnly) {
+    return (
+      <ErrorBoundary fallback={<JsonEditorErrorFallback />}>
+        <JsonEditorView
+          value={viewValue}
+          className={className}
+          height={height ?? "100%"}
+          maxHeight={maxHeight}
+          collapsible={collapsible}
+          defaultExpandDepth={defaultExpandDepth}
+          collapsedPaths={collapsedPaths}
+          onCollapseChange={onCollapseChange}
+          showLineNumbers={showLineNumbers}
+          collapseStringsAfterLength={collapseStringsAfterLength}
+          wrapLongLinesInView={wrapLongLinesInView}
+        />
+      </ErrorBoundary>
+    );
+  }
+
+  // Calculate container styles
+  const containerStyle: React.CSSProperties = isMaximized
+    ? {
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 50,
+      }
+    : {
+        height: height ?? "100%",
+        maxHeight: maxHeight ?? "none",
+      };
+
+  return (
+    <ErrorBoundary fallback={<JsonEditorErrorFallback />}>
+      <div
+        className={cn(
+          "flex flex-col rounded-lg bg-background overflow-hidden",
+          isMaximized && "rounded-none",
+          className,
+        )}
+        style={containerStyle}
+      >
+        {/* Toolbar */}
+        {showToolbar && (
+          <JsonEditorToolbar
+            mode={mode}
+            onModeChange={handleModeChange}
+            showModeToggle={showModeToggle && !readOnly}
+            readOnly={readOnly}
+            onFormat={editor.format}
+            onCopy={handleCopy}
+            onUndo={editor.undo}
+            onRedo={editor.redo}
+            canUndo={editor.canUndo}
+            canRedo={editor.canRedo}
+            isMaximized={isMaximized}
+            onToggleMaximize={toggleMaximize}
+            allowMaximize={allowMaximize}
+            isValid={editor.isValid}
+            leftContent={toolbarLeftContent}
+            rightContent={toolbarRightContent}
+            error={error}
+          />
+        )}
+
+        {/* Content area */}
+        <div className="flex-1 min-h-0 h-full">
+          {mode === "view" ? (
+            <JsonEditorView
+              value={viewValue}
+              height={height ?? "100%"}
+              collapsible={collapsible}
+              defaultExpandDepth={defaultExpandDepth}
+              collapsedPaths={collapsedPaths}
+              onCollapseChange={onCollapseChange}
+              showLineNumbers={showLineNumbers}
+              collapseStringsAfterLength={collapseStringsAfterLength}
+              wrapLongLinesInView={wrapLongLinesInView}
+            />
+          ) : editSurface === "codemirror" ? (
+            <CodeMirrorJsonEditor
+              content={editor.content}
+              onChange={editor.setContent}
+              onCursorChange={editor.setCursorPosition}
+              onUndo={editor.undo}
+              onRedo={editor.redo}
+              onEscape={handleEscape}
+              isValid={editor.isValid}
+              height={height ?? "100%"}
+              maxHeight={isMaximized ? undefined : maxHeight}
+              showLineNumbers={showLineNumbers}
+              wrapLongLines={wrapLongLinesInEdit}
+            />
+          ) : (
+            <JsonEditorEdit
+              content={editor.content}
+              onChange={editor.setContent}
+              onCursorChange={editor.setCursorPosition}
+              onUndo={editor.undo}
+              onRedo={editor.redo}
+              onEscape={handleEscape}
+              isValid={editor.isValid}
+              height={height ?? "100%"}
+              maxHeight={isMaximized ? undefined : maxHeight}
+              showLineNumbers={showLineNumbers}
+              wrapLongLinesInEdit={wrapLongLinesInEdit}
+              wrapLongLinesInView={wrapLongLinesInView}
+            />
+          )}
+        </div>
+
+        {/* Status bar (only in edit mode) */}
+        {mode === "edit" && (
+          <JsonEditorStatusBar
+            cursorPosition={editor.cursorPosition}
+            characterCount={editor.content.length}
+            validationError={
+              showValidationErrorInStatusBar ? editor.validationError : null
+            }
+          />
+        )}
+      </div>
+    </ErrorBoundary>
+  );
+}

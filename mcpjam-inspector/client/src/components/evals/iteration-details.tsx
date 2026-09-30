@@ -1,0 +1,1285 @@
+import { describeEvalIterationError } from "@/lib/eval-iteration-error";
+import { ErrorCard } from "@/components/ui/error-card";
+import { TranscriptEmptyState } from "@/components/chat-v2/transcript-empty-state";
+import { useAction, useQuery } from "convex/react";
+import { useActorCanQuery } from "@/hooks/use-actor-can-query";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { EvalIteration, EvalCase } from "./types";
+import {
+  JudgeVerdictPanel,
+  type JudgeCase,
+} from "./goal-completion-presentation";
+import { TrialJudgeReviewPanel } from "./trial-judge-review";
+import { evaluateToolCalls } from "@/shared/eval-matching";
+import { ToolCallDiff } from "./tool-call-diff";
+import {
+  registerArtifactUrls,
+  useArtifactUrlEpoch,
+} from "@/lib/artifact-urls";
+// One copy, deliberately. This module used to carry a byte-identical
+// `resolveTraceModel` (plus its own hand-copied `KNOWN_MODEL_PROVIDERS`), so a
+// provider added to the union had to be remembered in two places or the trace
+// header silently labelled the run `custom` — which is exactly how `cursor`
+// nearly shipped half-registered.
+import { resolveTraceModel } from "./compare-playground-helpers";
+import {
+  PredicatesList,
+  parseIterationPredicates,
+} from "./predicates-list";
+import {
+  ScoresList,
+  parseEvaluationConfig,
+  parseIterationScores,
+  parseScoreIntegrity,
+} from "./scores-list";
+import { TraceViewer } from "./trace-viewer";
+import type { HostSnapshot } from "@/lib/host-snapshot";
+import {
+  gateMcpToolResultImageRenderingByModelVisibility,
+  type HostConfigDtoV2,
+} from "@/lib/client-config-v2";
+import {
+  TraceViewModeTabs,
+  type TraceViewMode,
+} from "./trace-view-mode-tabs";
+import { PreviewHeaderSlot } from "./preview/preview-header-slot";
+import { BrowserArtifactsView } from "./browser-artifacts-view";
+import {
+  MessageSquare,
+  Code2,
+  ChevronDown,
+  ChevronRight,
+  WifiOff,
+  AlertCircle,
+} from "lucide-react";
+import {
+  ToolServerMap,
+  listTools,
+  type ListToolsResultWithMetadata,
+} from "@/lib/apis/mcp-tools-api";
+import { JsonEditor } from "@/components/ui/json-editor";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@mcpjam/design-system/collapsible";
+import { cn } from "@/lib/utils";
+import { formatConvexBlobLoadError } from "@/lib/convex-action-error";
+import { Alert, AlertDescription, AlertTitle } from "@mcpjam/design-system/alert";
+import { Button } from "@mcpjam/design-system/button";
+import {
+  isModelFree,
+  normalizeSteps,
+  promptTurnsToSteps,
+  resolveDisplayExpectedToolCalls,
+  type TestStep,
+} from "@/shared/steps";
+import {
+  assembleStepResults,
+  parseStepStatusById,
+  type StepReplayMetadata,
+  type StepReplayEnvelope,
+} from "@/shared/eval-step-replay";
+
+const TOOL_ARGUMENT_BLOCK_THRESHOLD = 120;
+const TOOL_CALLS_SUMMARY_MAX_LEN = 160;
+const EMPTY_SERVER_NAMES: string[] = [];
+
+function formatToolCallsSummary(
+  expected: Array<{ toolName: string }>,
+  actual: Array<{ toolName: string }>,
+  maxLen = TOOL_CALLS_SUMMARY_MAX_LEN,
+): string {
+  const expPart =
+    expected.length === 0 ? "—" : expected.map((t) => t.toolName).join(", ");
+  const actPart =
+    actual.length === 0 ? "—" : actual.map((t) => t.toolName).join(", ");
+  const s = `Expected: ${expPart} · Actual: ${actPart}`;
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, maxLen - 1)}…`;
+}
+
+function tryParseStructuredArgumentString(value: string): unknown | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const firstCharacter = trimmed[0];
+  if (firstCharacter !== "{" && firstCharacter !== "[") {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed !== null && typeof parsed === "object") {
+      return parsed;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function stringifyToolArgumentValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (value === undefined) {
+    return "undefined";
+  }
+
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+export function resolveFormattedArgumentValue(
+  value: unknown,
+):
+  | { kind: "structured"; value: unknown }
+  | { kind: "text"; value: string; renderAsBlock: boolean } {
+  if (value !== null && typeof value === "object") {
+    return { kind: "structured", value };
+  }
+
+  if (typeof value === "string") {
+    const parsedStructuredValue = tryParseStructuredArgumentString(value);
+    if (parsedStructuredValue !== null) {
+      return { kind: "structured", value: parsedStructuredValue };
+    }
+  }
+
+  const textValue = stringifyToolArgumentValue(value);
+  return {
+    kind: "text",
+    value: textValue,
+    renderAsBlock:
+      textValue.length > TOOL_ARGUMENT_BLOCK_THRESHOLD ||
+      textValue.includes("\n"),
+  };
+}
+
+function TraceBlobLoadErrorPanel({
+  error,
+  layoutMode,
+  onRetry,
+  isDetailsOpen,
+  onDetailsOpenChange,
+}: {
+  error: string;
+  layoutMode: "compact" | "full";
+  onRetry: () => void;
+  isDetailsOpen: boolean;
+  onDetailsOpenChange: (open: boolean) => void;
+}) {
+  const info = formatConvexBlobLoadError(error);
+  const Icon = info.kind === "transient" ? WifiOff : AlertCircle;
+  return (
+    <div
+      className={cn("space-y-3", layoutMode === "full" && "max-w-md")}
+      data-testid="iteration-trace-load-error"
+    >
+      <Alert variant={info.alertVariant}>
+        <Icon />
+        <AlertTitle>{info.title}</AlertTitle>
+        <AlertDescription className="space-y-3">
+          <p>{info.description}</p>
+          <Button type="button" variant="secondary" size="sm" onClick={onRetry}>
+            Try again
+          </Button>
+        </AlertDescription>
+      </Alert>
+      <Collapsible open={isDetailsOpen} onOpenChange={onDetailsOpenChange}>
+        <CollapsibleTrigger
+          type="button"
+          className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
+          <span>Technical details</span>
+          {isDetailsOpen ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )}
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-2">
+          <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap overflow-x-auto rounded border border-border/40 bg-muted/30 p-2">
+            {error}
+          </pre>
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}
+
+/** What the Scorecard slot needs from this component's own state. */
+export type ScorecardTabContext = {
+  /** The resolved trace envelope, for per-step evidence. Null until loaded. */
+  envelope: StepReplayEnvelope | null;
+  /**
+   * The whole downloaded trace, for the scorecard's recorded stage floor. The
+   * same object `envelope` narrows — handed over unnarrowed because the floor
+   * reads messages and spans, which the step assembler has no use for.
+   */
+  trace: { messages?: unknown; spans?: unknown } | null;
+  envelopeLoading: boolean;
+  reviewActive: boolean;
+  judgeHidden: boolean;
+  onJudgeVisibilityChange: (hidden: boolean) => void;
+  /** The existing ScoresList block, integrity banner and all. */
+  scoresSection: ReactNode | null;
+};
+
+export function IterationDetails({
+  hostSnapshot,
+  iteration,
+  testCase,
+  serverNames = EMPTY_SERVER_NAMES,
+  layoutMode = "compact",
+  caseInsightSlot,
+  judgeCase = null,
+  enableJudgeReview = false,
+  trialChainSlot,
+  scorecard,
+  trialVerdictWord,
+  syncedStepId,
+  onSyncStep,
+}: {
+  iteration: EvalIteration;
+  /** undefined preserves ambient styling for existing chat callers. */
+  hostSnapshot?: HostSnapshot | null;
+  testCase: EvalCase | null;
+  serverNames?: string[];
+  layoutMode?: "compact" | "full";
+  /** Run-level case insight caption; shown under the trace toolbar or at top when no trace blob. */
+  caseInsightSlot?: ReactNode;
+  /** Advisory judge verdict for this case+run; surfaced on the Results tab. */
+  judgeCase?: JudgeCase | null;
+  /**
+   * Offer the CALIBRATION LABEL beside the judge's verdict.
+   *
+   * Opt-in for the same reason `trialChainSlot` is a slot: this component has
+   * five hosts, and the label's read and write have no business firing for the
+   * four that never asked. The host that shows a trial from a real suite run
+   * turns it on; the quick-run and playground hosts do not. Even when on, a
+   * trial with no `suiteRunId` (a quick run) gets the read-only verdict: the
+   * backend refuses every label for it (`JUDGE_REVIEW_NO_RUN`), so offering
+   * the control would only offer the refusal.
+   */
+  enableJudgeReview?: boolean;
+  /**
+   * This trial's user-value chain — where value stopped travelling, and why.
+   *
+   * A SLOT, not a read this component performs. It has five hosts and knows
+   * only its iteration: not the run it belongs to, not the project, not
+   * whether the Evaluate opt-in is on — and the chain read needs all three.
+   * The one host that holds them builds the node; the other four pass nothing
+   * and issue no request, which is what keeps this shared component free of a
+   * fetch four of its callers never asked for.
+   */
+  trialChainSlot?: ReactNode;
+  /**
+   * Evaluate-only. Present ⇒ the Scorecard layout: the authored scorers with
+   * this trial's results, as the default tab. Absent ⇒ the legacy layout,
+   * byte-identical — which is what every `/evals` mount and every compact
+   * mount still gets.
+   *
+   * A SLOT, not a component: `evals/` does not import `evaluate/`, for the
+   * same reason `trialChainSlot` is one.
+   */
+  scorecard?: { render: (ctx: ScorecardTabContext) => ReactNode };
+  /**
+   * The verdict word the page already computed. Supplying it stops the Steps
+   * tab deriving a SECOND one from a different field — they can disagree on
+   * the same screen.
+   */
+  trialVerdictWord?: string;
+  /**
+   * Step cursor shared with a host that lists the authored steps beside this
+   * pane (the Evaluate case workspace). Forwarded to the trace viewer's Steps
+   * view untouched; absent for the other hosts.
+   */
+  syncedStepId?: string | null;
+  onSyncStep?: (stepId: string | null) => void;
+}) {
+  // The Scores list prints the same judge number the review panel hides.
+  // Own the flag here so hiding starts on first paint (before the panel's
+  // read lands) and so a trial switch cannot leave the previous trial's
+  // reveal open on this one.
+  const reviewActive = Boolean(enableJudgeReview && iteration.suiteRunId);
+  const [judgeHidden, setJudgeHidden] = useState(reviewActive);
+  useEffect(() => {
+    setJudgeHidden(reviewActive);
+  }, [iteration._id, reviewActive]);
+
+  const getBlob = useAction(
+    "testSuites:getTestIterationBlob" as any,
+  ) as unknown as (args: { iterationId: string }) => Promise<any>;
+
+  const traceIdentity = JSON.stringify([
+    iteration._id,
+    iteration.blob,
+    iteration.chatSessionId,
+  ]);
+  const [loadedBlob, setLoadedBlob] = useState<{
+    identity: string;
+    data: any;
+  } | null>(null);
+  // Gate on identity during render, before the fetching effect can run.
+  const blob = loadedBlob?.identity === traceIdentity ? loadedBlob.data : null;
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [blobRetryTick, setBlobRetryTick] = useState(0);
+  const [isBlobErrorDetailsOpen, setIsBlobErrorDetailsOpen] = useState(false);
+  const prevBlobIdRef = useRef<string | undefined>(undefined);
+  const [toolViewMode, setToolViewMode] = useState<"formatted" | "raw">(
+    "formatted",
+  );
+  const [toolsMetadata, setToolsMetadata] = useState<
+    Record<string, Record<string, any>>
+  >({});
+  const [toolServerMap, setToolServerMap] = useState<ToolServerMap>({});
+  const [connectedServerIds, setConnectedServerIds] = useState<string[]>([]);
+
+  // Suite-level image-render policy. Mirrors how the chat surfaces derive it
+  // from the active host config (App.tsx / ChatTabV2): read the suite's host
+  // config and gate the policy by model visibility, then hand it to the trace
+  // `Thread`. Without this, eval result traces always fall back to the default
+  // "inline" placement and ignore the suite's collapse/hide setting.
+  // `canQuerySuiteConfig` keeps this off the wire until the actor's `users`
+  // row exists (direct guests, which never get one, keep reading) — the same
+  // gate the suite list upstream uses.
+  const canQuerySuiteConfig = useActorCanQuery();
+  const suiteHostConfigDto = useQuery(
+    "hostConfigsV2:getSuiteConfig" as any,
+    canQuerySuiteConfig && testCase?.testSuiteId
+      ? ({ suiteId: testCase.testSuiteId } as any)
+      : "skip",
+  ) as HostConfigDtoV2 | null | undefined;
+  const mcpToolResultImageRendering = useMemo(
+    () =>
+      gateMcpToolResultImageRenderingByModelVisibility(
+        suiteHostConfigDto?.mcpToolResultImageRendering,
+        suiteHostConfigDto?.modelVisibleMcpToolResults,
+      ),
+    [
+      suiteHostConfigDto?.mcpToolResultImageRendering,
+      suiteHostConfigDto?.modelVisibleMcpToolResults,
+    ],
+  );
+  const [toolsWithSchema, setToolsWithSchema] = useState<
+    Record<string, { name: string; inputSchema?: any }>
+  >({});
+  const [toolCallsSectionOpen, setToolCallsSectionOpen] = useState(() =>
+    layoutMode === "full" ? iteration.result !== "passed" : true,
+  );
+  type PreviewTraceMode = TraceViewMode | "browser" | "steps" | "scorecard";
+  const [previewTraceMode, setPreviewTraceMode] = useState<PreviewTraceMode>(
+    scorecard ? "scorecard" : "chat",
+  );
+
+  // The authored steps this run executed (from its snapshot), so the replay can
+  // offer the same step-aligned "Steps" tab the live preview does. Falls back to
+  // the legacy promptTurns shape for pre-migration snapshots.
+  const snapshotSteps = useMemo<TestStep[]>(() => {
+    const steps = iteration.testCaseSnapshot?.steps;
+    if (Array.isArray(steps) && steps.length > 0) return normalizeSteps(steps);
+    return promptTurnsToSteps(
+      Array.isArray(iteration.testCaseSnapshot?.promptTurns)
+        ? iteration.testCaseSnapshot.promptTurns
+        : [],
+    );
+  }, [iteration.testCaseSnapshot]);
+  const hasSteps = snapshotSteps.length > 0;
+
+  // Source-aware trace identity. New iterations carry `chatSessionId`
+  // (unified path); legacy iterations carry `blob`. The hook gates on
+  // either being present and re-runs when either changes.
+  const traceSourceKey = iteration.blob ?? iteration.chatSessionId;
+
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      if (!traceSourceKey) {
+        prevBlobIdRef.current = undefined;
+        setLoadedBlob(null);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+      if (prevBlobIdRef.current !== traceSourceKey) {
+        prevBlobIdRef.current = traceSourceKey;
+        setIsBlobErrorDetailsOpen(false);
+      }
+      setLoadedBlob(null);
+      setLoading(true);
+      setError(null);
+      try {
+        // Backend `getTestIterationBlob` is source-aware: it returns the
+        // chatSessions transcript when `iteration.chatSessionId` is set,
+        // otherwise reads from `iteration.blob`. Both paths return the
+        // same envelope shape to `TraceViewer`.
+        const data = await getBlob({ iterationId: iteration._id });
+        registerArtifactUrls(data);
+        if (!cancelled) setLoadedBlob({ identity: traceIdentity, data });
+      } catch (e: any) {
+        if (!cancelled) {
+          setError(e?.message || "Failed to load blob");
+          console.error("Blob load error:", e);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [traceSourceKey, traceIdentity, getBlob, blobRetryTick]);
+
+  // The trace's widget HTML and screenshots arrive as short-lived artifact
+  // links. When one expires anywhere on the page, re-read the trace in the
+  // background and swap the fresh links in without blanking the view.
+  const artifactUrlEpoch = useArtifactUrlEpoch();
+  const handledArtifactUrlEpochRef = useRef(artifactUrlEpoch);
+  useEffect(() => {
+    if (artifactUrlEpoch === handledArtifactUrlEpochRef.current) return;
+    handledArtifactUrlEpochRef.current = artifactUrlEpoch;
+    if (!traceSourceKey) return;
+    let cancelled = false;
+    getBlob({ iterationId: iteration._id })
+      .then((data) => {
+        registerArtifactUrls(data);
+        if (cancelled) return;
+        setLoadedBlob((current) =>
+          current?.identity === traceIdentity
+            ? { identity: traceIdentity, data }
+            : current,
+        );
+      })
+      .catch(() => {
+        // Keep what is shown; the next expired link retries.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    artifactUrlEpoch,
+    traceSourceKey,
+    traceIdentity,
+    iteration._id,
+    getBlob,
+  ]);
+
+  useEffect(() => {
+    if (layoutMode !== "full") return;
+    setToolCallsSectionOpen(iteration.result !== "passed");
+    // Step-aligned cases (any interact/assert step) open on the Steps replay —
+    // the 1:1 mirror of the authored steps — matching the live preview default;
+    // pure prompt+grade cases keep Chat.
+    setPreviewTraceMode(
+      scorecard
+        ? "scorecard"
+        : snapshotSteps.some((s) => s.kind === "interact" || s.kind === "assert")
+        ? "steps"
+        : "chat",
+    );
+  }, [layoutMode, iteration._id, iteration.result, snapshotSteps]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (serverNames.length === 0) {
+      setToolsMetadata({});
+      setToolServerMap({});
+      setToolsWithSchema({});
+      setConnectedServerIds([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setToolsMetadata({});
+    setToolServerMap({});
+    setToolsWithSchema({});
+    setConnectedServerIds([]);
+
+    serverNames.forEach((serverId) => {
+      void listTools({ serverId })
+        .then(
+          (result: ListToolsResultWithMetadata) => {
+            if (cancelled) return;
+
+            setConnectedServerIds((prev) =>
+              prev.includes(serverId) ? prev : [...prev, serverId],
+            );
+
+            if (result.tools?.length) {
+              setToolsWithSchema((prev) => {
+                const next = { ...prev };
+                for (const tool of result.tools ?? []) {
+                  next[tool.name] = {
+                    name: tool.name,
+                    inputSchema: tool.inputSchema,
+                  };
+                }
+                return next;
+              });
+
+              setToolServerMap((prev: ToolServerMap) => {
+                const next = { ...prev };
+                for (const tool of result.tools ?? []) {
+                  next[tool.name] = serverId;
+                }
+                return next;
+              });
+            }
+
+            if (result.toolsMetadata) {
+              setToolsMetadata((prev) => ({
+                ...prev,
+                ...Object.fromEntries(
+                  Object.entries(result.toolsMetadata ?? {}).map(
+                    ([toolName, meta]) => [
+                      toolName,
+                      meta as Record<string, unknown>,
+                    ],
+                  ),
+                ),
+              }));
+            }
+          },
+        )
+        .catch((loadError: unknown) => {
+          if (cancelled) return;
+
+          console.warn(
+            `Failed to fetch tools for server ${serverId}:`,
+            loadError,
+          );
+        });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [serverNames]);
+
+  const traceModel = useMemo(
+    () => resolveTraceModel(iteration, testCase),
+    [iteration, testCase],
+  );
+
+  const estimatedDurationMs = useMemo(
+    () =>
+      Math.max(
+        iteration.updatedAt - (iteration.startedAt ?? iteration.createdAt),
+        0,
+      ),
+    [iteration.updatedAt, iteration.startedAt, iteration.createdAt],
+  );
+  const traceStartedAtMs = iteration.startedAt ?? iteration.createdAt;
+  const traceEndedAtMs = iteration.updatedAt;
+
+  // Aggregate expected tools across turns for display (snapshot wins over draft case).
+  const expectedToolCalls = resolveDisplayExpectedToolCalls(
+    iteration.testCaseSnapshot,
+    testCase,
+  );
+  const actualToolCalls = iteration.actualToolCalls || [];
+  const hasEvalToolCalls =
+    expectedToolCalls.length > 0 || actualToolCalls.length > 0;
+  const hasBrowserArtifacts = useMemo(() => {
+    if (!blob || Array.isArray(blob) || typeof blob !== "object") {
+      return false;
+    }
+    const observations = (blob as { widgetRenderObservations?: unknown })
+      .widgetRenderObservations;
+    const videoUrl = (blob as { videoUrl?: unknown }).videoUrl;
+    return (
+      (Array.isArray(observations) && observations.length > 0) ||
+      (typeof videoUrl === "string" && videoUrl.length > 0)
+    );
+  }, [blob]);
+
+  // Helper to format type information
+  const formatType = (type: any): string => {
+    if (Array.isArray(type)) {
+      return type.join(" | ");
+    }
+    if (typeof type === "string") {
+      return type;
+    }
+    return String(type);
+  };
+
+  // Helper to get argument schema for a tool
+  const getArgumentSchema = (toolName: string, argKey: string) => {
+    const tool = toolsWithSchema[toolName];
+    if (!tool?.inputSchema?.properties) return null;
+    return tool.inputSchema.properties[argKey];
+  };
+
+  // Helper to render arguments in a readable format
+  const renderArguments = (args: Record<string, any>, toolName?: string) => {
+    const entries = Object.entries(args);
+    if (entries.length === 0) {
+      return <span className="text-muted-foreground italic">No arguments</span>;
+    }
+    return (
+      <div className="space-y-2">
+        {entries.map(([key, value]) => {
+          const argSchema = toolName ? getArgumentSchema(toolName, key) : null;
+          const formattedValue = resolveFormattedArgumentValue(value);
+
+          return (
+            <div
+              key={key}
+              className="rounded-md border border-border/20 bg-background/40 px-2 py-1.5"
+            >
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-medium text-foreground">{key}:</span>
+                {argSchema?.type && (
+                  <span className="text-[10px] font-normal text-muted-foreground bg-background/50 px-1.5 py-0.5 rounded border border-border/40">
+                    {formatType(argSchema.type)}
+                  </span>
+                )}
+              </div>
+
+              {formattedValue.kind === "structured" ? (
+                <div className="mt-2 overflow-hidden rounded-md border border-border/30 bg-background/80">
+                  <JsonEditor
+                    value={formattedValue.value}
+                    viewOnly
+                    collapsible
+                    defaultExpandDepth={1}
+                    collapseStringsAfterLength={160}
+                    expandJsonStrings
+                    className="max-h-72"
+                  />
+                </div>
+              ) : formattedValue.renderAsBlock ? (
+                <div className="mt-2 overflow-hidden rounded-md border border-border/30 bg-background/80">
+                  <JsonEditor
+                    value={formattedValue.value}
+                    viewOnly
+                    collapsible
+                    defaultExpandDepth={1}
+                    collapseStringsAfterLength={160}
+                    expandJsonStrings
+                    className="max-h-72"
+                  />
+                </div>
+              ) : (
+                <div className="mt-1 min-w-0 break-words font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {formattedValue.value}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderRawToolCalls = (
+    toolCalls: Array<{ toolName: string; arguments: Record<string, any> }>,
+    emptyMessage: string,
+  ) => {
+    if (toolCalls.length === 0) {
+      return (
+        <div className="text-xs text-muted-foreground italic">
+          {emptyMessage}
+        </div>
+      );
+    }
+
+    return (
+      <div className="overflow-hidden rounded-md border border-border/30 bg-background/50">
+        <JsonEditor
+          value={toolCalls}
+          viewOnly
+          collapsible
+          defaultExpandDepth={2}
+          collapseStringsAfterLength={160}
+          className="min-h-[160px] max-h-72"
+        />
+      </div>
+    );
+  };
+
+  const iterationError = describeEvalIterationError(iteration);
+
+  const hasToolCalls =
+    expectedToolCalls.length > 0 || actualToolCalls.length > 0;
+  const hasTrace = Boolean(iteration.blob || iteration.chatSessionId);
+  const traceFirst = layoutMode === "full" && hasTrace;
+  // With a scorecard the toolbar does not wait on the trace, and does not
+  // disappear when it fails to load: the scorecard reads persisted metadata,
+  // so a traceless or blob-errored trial still has scorers to show — and
+  // hiding the tabs would hide the only view of them, which is the failure
+  // this pane exists to fix. Missing trace views explain their unavailable data.
+  /** The tabs that read the trace blob, and therefore wait for it. */
+  const traceTabsReady = hasTrace && !loading && !error;
+  const previewTraceToolbar =
+    layoutMode === "full" &&
+    (scorecard || (hasTrace && !loading && !error)) ? (
+      <PreviewHeaderSlot>
+        <TraceViewModeTabs
+          mode={
+            previewTraceMode === "browser" ||
+            previewTraceMode === "steps" ||
+            previewTraceMode === "scorecard"
+              ? "timeline"
+              : previewTraceMode
+          }
+          onModeChange={setPreviewTraceMode}
+          showToolsTab={Boolean(scorecard) || (hasEvalToolCalls && traceTabsReady)}
+          showBrowserTab={hasBrowserArtifacts && traceTabsReady}
+          browserActive={previewTraceMode === "browser"}
+          onSelectBrowser={() => setPreviewTraceMode("browser")}
+          showStepsTab={hasSteps && (Boolean(scorecard) || traceTabsReady)}
+          stepsActive={previewTraceMode === "steps"}
+          onSelectSteps={() => setPreviewTraceMode("steps")}
+          showScorecardTab={Boolean(scorecard)}
+          scorecardActive={previewTraceMode === "scorecard"}
+          onSelectScorecard={() => setPreviewTraceMode("scorecard")}
+          appearance="segment"
+          className="w-full"
+        />
+      </PreviewHeaderSlot>
+    ) : null;
+  const toolCallsSummary = formatToolCallsSummary(
+    expectedToolCalls,
+    actualToolCalls,
+  );
+
+  /**
+   * Categorized diff rendered above the raw Expected/Actual grids. We only
+   * render the component when it would have something to say (mismatches /
+   * extras / out-of-order) — `ToolCallDiff` itself returns null otherwise.
+   */
+  const toolCallDiffResult = useMemo(
+    () =>
+      evaluateToolCalls(expectedToolCalls, actualToolCalls, {
+        isNegativeTest: iteration.testCaseSnapshot?.isNegativeTest,
+      }),
+    [
+      expectedToolCalls,
+      actualToolCalls,
+      iteration.testCaseSnapshot?.isNegativeTest,
+    ],
+  );
+
+  const toolCallsGrids =
+    toolViewMode === "raw" ? (
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className="rounded-md border border-border/40 bg-muted/10 p-3 space-y-2">
+          <div className="text-xs font-medium text-muted-foreground uppercase">
+            Expected
+          </div>
+          {renderRawToolCalls(expectedToolCalls, "No expected tool calls")}
+        </div>
+        <div className="rounded-md border border-border/40 bg-muted/10 p-3 space-y-2">
+          <div className="text-xs font-medium text-muted-foreground uppercase">
+            Actual
+          </div>
+          {renderRawToolCalls(actualToolCalls, "No tool calls made")}
+        </div>
+      </div>
+    ) : (
+      <div className="grid gap-2 md:grid-cols-2">
+        <div className="rounded-md border border-border/40 bg-muted/10 p-2 space-y-2">
+          <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
+            Expected
+          </div>
+          {expectedToolCalls.length === 0 ? (
+            <div className="text-xs text-muted-foreground italic">
+              No expected tool calls
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {expectedToolCalls.map((tool, idx) => (
+                <div
+                  key={`expected-${idx}`}
+                  className="rounded border border-border/30 bg-background/50 p-1.5 space-y-1"
+                >
+                  <div className="font-mono text-xs font-medium">
+                    {tool.toolName}
+                  </div>
+                  {Object.keys(tool.arguments || {}).length > 0 && (
+                    <div className="text-xs bg-muted/30 rounded p-1.5">
+                      {renderArguments(tool.arguments || {}, tool.toolName)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="rounded-md border border-border/40 bg-muted/10 p-2 space-y-2">
+          <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
+            Actual
+          </div>
+          {actualToolCalls.length === 0 ? (
+            <div className="text-xs text-muted-foreground italic">
+              No tool calls made
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {actualToolCalls.map((tool, idx) => (
+                <div
+                  key={`actual-${idx}`}
+                  className="rounded border border-border/30 bg-background/50 p-1.5 space-y-1"
+                >
+                  <div className="font-mono text-xs font-medium">
+                    {tool.toolName}
+                  </div>
+                  {Object.keys(tool.arguments || {}).length > 0 && (
+                    <div className="text-xs bg-muted/30 rounded p-1.5">
+                      {renderArguments(tool.arguments || {}, tool.toolName)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+
+  const formattedRawToggle = (
+    <div className="flex items-center gap-1 rounded-md border border-border/40 bg-background p-0.5">
+      <button
+        type="button"
+        onClick={() => setToolViewMode("formatted")}
+        className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs transition-colors ${
+          toolViewMode === "formatted"
+            ? "bg-primary/10 text-foreground font-medium"
+            : "text-muted-foreground hover:text-foreground"
+        }`}
+        title="Formatted view"
+      >
+        <MessageSquare className="h-3 w-3" />
+        Formatted
+      </button>
+      <button
+        type="button"
+        onClick={() => setToolViewMode("raw")}
+        className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs transition-colors ${
+          toolViewMode === "raw"
+            ? "bg-primary/10 text-foreground font-medium"
+            : "text-muted-foreground hover:text-foreground"
+        }`}
+        title="Raw JSON view"
+      >
+        <Code2 className="h-3 w-3" />
+        Raw
+      </button>
+    </div>
+  );
+
+  const toolCallsSection =
+    hasToolCalls && !hasTrace ? (
+      layoutMode === "full" ? (
+        <Collapsible
+          open={toolCallsSectionOpen}
+          onOpenChange={setToolCallsSectionOpen}
+        >
+          <div className="space-y-2" data-testid="iteration-tool-calls-section">
+            <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border/40 pb-2">
+              <CollapsibleTrigger
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-1 text-left transition-colors hover:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              >
+                {toolCallsSectionOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="shrink-0 text-xs font-semibold">
+                  Tool Calls
+                </span>
+                {!toolCallsSectionOpen && (
+                  <span
+                    className="min-w-0 truncate text-xs text-muted-foreground"
+                    title={toolCallsSummary}
+                  >
+                    {toolCallsSummary}
+                  </span>
+                )}
+              </CollapsibleTrigger>
+              {toolCallsSectionOpen ? formattedRawToggle : null}
+            </div>
+            <CollapsibleContent>
+              <div
+                className="space-y-2"
+                data-testid="iteration-tool-calls-grid"
+              >
+                <ToolCallDiff
+                  result={toolCallDiffResult}
+                  expectedToolCalls={expectedToolCalls}
+                  actualToolCalls={actualToolCalls}
+                />
+                {toolCallsGrids}
+              </div>
+            </CollapsibleContent>
+          </div>
+        </Collapsible>
+      ) : (
+        <div className="space-y-2" data-testid="iteration-tool-calls-section">
+          <div className="flex items-center justify-between border-b border-border/40 pb-2">
+            <div className="text-xs font-semibold">Tool Calls</div>
+            {formattedRawToggle}
+          </div>
+          <div data-testid="iteration-tool-calls-grid">
+            <ToolCallDiff
+              result={toolCallDiffResult}
+              expectedToolCalls={expectedToolCalls}
+              actualToolCalls={actualToolCalls}
+            />
+            {toolCallsGrids}
+          </div>
+        </div>
+      )
+    ) : null;
+
+  const predicates = useMemo(
+    () => parseIterationPredicates(iteration.metadata),
+    [iteration.metadata],
+  );
+  // Persisted per-step verdicts (`metadata.stepResults`), keyed by stepId — the
+  // completed-run analogue of the live step_status stream. Feeds the Steps tab so
+  // each assert/interact shows its own PASS/FAIL inline, which is why the gate
+  // footer below no longer repeats the step-scoped checks.
+  const stepStatusById = useMemo(
+    () =>
+      parseStepStatusById(
+        iteration.metadata as StepReplayMetadata | undefined,
+      ),
+    [iteration.metadata],
+  );
+  // A snapshot is a render check ("probe") when its steps are model-free (no
+  // `prompt` step). Probes get an artifacts-first layout with NO Steps tab, so
+  // the gate stays their canonical checks display (see below); every other case
+  // surfaces step verdicts inline on the Steps tab.
+  const isProbe = isModelFree(snapshotSteps);
+  // For the non-probe layout, only CASE-LEVEL (unscoped) predicates belong in the
+  // gate footer: every step-scoped check (toolCalledWith / widgetRendered / …)
+  // corresponds to an authored `assert` step and now renders its verdict inline
+  // on the Steps tab. So the footer carries just the global gates that have no
+  // per-step home, and disappears entirely when every check is step-scoped.
+  // Probes keep the FULL gate (no Steps tab to absorb the step-scoped rows).
+  const gateRows = useMemo(() => {
+    if (!predicates) return null;
+    return isProbe ? predicates : predicates.filter((p) => !p.scope);
+  }, [predicates, isProbe]);
+  // Per-widget render observations off the trace blob, so a `widgetRendered`
+  // (and friends) check can show the rendered widget inline as its evidence.
+  // Absent until the blob loads — the gate renders fine without it.
+  const blobObservations = useMemo<
+    import("@/shared/eval-trace").EvalTraceWidgetRenderObservationView[]
+  >(() => {
+    if (!blob || Array.isArray(blob) || typeof blob !== "object") return [];
+    const raw = (blob as { widgetRenderObservations?: unknown })
+      .widgetRenderObservations;
+    return Array.isArray(raw) ? raw : [];
+  }, [blob]);
+  /** The structural subset `assembleStepResults` reads off the trace blob. */
+  const blobEnvelope = useMemo<StepReplayEnvelope | null>(() => {
+    if (!blob || Array.isArray(blob) || typeof blob !== "object") return null;
+    return blob as StepReplayEnvelope;
+  }, [blob]);
+
+  /**
+   * Per-step verdicts WITH their reasons, for the Steps tab and the scorecard.
+   * `parseStepStatusById` keeps only the status, which is why a failed step
+   * has never said why.
+   */
+  const stepReplayRows = useMemo(
+    () =>
+      assembleStepResults(
+        snapshotSteps,
+        iteration.metadata as StepReplayMetadata | undefined,
+        blobEnvelope ?? undefined,
+      ),
+    [snapshotSteps, iteration.metadata, blobEnvelope],
+  );
+
+  const predicatesSection =
+    gateRows && gateRows.length > 0 ? (
+      <div className="space-y-2" data-testid="iteration-predicates-section">
+        <div className="flex items-center justify-between border-b border-border/40 pb-2">
+          <div className="text-xs font-semibold">
+            {isProbe ? "Assertions" : "Whole-run assertions"}
+          </div>
+        </div>
+        <PredicatesList predicates={gateRows} observations={blobObservations} />
+      </div>
+    ) : null;
+
+  // The score gate: every verdict source in one shape, joined to the
+  // definitions that say whether each one gates. Rendered ALONGSIDE the
+  // predicate list rather than replacing it — the predicate rows carry widget
+  // render evidence the score rows do not, and an SDK run that predates
+  // scoring has predicates and no scores at all.
+  const scoresSection = (() => {
+    const scores = parseIterationScores(iteration.metadata);
+    const integrity = parseScoreIntegrity(iteration.metadata);
+    // Rendered when there are scores OR when the backend flagged a downgrade.
+    // An integrity-invalid iteration whose rows were ALL quarantined has
+    // nothing to list, and that is exactly the case where the warning is the
+    // only explanation the operator will get for a failed verdict.
+    if ((!scores || scores.length === 0) && !integrity) return null;
+    return (
+      // `ScoresList` owns its own "Scores" header; a wrapper heading here
+      // rendered it twice.
+      <div data-testid="iteration-scores-section">
+        <ScoresList
+          scores={scores ?? []}
+          evaluationConfig={parseEvaluationConfig(iteration.metadata)}
+          integrity={integrity}
+          hideJudgeRows={reviewActive && judgeHidden}
+        />
+      </div>
+    );
+  })();
+
+  // Widget probes get an artifacts-first layout: checks + the rendered widget.
+  // Tool-call diff (expected vs actual is meaningless for a pinned call) and the
+  // full trace viewer (no LLM conversation) are hidden. `isProbe` is computed
+  // above (next to the gate, which depends on it).
+  // Pure render checks hide the trace viewer (no LLM conversation), so they get
+  // a dedicated "Widget Render" section here. Every other case (prompt/hybrid)
+  // already surfaces the same observations via the trace viewer's Browser tab,
+  // so no separate section is added for them — see the layout below.
+  const probeObservations = useMemo<
+    import("@/shared/eval-trace").EvalTraceWidgetRenderObservationView[]
+  >(() => {
+    if (!isProbe || !blob || Array.isArray(blob) || typeof blob !== "object") {
+      return [];
+    }
+    const raw = (blob as { widgetRenderObservations?: unknown })
+      .widgetRenderObservations;
+    return Array.isArray(raw) ? raw : [];
+  }, [isProbe, blob]);
+  const probeArtifactsSection = isProbe ? (
+    <div className="space-y-2" data-testid="iteration-probe-artifacts-section">
+      <div className="flex items-center justify-between border-b border-border/40 pb-2">
+        <div className="text-xs font-semibold">Widget Render</div>
+      </div>
+      {loading ? (
+        <div className="flex items-center justify-center py-8">
+          <TranscriptEmptyState kind="loading" />
+        </div>
+      ) : error ? (
+        <TraceBlobLoadErrorPanel
+          error={error}
+          layoutMode={layoutMode}
+          onRetry={() => setBlobRetryTick((n) => n + 1)}
+          isDetailsOpen={isBlobErrorDetailsOpen}
+          onDetailsOpenChange={setIsBlobErrorDetailsOpen}
+        />
+      ) : probeObservations.length > 0 ? (
+        <BrowserArtifactsView observations={probeObservations} />
+      ) : (
+        <p className="text-xs italic text-muted-foreground">
+          No render observation recorded for this iteration.
+        </p>
+      )}
+    </div>
+  ) : null;
+
+  const traceSection = hasTrace || (scorecard && previewTraceMode === "steps") ? (
+    <div
+      className={cn(
+        "flex flex-col",
+        layoutMode === "full" && "min-h-0 flex-1",
+        layoutMode === "full" ? "gap-1" : "gap-1.5",
+      )}
+      data-testid="iteration-trace-section"
+    >
+      {layoutMode !== "full" ? (
+        <div className="text-xs font-semibold">Trace</div>
+      ) : null}
+      <div
+        className={cn(
+          layoutMode === "compact" && "rounded-md bg-muted/20 p-3",
+          layoutMode === "full" &&
+            hasTrace &&
+            !error &&
+            "flex min-h-0 flex-1 flex-col",
+          layoutMode === "full" &&
+            error &&
+            !loading &&
+            "min-h-[320px] flex flex-col justify-center",
+        )}
+      >
+        {loading ? (
+          <div className="flex items-center justify-center py-8">
+            <TranscriptEmptyState kind="loading" />
+          </div>
+        ) : error ? (
+          <TraceBlobLoadErrorPanel
+            error={error}
+            layoutMode={layoutMode}
+            onRetry={() => setBlobRetryTick((n) => n + 1)}
+            isDetailsOpen={isBlobErrorDetailsOpen}
+            onDetailsOpenChange={setIsBlobErrorDetailsOpen}
+          />
+        ) : hostSnapshot === null && previewTraceMode === "chat" ? (
+          <p role="alert" className="p-4 text-sm text-muted-foreground">
+            Could not load this run's host configuration.
+          </p>
+        ) : (
+          <TraceViewer
+              hostSnapshot={hostSnapshot}
+              trace={blob ?? {}}
+              mcpToolResultImageRendering={mcpToolResultImageRendering}
+              model={traceModel}
+              toolsMetadata={toolsMetadata}
+              toolServerMap={toolServerMap}
+              connectedServerIds={connectedServerIds}
+              traceStartedAtMs={traceStartedAtMs}
+              traceEndedAtMs={traceEndedAtMs}
+              estimatedDurationMs={estimatedDurationMs}
+              traceInsight={caseInsightSlot}
+              chromeDensity={layoutMode === "full" ? "compact" : "default"}
+              fillContent={layoutMode === "full"}
+              frame={layoutMode === "full" ? "none" : "inset"}
+              hideToolbar={layoutMode === "full"}
+              forcedViewMode={
+                layoutMode === "full" && previewTraceMode !== "scorecard"
+                  ? previewTraceMode
+                  : undefined
+              }
+              steps={snapshotSteps}
+              stepPresentation={scorecard ? "scorecard" : "legacy"}
+              stepResults={scorecard ? stepReplayRows : undefined}
+              verdictWord={scorecard ? trialVerdictWord : undefined}
+              stepStatusById={
+                stepStatusById.size > 0 ? stepStatusById : undefined
+              }
+              syncedStepId={syncedStepId}
+              onSyncStep={onSyncStep}
+              iterationResult={iteration.result}
+              expectedToolCalls={expectedToolCalls}
+              actualToolCalls={actualToolCalls}
+            />
+        )}
+      </div>
+    </div>
+  ) : null;
+
+  const caseInsightFallback =
+    caseInsightSlot && !hasTrace ? (
+      <div className="min-w-0" data-testid="iteration-case-insight-fallback">
+        {caseInsightSlot}
+      </div>
+    ) : null;
+  return (
+    <div
+      className={cn(
+        "flex flex-col",
+        layoutMode === "full" && "min-h-0 flex-1",
+        layoutMode === "full" ? "gap-3" : "gap-4 py-2",
+      )}
+    >
+      {/* WHERE VALUE STOPPED, above the transcript.
+          A reader who opened this trial is asking why it did not deliver, and
+          the answer is six cards wide — putting it under the trace would make
+          them scroll a transcript to reach the summary of it. Absent for the
+          hosts that pass no slot, which is most of them. */}
+      {trialChainSlot && !scorecard ? (
+        <div className="shrink-0 px-3" data-testid="iteration-trial-chain">
+          {trialChainSlot}
+        </div>
+      ) : null}
+      {previewTraceToolbar}
+      {/* Advisory judge verdict — pinned under the tab row so it's visible on
+          every tab (Steps/Chat/Results/Trace/App/Raw), not buried in one. */}
+      {/* With a scorecard the judge is a ROW there, hosting this same panel as
+          its body — so the protocol survives without a second mount, and the
+          judge sits with the other scorers instead of above all of them. */}
+      {layoutMode === "full" && judgeCase && !scorecard ? (
+        <div className="shrink-0 px-3">
+          {enableJudgeReview && iteration.suiteRunId ? (
+            // Keyed by trial: a switch remounts the panel, so no read or label
+            // state from the previous trial can survive into this one.
+            <TrialJudgeReviewPanel
+              key={iteration._id}
+              iterationId={iteration._id}
+              judgeCase={judgeCase}
+              onVisibilityChange={setJudgeHidden}
+            />
+          ) : (
+            <JudgeVerdictPanel judgeCase={judgeCase} />
+          )}
+        </div>
+      ) : null}
+      {iterationError && <ErrorCard key={iteration._id} error={iterationError} variant="inline" />}
+
+      {!hasTrace && !scorecard && !isProbe && (
+        <TranscriptEmptyState {...(iteration.status === "running" || iteration.status === "pending"
+          ? { kind: "streaming" as const }
+          : { kind: "unrecorded" as const, execution: iteration.tokensUsed > 0 || iteration.actualToolCalls.length > 0 ? "observed" as const : "unknown" as const })} />
+      )}
+      {caseInsightFallback}
+
+      {isProbe && !scorecard ? (
+        <>
+          {predicatesSection}
+          {scoresSection}
+          {probeArtifactsSection}
+        </>
+      ) : scorecard ? (
+        previewTraceMode === "scorecard" ? (
+          scorecard.render({
+            envelope: blobEnvelope,
+            trace: blob ?? null,
+            envelopeLoading: loading,
+            reviewActive: Boolean(enableJudgeReview && iteration.suiteRunId),
+            judgeHidden,
+            onJudgeVisibilityChange: setJudgeHidden,
+            scoresSection,
+          })
+        ) : (
+          !hasTrace && previewTraceMode === "tools" ? (
+            <div className="space-y-3" data-testid="iteration-tools-without-trace">{toolCallsGrids}</div>
+          ) : !hasTrace && previewTraceMode !== "steps" ? (
+            <TranscriptEmptyState {...(iteration.status === "running" || iteration.status === "pending"
+              ? { kind: "streaming" as const }
+              : { kind: "unrecorded" as const, execution: iteration.tokensUsed > 0 || iteration.actualToolCalls.length > 0 ? "observed" as const : "unknown" as const })} />
+          ) : traceSection
+        )
+      ) : traceFirst ? (
+        <>
+          {traceSection}
+          {toolCallsSection}
+          {predicatesSection}
+          {scoresSection}
+        </>
+      ) : (
+        <>
+          {toolCallsSection}
+          {predicatesSection}
+          {scoresSection}
+          {traceSection}
+        </>
+      )}
+    </div>
+  );
+}

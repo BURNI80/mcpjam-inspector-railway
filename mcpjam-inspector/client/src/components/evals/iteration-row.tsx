@@ -1,0 +1,168 @@
+import {
+  modelDisplayName,
+  ModelDisplayNamesContext,
+} from "@/lib/model-display-name";
+import { useContext } from "react";
+import { Button } from "@mcpjam/design-system/button";
+import { cn } from "@/lib/utils";
+import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { EvalIteration, EvalCase } from "./types";
+import { evalStatusLeftBorderClasses, formatRunId } from "./helpers";
+import { parseIterationPredicates } from "./predicates-list";
+import {
+  isGatingScore,
+  parseEvaluationConfig,
+  parseIterationScores,
+  parseScoreIntegrity,
+  scoreFailsGate,
+} from "./scores-list";
+
+interface IterationRowProps {
+  iteration: EvalIteration;
+  testCase: EvalCase | null;
+  iterationTestCase?: EvalCase | null;
+  iterationRun?: { _id: string } | null;
+  onViewRun?: (runId: string) => void;
+  formatTime: (ts?: number) => string;
+  formatDuration: (ms: number) => string;
+  isOpen?: boolean;
+  onToggle?: () => void;
+}
+
+export function CompactIterationRow({
+  iteration,
+  testCase,
+  iterationTestCase,
+  iterationRun,
+  onViewRun,
+  formatTime: _formatTime,
+  formatDuration,
+  isOpen = false,
+  onToggle,
+}: IterationRowProps) {
+  const availableModels = useContext(ModelDisplayNamesContext);
+  const startedAt = iteration.startedAt ?? iteration.createdAt;
+  const completedAt = iteration.updatedAt ?? iteration.createdAt;
+  const durationMs =
+    startedAt && completedAt ? Math.max(completedAt - startedAt, 0) : null;
+  const isPending = iteration.result === "pending";
+
+  const actualToolCalls = iteration.actualToolCalls || [];
+
+  // X/Y assertions passed badge — read from the same parsed verdicts the detail
+  // view renders. User-facing wording is "checks".
+  //
+  // Gating SCORES win when present, and are not added to the predicate count:
+  // every predicate is itself projected into a gating score, so summing both
+  // would double-count the same verdict. Advisory scores are excluded outright
+  // — a red advisory judge must never make a passing run look failed in a list.
+  // Runs that predate scoring fall back to `metadata.predicates`.
+  const scores = parseIterationScores(iteration.metadata);
+  const evaluationConfig = parseEvaluationConfig(iteration.metadata);
+  const gatingScores = scores
+    ? scores.filter((score) => isGatingScore(score, evaluationConfig))
+    : [];
+  const predicates = parseIterationPredicates(iteration.metadata);
+  const checksBadge =
+    gatingScores.length > 0
+      ? {
+          total: gatingScores.length,
+          passed: gatingScores.filter(
+            (score) => !scoreFailsGate(score, evaluationConfig),
+          ).length,
+        }
+      : predicates && predicates.length > 0
+        ? {
+            total: predicates.length,
+            passed: predicates.filter((p) => p.passed).length,
+          }
+        : null;
+  // An integrity downgrade means the gating evidence did not verify. The rows
+  // that survived may all be green, so the chip must not read as a pass.
+  const scoreIntegrityInvalid =
+    parseScoreIntegrity(iteration.metadata) === "score_integrity_invalid";
+  const allChecksPassed =
+    checksBadge !== null &&
+    checksBadge.passed === checksBadge.total &&
+    !scoreIntegrityInvalid;
+
+  return (
+    <div
+      className={cn(
+        "relative overflow-hidden border-l-2",
+        evalStatusLeftBorderClasses(isPending ? "running" : iteration.result),
+        isPending && "opacity-60",
+      )}
+    >
+      <div className="flex items-center gap-6 w-full">
+        <div className="pl-3">
+          {isOpen ? (
+            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+          )}
+        </div>
+        <button
+          onClick={onToggle}
+          className="flex flex-1 items-center gap-6 py-2.5 pr-3 text-left transition-colors hover:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+        >
+          <span className="text-xs font-medium min-w-[120px] max-w-[120px] truncate">
+            {testCase?.title || "—"}
+          </span>
+          <span className="text-xs text-muted-foreground min-w-[140px] max-w-[140px] truncate">
+            {modelDisplayName(
+              iteration.testCaseSnapshot?.model
+                ? `${iteration.testCaseSnapshot.provider}/${iteration.testCaseSnapshot.model}`
+                : iterationTestCase?.models?.[0]?.model
+                  ? `${iterationTestCase.models[0].provider}/${iterationTestCase.models[0].model}`
+                  : "—",
+              availableModels,
+            )}
+          </span>
+          <span className="text-xs font-mono text-muted-foreground min-w-[60px] max-w-[60px] text-right">
+            {actualToolCalls.length}
+          </span>
+          <span className="text-xs font-mono text-muted-foreground min-w-[70px] max-w-[70px] text-right">
+            {Number(iteration.tokensUsed || 0).toLocaleString()}
+          </span>
+          <span className="text-xs text-muted-foreground font-mono min-w-[70px] max-w-[70px] text-right">
+            {durationMs !== null ? formatDuration(durationMs) : "—"}
+          </span>
+          {checksBadge ? (
+            <span
+              className={cn(
+                "text-[10px] font-semibold rounded px-1.5 py-0.5 min-w-[100px] max-w-[110px] text-center",
+                allChecksPassed
+                  ? "bg-success/15 text-success"
+                  : "bg-destructive/15 text-destructive",
+              )}
+              title={`${checksBadge.passed} of ${checksBadge.total} assertions passed`}
+            >
+              {checksBadge.passed} / {checksBadge.total} assertions
+            </span>
+          ) : null}
+          {isPending && (
+            <div className="flex items-center min-w-[40px]">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-warning" />
+            </div>
+          )}
+          {!isPending && iterationRun && onViewRun && (
+            <div className="flex items-center min-w-[120px]">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 text-[11px] px-2"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onViewRun(iterationRun._id);
+                }}
+              >
+                View Run {formatRunId(iterationRun._id)}
+              </Button>
+            </div>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}

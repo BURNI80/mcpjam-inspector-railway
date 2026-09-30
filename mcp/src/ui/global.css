@@ -1,0 +1,38 @@
+@import "tailwindcss";
+@import "@mcpjam/design-system/index.css";
+
+@source "./**/*.{ts,tsx,html}";
+@source "../../../design-system/src/**/*.tsx";
+
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    margin: 0;
+    min-height: 100%;
+  }
+
+  body {
+    @apply antialiased;
+    min-width: 320px;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  code,
+  pre {
+    font-family: var(--font-code);
+  }
+}

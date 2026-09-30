@@ -1,0 +1,833 @@
+import { getBillingErrorMessage } from "@/lib/billing-entitlements";
+import { canCheckoutPlan } from "@/lib/pricing-catalog";
+import { useAction, useMutation, useQueries, useQuery } from "convex/react";
+import { makeFunctionReference } from "convex/server";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { confirmSeatPaymentWithStripe } from "@/lib/seat-payment-stripe";
+import { useDbUserReady } from "@/contexts/db-user-ready-context";
+
+export type OrganizationPlan = "free" | "pro" | "team" | "enterprise";
+export type BillingInterval = "monthly" | "annual";
+export type BillingModel = "free" | "flat" | "per_seat" | "contact";
+export type BillingFeatureName =
+  | "evals"
+  | "scenarios"
+  | "cicd"
+  | "customDomains"
+  | "auditLog"
+  | "sso"
+  | "prioritySupport";
+export type BillingLimitName =
+  | "maxMembers"
+  | "maxProjects"
+  | "maxServersPerProject"
+  | "maxScenariosPerProject"
+  | "maxEvalRunsPerMonth"
+  | "maxEvalIterationsPerMonth"
+  | "insightsPerDay"
+  // Journey runs launched per UTC day per organization. Hand-mirrored from the
+  // backend's `LIMIT_NAMES`, which `buildBillingCatalog` serializes wholesale
+  // onto the UNAUTHENTICATED billing catalog — so a new backend limit becomes
+  // visible here whether or not this file knows about it. Adding it is what
+  // gives it a name and a message instead of a silent generic failure.
+  | "journeyRunsPerDay"
+  | "computerStartsPerDay";
+
+/** Mirrors backend premiumness gate keys exactly. */
+export type PremiumnessGateKey =
+  | "scenarios"
+  | "evals"
+  | "cicd"
+  | "auditLog"
+  | "maxMembers"
+  | "maxProjects"
+  | "maxServersPerProject"
+  | "maxScenariosPerProject"
+  | "maxEvalRunsPerMonth"
+  | "maxEvalIterationsPerMonth"
+  | "insightsPerDay"
+  // Paired with the backend's gate of the same name. A gate key with no entry
+  // here still ARRIVES — `GateDecision.gateKey` is whatever the backend sent —
+  // and falls through `formatPremiumnessGateKey` to be rendered verbatim, so
+  // the user reads "journeyRunsPerDay is not included in the Free plan".
+  | "journeyRunsPerDay";
+
+export type BillingEnforcementState =
+  | "active"
+  | "disabled"
+  | "decision_required";
+
+export interface GateDecision {
+  gateKey: PremiumnessGateKey;
+  kind: "feature" | "limit";
+  scope: "organization" | "project";
+  canAccess: boolean;
+  shouldShowUpsell: boolean;
+  upgradePlan: OrganizationPlan | null;
+  reason: string;
+  currentValue?: number;
+  allowedValue?: number | null;
+}
+
+export interface PremiumnessState {
+  plan: OrganizationPlan;
+  enforcementState: BillingEnforcementState;
+  /** Effective plan for UX (trials, simulations). */
+  effectivePlan: OrganizationPlan;
+  billingInterval: BillingInterval | null;
+  source: "free" | "subscription" | "trial" | "simulation";
+  decisionRequired: boolean;
+  gates: GateDecision[];
+}
+
+export interface OrganizationEntitlements {
+  plan: OrganizationPlan;
+  billingInterval: BillingInterval | null;
+  source: OrganizationBillingStatus["source"];
+  features: Record<BillingFeatureName, boolean>;
+  limits: Record<BillingLimitName, number | null>;
+}
+
+export interface OrganizationBillingStatus {
+  organizationId: string;
+  organizationName: string;
+  catalogPlanId?: string;
+  pricingVersion?: "v1" | "v2";
+  priceModel?: BillingModel;
+  topUpEligible?: boolean;
+  plan: OrganizationPlan;
+  effectivePlan: OrganizationPlan;
+  source: "free" | "subscription" | "trial" | "simulation";
+  billingInterval: BillingInterval | null;
+  billingConfigured: boolean;
+  subscriptionStatus: string | null;
+  canManageBilling: boolean;
+  canCancelScheduledBillingChange: boolean;
+  isOwner: boolean;
+  hasCustomer: boolean;
+  stripeScheduledPlan: OrganizationPlan | null;
+  stripeScheduledBillingInterval: BillingInterval | null;
+  stripeScheduledPriceId: string | null;
+  stripeScheduledEffectiveAt: number | null;
+  stripeCancelAtPeriodEnd: boolean;
+  stripeCancelAt: number | null;
+  stripeCanceledAt: number | null;
+  stripeCurrentPeriodEnd: number | null;
+  stripePriceId: string | null;
+  stripeSeatQuantity?: number | null;
+  paymentState?: "ok" | "past_due";
+  paymentGraceEndsAt?: number | null;
+  trialStatus: string;
+  trialPlan: OrganizationPlan | null;
+  trialStartedAt: number | null;
+  trialEndsAt: number | null;
+  deferredTrialBillingStartsAt?: number | null;
+  trialDaysRemaining: number | null;
+  decisionRequired: boolean;
+  trialDecision: string | null;
+}
+
+export interface OrganizationSeatPaymentIntent {
+  _id: string;
+  organizationId: string;
+  userId: string;
+  email: string;
+  role: "guest" | "member";
+  source: string;
+  status:
+    | "pending"
+    | "requires_action"
+    | "cleanup_pending"
+    | "failed"
+    | "canceled";
+  /**
+   * The charge ended terminally and the invitee is still waiting. Only ever
+   * true for charges raised automatically at signup — when an owner starts one
+   * themselves they see the failure inline and just try again. Unattended,
+   * nothing would surface it, so the notice renders a retry variant instead.
+   */
+  needsRetry?: boolean;
+  targetSeatQuantity: number | null;
+  stripeInvoiceId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type SeatPaymentResult =
+  | { status: "paid"; seatQuantity: number; stripeInvoiceId?: string }
+  | { status: "failed"; stripeInvoiceId?: string; reason?: string }
+  | { status: "noop"; reason: string };
+
+export type SeatPaymentCancelResult = {
+  voided: boolean;
+  outcome: "canceled" | "deferred" | "paid" | "not_active";
+};
+
+export interface PlanCatalogEntry {
+  catalogPlanId?: string;
+  includedCredits?:
+    | { model: "daily_bucket"; dailyCredits: number }
+    | { model: "monthly_ledger"; flat: number }
+    | { model: "monthly_ledger"; perSeat: number }
+    | { model: "monthly_ledger"; negotiated: true };
+  rollover?: { capMultiplier: number; capCredits: number } | null;
+  topUp?: {
+    centsPerCredit: number;
+    monthlyCapCredits: number | null;
+    eligible: boolean;
+  };
+  rateCard?: {
+    id: string;
+    creditsPerProviderDollar: number;
+    platformFees: Record<string, number>;
+  };
+  display?: {
+    features: Array<{
+      key: string;
+      label: string;
+      included: boolean;
+      detail?: string;
+    }>;
+    support: "community" | "email" | "priority" | "dedicated";
+  };
+  plan: OrganizationPlan;
+  displayName: string;
+  billingModel: BillingModel;
+  isSelfServe: boolean;
+  prices: Record<BillingInterval, number | null>;
+  features: Record<BillingFeatureName, boolean>;
+  limits: Record<BillingLimitName, number | null>;
+  includedSeats: number | null;
+  seatMinimum: number | null;
+  checkout: {
+    plan: "pro" | "team";
+    supportedIntervals: BillingInterval[];
+  } | null;
+}
+
+export interface PlanCatalog {
+  catalogVersion: string;
+  currency: string;
+  appOrigin?: string;
+  plans: Record<Exclude<OrganizationPlan, "pro">, PlanCatalogEntry> & {
+    pro?: PlanCatalogEntry;
+  };
+}
+
+// One envelope for the five stable billing reads. Bundled server-side because
+// every open page used to hold five separate subscriptions for them, which is
+// what pushed prod into its concurrent-query limit. `projectPremiumness` is
+// null when the caller sent no projectId.
+export interface OrganizationBillingBundle {
+  billingStatus: OrganizationBillingStatus;
+  entitlements: OrganizationEntitlements;
+  organizationPremiumness: PremiumnessState;
+  projectPremiumness: PremiumnessState | null;
+  planCatalog: PlanCatalog;
+}
+
+export interface OrganizationPlanChangeSnapshot {
+  stripeCustomerId?: string;
+  stripeSubscriptionId?: string;
+  stripeSubscriptionStatus?: string;
+  stripeSubscriptionItemId?: string;
+  stripePriceId?: string;
+  stripeSeatQuantity?: number;
+  stripeScheduledPlan?: "pro" | "team" | null;
+  stripeScheduledBillingInterval?: BillingInterval | null;
+  stripeScheduledPriceId?: string | null;
+  stripeScheduledEffectiveAt?: number | null;
+  stripeCanCancelScheduledBillingChange?: boolean;
+  stripeCancelAtPeriodEnd?: boolean;
+  stripeCancelAt?: number | null;
+  stripeCanceledAt?: number | null;
+  stripeCurrentPeriodEnd?: number;
+  plan?: OrganizationPlan;
+  billingInterval?: BillingInterval;
+}
+
+export type OrganizationPlanChangeResult =
+  | {
+      kind: "checkout";
+      checkoutUrl: string;
+    }
+  | {
+      kind: "portal";
+      portalUrl: string;
+    }
+  | {
+      kind: "updated";
+      subscription: OrganizationPlanChangeSnapshot;
+    }
+  | {
+      kind: "scheduled";
+      subscription: OrganizationPlanChangeSnapshot;
+    };
+
+export function isPaidPlan(plan: OrganizationPlan): boolean {
+  return plan !== "free";
+}
+
+export interface UseOrganizationBillingOptions {
+  projectId?: string | null;
+  enabled?: boolean;
+  includeSeatPaymentIntent?: boolean;
+}
+
+export interface UseOrganizationBillingStatusOptions {
+  enabled?: boolean;
+}
+
+export interface StartOrganizationPlanChangeOptions {
+  confirmPaidPlanChange?: boolean;
+}
+
+export function useOrganizationBillingStatus(
+  organizationId: string | null,
+  options?: UseOrganizationBillingStatusOptions,
+): OrganizationBillingStatus | undefined {
+  const isUserReady = useDbUserReady();
+  const enabled = (options?.enabled ?? true) && isUserReady;
+
+  return useQuery(
+    "billing:getOrganizationBillingStatus" as any,
+    enabled && organizationId ? ({ organizationId } as any) : "skip",
+  ) as OrganizationBillingStatus | undefined;
+}
+
+const billingStatusQuery = makeFunctionReference<
+  "query",
+  { organizationId: string },
+  OrganizationBillingStatus
+>("billing:getOrganizationBillingStatus");
+
+/**
+ * Whether the viewer can manage billing, for surfaces that must keep
+ * rendering when the status query fails. useQueries returns the server error
+ * instead of throwing during render; an error or a pending result reads as
+ * false, so refusal copy falls back to the non-manager wording.
+ */
+export function useCanManageOrganizationBilling(
+  organizationId: string | null | undefined,
+  enabled: boolean,
+): boolean {
+  const isUserReady = useDbUserReady();
+  // Convex keys its subscription callbacks by this object's identity.
+  const queries = useMemo<Parameters<typeof useQueries>[0]>(
+    (): Parameters<typeof useQueries>[0] =>
+      enabled && isUserReady && organizationId
+        ? { status: { query: billingStatusQuery, args: { organizationId } } }
+        : {},
+    [enabled, isUserReady, organizationId],
+  );
+  const result = useQueries(queries).status as
+    OrganizationBillingStatus | Error | undefined;
+  return !(result instanceof Error) && result?.canManageBilling === true;
+}
+
+export function useOrganizationBilling(
+  organizationId: string | null,
+  options?: UseOrganizationBillingOptions,
+) {
+  const projectId = options?.projectId ?? null;
+  const isUserReady = useDbUserReady();
+  const callerEnabled = options?.enabled ?? true;
+  const enabled = callerEnabled && isUserReady;
+  const shouldQueryOrganization = enabled && !!organizationId;
+  const shouldQueryProject = shouldQueryOrganization && !!projectId;
+  const shouldQuerySeatPaymentIntent =
+    shouldQueryOrganization && options?.includeSeatPaymentIntent === true;
+
+  // One subscription instead of five. `useOrganizationBillingStatus` stays a
+  // separate export for callers that only want the status, so it is not reused
+  // here.
+  const bundle = useQuery(
+    "billing:getOrganizationBillingBundle" as any,
+    shouldQueryOrganization
+      ? ({
+          organizationId,
+          ...(shouldQueryProject ? { projectId } : {}),
+        } as any)
+      : "skip",
+  ) as OrganizationBillingBundle | undefined;
+
+  const billingStatus = bundle?.billingStatus;
+  const entitlements = bundle?.entitlements;
+  const organizationPremiumness = bundle?.organizationPremiumness;
+  // The bundle says null for "no projectId sent"; callers expect undefined,
+  // which is what the old "skip" subscription gave them. Gate it on
+  // shouldQueryProject too, so a bundle fetched without a project can never
+  // read as a settled project answer.
+  const projectPremiumness = shouldQueryProject
+    ? (bundle?.projectPremiumness ?? undefined)
+    : undefined;
+  const planCatalog = bundle?.planCatalog;
+
+  const activeSeatPaymentIntent = useQuery(
+    "billing:getActiveOrganizationSeatPaymentIntent" as any,
+    shouldQuerySeatPaymentIntent ? ({ organizationId } as any) : "skip",
+  ) as OrganizationSeatPaymentIntent | null | undefined;
+
+  const startPlanChangeAction = useAction(
+    "billing:startOrganizationPlanChange" as any,
+  );
+  const createPortal = useAction(
+    "billing:createOrganizationBillingPortalSession" as any,
+  );
+  const createCancellationPortal = useAction(
+    "billing:createOrganizationBillingPortalCancellationSession" as any,
+  );
+  const createIntervalChangePortal = useAction(
+    "billing:createOrganizationBillingPortalIntervalChangeSession" as any,
+  );
+  const cancelScheduledBillingChangeAction = useAction(
+    "billing:cancelOrganizationScheduledBillingChange" as any,
+  );
+  const selectFreeAfterTrialMutation = useMutation(
+    "billing:selectOrganizationFreePlanAfterTrial" as any,
+  );
+  const startSeatPaymentAction = useAction("billing:startSeatPayment" as any);
+  const completeSeatPaymentAction = useAction(
+    "billing:completeSeatPayment" as any,
+  );
+  const cancelSeatPaymentAction = useAction("billing:cancelSeatPayment" as any);
+  const retrySeatPaymentMutation = useMutation(
+    "billing:retrySeatPayment" as any,
+  );
+
+  const [isStartingPlanChange, setIsStartingPlanChange] = useState(false);
+  const [pendingPlanChangeTarget, setPendingPlanChangeTarget] = useState<
+    "pro" | "team" | null
+  >(null);
+  const [isOpeningPortal, setIsOpeningPortal] = useState(false);
+  const [
+    isCancelingScheduledBillingChange,
+    setIsCancelingScheduledBillingChange,
+  ] = useState(false);
+  const [isSelectingFreeAfterTrial, setIsSelectingFreeAfterTrial] =
+    useState(false);
+  const [isFinishingSeatPayment, setIsFinishingSeatPayment] = useState(false);
+  const [isCompletingSeatPayment, setIsCompletingSeatPayment] = useState(false);
+  const [isCancelingSeatPayment, setIsCancelingSeatPayment] = useState(false);
+  const seatPaymentCancelVersionRef = useRef(0);
+  const seatPaymentCompletionInFlightRef = useRef(false);
+  const [error, setError] = useState<string | null>(null);
+  const canManageBilling = billingStatus?.canManageBilling ?? false;
+
+  const startPlanChange = useCallback(
+    async (
+      returnUrl: string,
+      tier: "pro" | "team" = "team",
+      billingInterval: BillingInterval = "monthly",
+      options: StartOrganizationPlanChangeOptions = {},
+    ): Promise<OrganizationPlanChangeResult> => {
+      if (!organizationId) throw new Error("Organization is required");
+      if (!canCheckoutPlan(planCatalog, tier, billingInterval))
+        throw new Error(
+          "This plan or billing interval is not offered to this organization.",
+        );
+      setIsStartingPlanChange(true);
+      setPendingPlanChangeTarget(tier);
+      setError(null);
+      try {
+        const result = await startPlanChangeAction({
+          organizationId,
+          returnUrl,
+          tier,
+          billingInterval,
+          confirmPaidPlanChange: options.confirmPaidPlanChange,
+        });
+        return result as OrganizationPlanChangeResult;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to change plan",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsStartingPlanChange(false);
+        setPendingPlanChangeTarget(null);
+      }
+    },
+    [organizationId, startPlanChangeAction, planCatalog, canManageBilling],
+  );
+
+  const openPortal = useCallback(
+    async (returnUrl: string) => {
+      if (!organizationId) throw new Error("Organization is required");
+      setIsOpeningPortal(true);
+      setError(null);
+      try {
+        const result = await createPortal({
+          organizationId,
+          returnUrl,
+        });
+        return result.portalUrl as string;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to open billing portal",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsOpeningPortal(false);
+      }
+    },
+    [createPortal, organizationId, canManageBilling],
+  );
+
+  const openIntervalChangePortal = useCallback(
+    async (returnUrl: string, targetBillingInterval: BillingInterval) => {
+      if (!organizationId) throw new Error("Organization is required");
+      setIsOpeningPortal(true);
+      setError(null);
+      try {
+        const result = await createIntervalChangePortal({
+          organizationId,
+          returnUrl,
+          targetBillingInterval,
+        });
+        return result.portalUrl as string;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to open billing interval change",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsOpeningPortal(false);
+      }
+    },
+    [createIntervalChangePortal, organizationId, canManageBilling],
+  );
+
+  const openCancellationPortal = useCallback(
+    async (returnUrl: string) => {
+      if (!organizationId) throw new Error("Organization is required");
+      setIsOpeningPortal(true);
+      setError(null);
+      try {
+        const result = await createCancellationPortal({
+          organizationId,
+          returnUrl,
+        });
+        return result.portalUrl as string;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to open cancellation flow",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsOpeningPortal(false);
+      }
+    },
+    [createCancellationPortal, organizationId, canManageBilling],
+  );
+
+  const cancelScheduledBillingChange = useCallback(async () => {
+    if (!organizationId) throw new Error("Organization is required");
+    setIsCancelingScheduledBillingChange(true);
+    setError(null);
+    try {
+      const result = await cancelScheduledBillingChangeAction({
+        organizationId,
+      });
+      return result.subscription as OrganizationPlanChangeSnapshot;
+    } catch (err) {
+      const message = getBillingErrorMessage(
+        err,
+        "Failed to cancel scheduled billing change",
+        canManageBilling,
+      );
+      setError(message);
+      throw err;
+    } finally {
+      setIsCancelingScheduledBillingChange(false);
+    }
+  }, [cancelScheduledBillingChangeAction, organizationId, canManageBilling]);
+
+  const selectFreeAfterTrial = useCallback(async () => {
+    if (!organizationId) throw new Error("Organization is required");
+    setIsSelectingFreeAfterTrial(true);
+    setError(null);
+    try {
+      await selectFreeAfterTrialMutation({ organizationId } as any);
+    } catch (err) {
+      const message = getBillingErrorMessage(
+        err,
+        "Failed to choose free plan",
+        canManageBilling,
+      );
+      setError(message);
+      throw err;
+    } finally {
+      setIsSelectingFreeAfterTrial(false);
+    }
+  }, [organizationId, selectFreeAfterTrialMutation, canManageBilling]);
+
+  const finishSeatPayment = useCallback(
+    async (seatPaymentIntentId?: string): Promise<SeatPaymentResult> => {
+      if (!organizationId) throw new Error("Organization is required");
+      const activeSeatPaymentIntentId =
+        seatPaymentIntentId ?? activeSeatPaymentIntent?._id;
+      if (!activeSeatPaymentIntentId) {
+        return { status: "noop", reason: "no_pending_seat_payment" };
+      }
+
+      setIsFinishingSeatPayment(true);
+      setError(null);
+      const cancelVersionAtStart = seatPaymentCancelVersionRef.current;
+      try {
+        const startResult = await startSeatPaymentAction({
+          organizationId,
+          seatPaymentIntentId: activeSeatPaymentIntentId,
+        } as any);
+
+        if (seatPaymentCancelVersionRef.current !== cancelVersionAtStart) {
+          return { status: "noop", reason: "seat_payment_canceled" };
+        }
+
+        if (startResult.status === "requires_action") {
+          if (!startResult.clientSecret) {
+            throw new Error("Payment confirmation is unavailable");
+          }
+
+          try {
+            await confirmSeatPaymentWithStripe({
+              publishableKey: startResult.publishableKey,
+              clientSecret: startResult.clientSecret,
+            });
+          } catch (confirmError) {
+            try {
+              await cancelSeatPaymentAction({
+                organizationId,
+                seatPaymentIntentId: activeSeatPaymentIntentId,
+                stripeInvoiceId: startResult.stripeInvoiceId,
+                terminalStatus: "failed",
+              } as any);
+            } catch (cancelError) {
+              console.warn(
+                "[billing] Failed to cancel incomplete seat payment",
+                cancelError,
+              );
+            }
+            throw confirmError;
+          }
+
+          if (seatPaymentCancelVersionRef.current !== cancelVersionAtStart) {
+            return { status: "noop", reason: "seat_payment_canceled" };
+          }
+
+          seatPaymentCompletionInFlightRef.current = true;
+          setIsCompletingSeatPayment(true);
+          try {
+            const completeResult = (await completeSeatPaymentAction({
+              seatPaymentIntentId: activeSeatPaymentIntentId,
+              stripeInvoiceId: startResult.stripeInvoiceId,
+            } as any)) as SeatPaymentResult;
+            if (seatPaymentCancelVersionRef.current !== cancelVersionAtStart) {
+              return { status: "noop", reason: "seat_payment_canceled" };
+            }
+            if (completeResult.status !== "paid") {
+              throw new Error("Payment was not completed");
+            }
+            return completeResult;
+          } finally {
+            seatPaymentCompletionInFlightRef.current = false;
+            setIsCompletingSeatPayment(false);
+          }
+        }
+
+        if (startResult.status === "failed") {
+          if (startResult.reason === "missing_payment_method") {
+            throw new Error(
+              "Stripe has no default payment method for this subscription. Add or select a card in Billing, then click Finish payment again.",
+            );
+          }
+          throw new Error("Payment failed. The member was not added.");
+        }
+
+        return startResult as SeatPaymentResult;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to finish seat payment",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsFinishingSeatPayment(false);
+      }
+    },
+    [
+      activeSeatPaymentIntent?._id,
+      cancelSeatPaymentAction,
+      canManageBilling,
+      completeSeatPaymentAction,
+      organizationId,
+      startSeatPaymentAction,
+    ],
+  );
+
+  /**
+   * Retry a seat charge that died with nobody watching.
+   *
+   * Two steps on purpose. `startSeatPayment` refuses terminal charges — it is
+   * also reached by a stale browser tab, and that must never resurrect a
+   * charge the owner cancelled — so retrying first reopens the charge as a new
+   * attempt, then runs the ordinary finish flow. Going through that flow is
+   * also what makes a 3DS challenge possible, since it needs the owner here.
+   */
+  const retrySeatPayment = useCallback(async () => {
+    if (!organizationId) return;
+    setError(null);
+    setIsFinishingSeatPayment(true);
+    // Captured BEFORE the mutation, not inside finishSeatPayment: reopening
+    // the charge and starting payment are two round trips, and the owner can
+    // hit "Remove invite" in between. finishSeatPayment's own guard reads the
+    // version at its own start, which is already after such a cancel, so it
+    // would happily reopen a charge the owner just cancelled.
+    const cancelVersionAtStart = seatPaymentCancelVersionRef.current;
+    try {
+      const result = (await retrySeatPaymentMutation({
+        organizationId,
+      } as any)) as {
+        restarted: boolean;
+        seatPaymentIntentId: string | null;
+      };
+      if (!result?.restarted || !result.seatPaymentIntentId) {
+        throw new Error(
+          "This seat payment can no longer be retried. Try adding the member again.",
+        );
+      }
+      if (seatPaymentCancelVersionRef.current !== cancelVersionAtStart) {
+        // Cancelled while we were reopening it. Leave it cancelled.
+        return { status: "noop", reason: "seat_payment_canceled" } as const;
+      }
+      return await finishSeatPayment(result.seatPaymentIntentId);
+    } catch (err) {
+      const message = getBillingErrorMessage(
+        err,
+        "Failed to retry seat payment",
+        canManageBilling,
+      );
+      setError(message);
+      throw err;
+    } finally {
+      setIsFinishingSeatPayment(false);
+    }
+  }, [
+    finishSeatPayment,
+    organizationId,
+    retrySeatPaymentMutation,
+    canManageBilling,
+  ]);
+
+  const cancelSeatPayment = useCallback(
+    async (seatPaymentIntentId?: string): Promise<SeatPaymentCancelResult> => {
+      if (!organizationId) throw new Error("Organization is required");
+      const activeSeatPaymentIntentId =
+        seatPaymentIntentId ?? activeSeatPaymentIntent?._id;
+      if (!activeSeatPaymentIntentId) {
+        return { voided: false, outcome: "not_active" };
+      }
+      if (seatPaymentCompletionInFlightRef.current) {
+        return { voided: false, outcome: "not_active" };
+      }
+
+      setIsCancelingSeatPayment(true);
+      seatPaymentCancelVersionRef.current += 1;
+      setError(null);
+      try {
+        return (await cancelSeatPaymentAction({
+          organizationId,
+          seatPaymentIntentId: activeSeatPaymentIntentId,
+          stripeInvoiceId:
+            activeSeatPaymentIntent?.stripeInvoiceId ?? undefined,
+        } as any)) as SeatPaymentCancelResult;
+      } catch (err) {
+        const message = getBillingErrorMessage(
+          err,
+          "Failed to cancel seat payment",
+          canManageBilling,
+        );
+        setError(message);
+        throw err;
+      } finally {
+        setIsCancelingSeatPayment(false);
+      }
+    },
+    [
+      activeSeatPaymentIntent?._id,
+      activeSeatPaymentIntent?.stripeInvoiceId,
+      cancelSeatPaymentAction,
+      canManageBilling,
+      organizationId,
+    ],
+  );
+
+  // The caller asked for billing and we're only waiting on the `users` row.
+  // These flags feed `useProjectBillingGate`, and a gate that reads as settled
+  // resolves to "not denied, free plan" — i.e. it fails OPEN and lets a
+  // limited action through. An unfinished answer must read as loading.
+  const isAwaitingUserRow = callerEnabled && !isUserReady && !!organizationId;
+
+  const isLoadingOrganizationPremiumness =
+    isAwaitingUserRow ||
+    (shouldQueryOrganization && organizationPremiumness === undefined);
+  const isLoadingProjectPremiumness =
+    (isAwaitingUserRow && !!projectId) ||
+    (shouldQueryProject && projectPremiumness === undefined);
+
+  return {
+    billingStatus,
+    organizationPremiumness,
+    projectPremiumness,
+    entitlements,
+    activeSeatPaymentIntent,
+    planCatalog,
+    isLoadingBilling:
+      isAwaitingUserRow ||
+      (shouldQueryOrganization && billingStatus === undefined),
+    isLoadingEntitlements:
+      isAwaitingUserRow ||
+      (shouldQueryOrganization && entitlements === undefined),
+    isLoadingOrganizationPremiumness,
+    isLoadingProjectPremiumness,
+    isLoadingPlanCatalog:
+      isAwaitingUserRow ||
+      (shouldQueryOrganization && planCatalog === undefined),
+    isStartingPlanChange,
+    pendingPlanChangeTarget,
+    isOpeningPortal,
+    isCancelingScheduledBillingChange,
+    isSelectingFreeAfterTrial,
+    isFinishingSeatPayment,
+    isCompletingSeatPayment,
+    isCancelingSeatPayment,
+    isHandlingSeatPayment:
+      isFinishingSeatPayment ||
+      isCompletingSeatPayment ||
+      isCancelingSeatPayment,
+    error,
+    startPlanChange,
+    openPortal,
+    openCancellationPortal,
+    openIntervalChangePortal,
+    cancelScheduledBillingChange,
+    selectFreeAfterTrial,
+    finishSeatPayment,
+    retrySeatPayment,
+    cancelSeatPayment,
+  };
+}

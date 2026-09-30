@@ -1,0 +1,836 @@
+import { toast as sonnerToast } from "sonner";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useServerState } from "../use-server-state";
+import { writeHostedOAuthPendingMarker } from "@/lib/hosted-oauth-callback";
+import { getDefaultClientCapabilities } from "@mcpjam/sdk/browser";
+
+const {
+  mockHandleOAuthCallback,
+  mockListServers,
+  mockReconnectServer,
+  mockEnsureAuthorizedForReconnect,
+  mockUseServerMutations,
+  mockConvexQuery,
+  testConnectionMock,
+  mockTryResolveProjectServer,
+  readStoredOAuthConfigMock,
+  toastSuccess,
+  mockUseDbUserReady,
+} = vi.hoisted(() => ({
+  mockHandleOAuthCallback: vi.fn(),
+  mockListServers: vi.fn(),
+  mockReconnectServer: vi.fn(),
+  mockEnsureAuthorizedForReconnect: vi.fn(),
+  mockUseServerMutations: vi.fn(() => ({
+    createServer: vi.fn(),
+    updateServer: vi.fn(),
+    deleteServer: vi.fn(),
+  })),
+  mockConvexQuery: vi.fn(),
+  testConnectionMock: vi.fn(),
+  mockTryResolveProjectServer: vi.fn<
+    (serverNameOrId: string) => { projectId: string; serverId: string } | null
+  >(() => ({ projectId: "ws_1", serverId: "srv_asana" })),
+  readStoredOAuthConfigMock: vi.fn(),
+  toastSuccess: vi.fn(),
+  mockUseDbUserReady: vi.fn(() => true),
+}));
+
+vi.mock("convex/react", () => ({
+  useConvex: () => ({
+    query: mockConvexQuery,
+  }),
+}));
+
+vi.mock("@/contexts/db-user-ready-context", () => ({
+  useDbUserReady: mockUseDbUserReady,
+}));
+
+vi.mock("@/lib/config", () => ({
+  HOSTED_MODE: true,
+}));
+
+vi.mock("@/state/mcp-api", () => ({
+  testConnection: testConnectionMock,
+  deleteServer: vi.fn(),
+  listServers: mockListServers,
+  reconnectServer: mockReconnectServer,
+  getInitializationInfo: vi.fn(),
+}));
+
+vi.mock("@/state/oauth-orchestrator", () => ({
+  ensureAuthorizedForReconnect: mockEnsureAuthorizedForReconnect,
+}));
+
+vi.mock("@/lib/oauth/mcp-oauth", () => ({
+  // Literal rather than the real export: the module under mock is the one
+  // being stubbed out. Drift is caught by the ratchet in
+  // lib/oauth/__tests__/oauth-callback-recovery.test.ts, which pins the
+  // constant to this exact value.
+  OAUTH_PENDING_STORAGE_KEY: "mcp-oauth-pending",
+  completeHostedOAuthCallback: mockHandleOAuthCallback,
+  handleOAuthCallback: mockHandleOAuthCallback,
+  getStoredTokens: vi.fn(),
+  clearOAuthData: vi.fn(),
+  clearPendingOAuthAttempt: vi.fn(),
+  initiateOAuth: vi.fn(),
+  isElectronMcpCallbackState: (state: string | null | undefined) =>
+    Boolean(state?.startsWith("electron_mcp:")),
+  readStoredOAuthConfig: readStoredOAuthConfigMock,
+}));
+
+vi.mock("@/lib/apis/web/context", () => ({
+  injectHostedServerMapping: vi.fn(),
+  tryGetHostedServerDisplayName: vi.fn(),
+  tryResolveProjectServer: mockTryResolveProjectServer,
+}));
+
+vi.mock("@/lib/session-token", () => ({
+  authFetch: vi.fn(),
+}));
+
+vi.mock("@/stores/ui-playground-store", () => ({
+  useUIPlaygroundStore: {
+    getState: () => ({
+      setCspMode: vi.fn(),
+      setMcpAppsCspMode: vi.fn(),
+    }),
+  },
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: toastSuccess,
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("../useProjects", () => ({
+  useServerMutations: mockUseServerMutations,
+}));
+
+function renderHostedServerState(
+  dispatch = vi.fn(),
+  options?: {
+    projectClientConfig?: {
+      version: 1;
+      clientCapabilities: Record<string, unknown>;
+      hostContext: Record<string, unknown>;
+    };
+  },
+) {
+  return renderHook(() =>
+    useServerState({
+      appState: {
+        activeProjectId: "ws_1",
+        projects: {
+          ws_1: {
+            id: "ws_1",
+            name: "Project",
+            sharedProjectId: "ws_1",
+            clientConfig: options?.projectClientConfig,
+            servers: {
+              asana: {
+                name: "asana",
+                config: {
+                  type: "http",
+                  url: "https://mcp.asana.com/sse",
+                },
+                lastConnectionTime: new Date(),
+                connectionStatus: "disconnected",
+                retryCount: 0,
+                enabled: true,
+                useOAuth: true,
+              },
+            },
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        },
+        servers: {
+          asana: {
+            name: "asana",
+            config: {
+              type: "http",
+              url: "https://mcp.asana.com/sse",
+            },
+            lastConnectionTime: new Date(),
+            connectionStatus: "disconnected",
+            retryCount: 0,
+            enabled: true,
+            useOAuth: true,
+          },
+        },
+        selectedServer: "asana",
+        selectedMultipleServers: [],
+        isMultiSelectMode: false,
+      } as any,
+      dispatch,
+      isLoading: false,
+      isAuthenticated: true,
+      hasSignedInUser: true,
+        currentUserId: "user_1",
+        oauthProjectIds: new Set(["ws_1"]),
+      isAuthLoading: false,
+      isLoadingProjects: false,
+      useLocalFallback: false,
+      effectiveProjects: {
+        ws_1: {
+          id: "ws_1",
+          name: "Project",
+          sharedProjectId: "ws_1",
+          clientConfig: options?.projectClientConfig,
+          servers: {
+            asana: {
+              name: "asana",
+              config: {
+                type: "http",
+                url: "https://mcp.asana.com/sse",
+              },
+              lastConnectionTime: new Date(),
+              connectionStatus: "disconnected",
+              retryCount: 0,
+              enabled: true,
+              useOAuth: true,
+            },
+          },
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      } as any,
+      effectiveActiveProjectId: "ws_1",
+      activeProjectServersFlat: [{ _id: "srv_asana", name: "asana" }],
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    }),
+  );
+}
+
+describe("useServerState hosted OAuth callback guards", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    window.history.replaceState({}, "", "/oauth/callback?code=oauth-code");
+    mockHandleOAuthCallback.mockReset();
+    mockListServers.mockReset();
+    mockReconnectServer.mockReset();
+    mockEnsureAuthorizedForReconnect.mockReset();
+    mockConvexQuery.mockReset();
+    mockUseDbUserReady.mockReturnValue(true);
+    testConnectionMock.mockReset();
+    readStoredOAuthConfigMock.mockReset();
+    toastSuccess.mockReset();
+    mockListServers.mockResolvedValue({ success: true, servers: [] });
+    mockReconnectServer.mockResolvedValue({
+      success: true,
+      initInfo: {},
+    });
+    testConnectionMock.mockResolvedValue({
+      success: true,
+      initInfo: {},
+    });
+    mockTryResolveProjectServer.mockReturnValue({
+      projectId: "ws_1",
+      serverId: "srv_asana",
+    });
+    readStoredOAuthConfigMock.mockReturnValue({});
+  });
+
+  it("keeps the base connection intact when adding an account fails", async () => {
+    window.history.replaceState({}, "", "/");
+    const { initiateOAuth, clearOAuthData } = await import("@/lib/oauth/mcp-oauth");
+    const { deleteServer } = await import("@/state/mcp-api");
+    vi.mocked(initiateOAuth).mockResolvedValue({ success: false, error: "Consent declined" } as any);
+    vi.mocked(clearOAuthData).mockClear();
+    vi.mocked(deleteServer).mockClear();
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch);
+    await act(async () => {
+      await result.current.handleReconnect("asana", { forceOAuthFlow: true, connectionIntent: { kind: "add" } });
+    });
+    expect(clearOAuthData).not.toHaveBeenCalled();
+    expect(deleteServer).not.toHaveBeenCalled();
+    expect(dispatch.mock.calls.some(([action]) => ["RECONNECT_REQUEST", "CONNECT_FAILURE"].includes(action.type))).toBe(false);
+  });
+
+  // A `?code=` on a route this hook does not own must not be claimed. The
+  // GitHub App bind returns to `/settings/integrations/github/callback`, and
+  // this effect used to complete it as an MCP flow, fail, toast "No pending
+  // OAuth flow found", and navigate away — stripping GitHub's `code`/`state`
+  // before `GithubInstallCallbackRoute` could read them, so the bind failed
+  // 100% in production with a misleading "opened without the details GitHub
+  // sends".
+  it("leaves a GitHub App bind callback alone when no MCP flow is pending", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/settings/integrations/github/callback?code=gh-code&state=gh-state",
+    );
+
+    renderHostedServerState();
+
+    await waitFor(() => {
+      expect(mockListServers).toHaveBeenCalled();
+    });
+
+    expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+    // The params must survive for the route that actually owns them.
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get("code")).toBe("gh-code");
+    expect(params.get("state")).toBe("gh-state");
+  });
+
+  // Non-vacuity for the guard above: it must refuse only callbacks with no
+  // pending MCP flow, never disable the handler outright.
+  it("still completes an MCP callback when a flow IS pending", async () => {
+    window.history.replaceState({}, "", "/oauth/callback?code=oauth-code");
+    localStorage.setItem("mcp-oauth-pending", "asana");
+    localStorage.setItem("mcp-serverUrl-asana", "https://mcp.asana.com/sse");
+    mockHandleOAuthCallback.mockResolvedValue({
+      success: true,
+      serverName: "asana",
+    });
+
+    renderHostedServerState();
+
+    await waitFor(() => {
+      expect(mockHandleOAuthCallback).toHaveBeenCalled();
+    });
+  });
+
+  it("defers hosted scenario OAuth callbacks to App.tsx", async () => {
+    writeHostedOAuthPendingMarker({
+      surface: "scenario",
+      serverName: "asana",
+      serverUrl: "https://mcp.asana.com/sse",
+      returnPath: "#asaan",
+    });
+    localStorage.setItem("mcp-oauth-pending", "asana");
+    localStorage.setItem("mcp-serverUrl-asana", "https://mcp.asana.com/sse");
+
+    renderHook(() =>
+      useServerState({
+        appState: {
+          servers: {},
+          selectedMultipleServers: [],
+        } as any,
+        dispatch: vi.fn(),
+        isLoading: false,
+        isAuthenticated: true,
+        hasSignedInUser: true,
+        currentUserId: "user_1",
+        oauthProjectIds: new Set(["ws_1"]),
+        isAuthLoading: false,
+        isLoadingProjects: false,
+        useLocalFallback: false,
+        effectiveProjects: {
+          ws_1: {
+            id: "ws_1",
+            name: "Project",
+            sharedProjectId: "ws_1",
+            servers: {},
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        } as any,
+        effectiveActiveProjectId: "ws_1",
+        activeProjectServersFlat: [],
+        logger: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+    });
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("completes hosted project OAuth callbacks through the backend path", async () => {
+    writeHostedOAuthPendingMarker({
+      surface: "project",
+      initiatingUserId: "user_1",
+      projectId: "ws_1",
+      serverId: "srv_asana",
+      serverName: "asana",
+      serverUrl: "https://mcp.asana.com/sse",
+      accessScope: "project_member",
+      returnPath: "#servers",
+    });
+    localStorage.setItem("mcp-oauth-pending", "asana");
+    localStorage.setItem("mcp-serverUrl-asana", "https://mcp.asana.com/sse");
+    mockHandleOAuthCallback.mockResolvedValue({
+      success: true,
+      serverName: "asana",
+      serverConfig: {
+        url: "https://mcp.asana.com/sse",
+        requestInit: { headers: {} },
+      },
+    });
+
+    const dispatch = vi.fn();
+
+    renderHook(() =>
+      useServerState({
+        appState: {
+          servers: {},
+          selectedMultipleServers: [],
+        } as any,
+        dispatch,
+        isLoading: false,
+        isAuthenticated: true,
+        hasSignedInUser: true,
+        currentUserId: "user_1",
+        oauthProjectIds: new Set(["ws_1"]),
+        isAuthLoading: false,
+        isLoadingProjects: false,
+        useLocalFallback: false,
+        effectiveProjects: {
+          ws_1: {
+            id: "ws_1",
+            name: "Project",
+            sharedProjectId: "ws_1",
+            servers: {},
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        } as any,
+        effectiveActiveProjectId: "ws_1",
+        activeProjectServersFlat: [],
+        logger: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(mockHandleOAuthCallback).toHaveBeenCalledWith(
+        expect.objectContaining({
+          surface: "project",
+      initiatingUserId: "user_1",
+          projectId: "ws_1",
+          serverId: "srv_asana",
+          serverName: "asana",
+        }),
+        "oauth-code",
+        expect.objectContaining({
+          onTraceUpdate: expect.any(Function),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "CONNECT_SUCCESS",
+          name: "asana",
+          useOAuth: true,
+          tokens: undefined,
+        }),
+      );
+    });
+  });
+
+  it.each(["guest", "changed", "legacy", "membership"])(
+    "blocks token completion after %s recovery",
+    async (reason) => {
+      const requestSignIn = vi.fn();
+      writeHostedOAuthPendingMarker({
+        surface: "project",
+        initiatingUserId: reason === "legacy" ? undefined : "original",
+        projectId: "ws_1",
+        serverId: "srv_asana",
+        serverName: "asana",
+        serverUrl: "https://mcp.asana.com/sse",
+        returnPath: "/p/abcdefghijklmnop/servers",
+      });
+      localStorage.setItem("mcp-oauth-pending", "asana");
+      window.history.replaceState(
+        {},
+        "",
+        "/oauth/callback?code=secret&state=one",
+      );
+      renderHook(() =>
+        useServerState({
+          appState: { servers: {}, selectedMultipleServers: [] } as any,
+          dispatch: vi.fn(),
+          requestSignIn,
+          isLoading: false,
+          isAuthenticated: true,
+          hasSignedInUser: reason !== "guest",
+          currentUserId:
+            reason === "guest"
+              ? null
+              : reason === "changed"
+                ? "other"
+                : "original",
+          oauthProjectIds: new Set(reason === "membership" ? [] : ["ws_1"]),
+          isAuthLoading: false,
+          isLoadingProjects: false,
+          useLocalFallback: false,
+          effectiveProjects: {},
+          effectiveActiveProjectId: "ws_1",
+          activeProjectServersFlat: [],
+          logger: {
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug: vi.fn(),
+          },
+        }),
+      );
+      expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+      const action = vi.mocked(sonnerToast.error).mock.calls.at(-1)?.[1]?.action as any;
+      if (reason === "guest" || reason === "changed") {
+        expect(action.label).toBe("Sign in");
+        action.onClick();
+        expect(requestSignIn).toHaveBeenCalledWith("/p/abcdefghijklmnop/servers");
+      } else {
+        expect(action).toBeUndefined();
+        expect(requestSignIn).not.toHaveBeenCalled();
+      }
+      expect(window.location.pathname).toBe("/p/abcdefghijklmnop/servers");
+      expect(localStorage.getItem("mcp-hosted-oauth-pending")).toBeNull();
+    },
+  );
+
+  it("waits for auth, completes duplicate delivery once, then completes a new attempt", async () => {
+    const prepare = (state: string) => {
+      writeHostedOAuthPendingMarker({
+        surface: "project",
+        initiatingUserId: "user_1",
+        projectId: "ws_1",
+        serverId: "srv_asana",
+        serverName: "asana",
+        serverUrl: "https://mcp.asana.com/sse",
+        returnPath: "/servers",
+      });
+      localStorage.setItem("mcp-oauth-pending", "asana");
+      window.history.replaceState(
+        {},
+        "",
+        `/oauth/callback?code=${state}&state=${state}`,
+      );
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    };
+    prepare("first");
+    mockHandleOAuthCallback.mockResolvedValue({
+      success: false,
+      error: "test failure",
+    });
+    const { rerender } = renderHook(
+      ({ loading }) =>
+        useServerState({
+          appState: { servers: {}, selectedMultipleServers: [] } as any,
+          dispatch: vi.fn(),
+          isLoading: false,
+          isAuthenticated: true,
+          hasSignedInUser: true,
+          currentUserId: "user_1",
+          oauthProjectIds: new Set(["ws_1"]),
+          isAuthLoading: loading,
+          isLoadingProjects: false,
+          useLocalFallback: false,
+          effectiveProjects: {},
+          effectiveActiveProjectId: "ws_1",
+          activeProjectServersFlat: [],
+          logger: {
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug: vi.fn(),
+          },
+        }),
+      { initialProps: { loading: true } },
+    );
+    expect(mockHandleOAuthCallback).not.toHaveBeenCalled();
+    rerender({ loading: false });
+    await waitFor(() => expect(window.location.pathname).toBe("/servers"));
+    expect(mockHandleOAuthCallback).toHaveBeenCalledTimes(1);
+    act(() => prepare("first"));
+    expect(mockHandleOAuthCallback).toHaveBeenCalledTimes(1);
+    act(() => prepare("second"));
+    await waitFor(() => expect(mockHandleOAuthCallback).toHaveBeenCalledTimes(2));
+  });
+  it("forwards the OAuth callback state parameter to completeHostedOAuthCallback", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/oauth/callback?code=oauth-code&state=expected-state-token",
+    );
+    writeHostedOAuthPendingMarker({
+      surface: "project",
+      initiatingUserId: "user_1",
+      projectId: "ws_1",
+      serverId: "srv_asana",
+      serverName: "asana",
+      serverUrl: "https://mcp.asana.com/sse",
+      accessScope: "project_member",
+      returnPath: "#servers",
+    });
+    localStorage.setItem("mcp-oauth-pending", "asana");
+    localStorage.setItem("mcp-serverUrl-asana", "https://mcp.asana.com/sse");
+    mockHandleOAuthCallback.mockResolvedValue({
+      success: true,
+      serverName: "asana",
+      serverConfig: {
+        url: "https://mcp.asana.com/sse",
+        requestInit: { headers: {} },
+      },
+    });
+
+    renderHook(() =>
+      useServerState({
+        appState: {
+          servers: {},
+          selectedMultipleServers: [],
+        } as any,
+        dispatch: vi.fn(),
+        isLoading: false,
+        isAuthenticated: true,
+        hasSignedInUser: true,
+        currentUserId: "user_1",
+        oauthProjectIds: new Set(["ws_1"]),
+        isAuthLoading: false,
+        isLoadingProjects: false,
+        useLocalFallback: false,
+        effectiveProjects: {} as any,
+        effectiveActiveProjectId: "ws_1",
+        activeProjectServersFlat: [],
+        logger: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(mockHandleOAuthCallback).toHaveBeenCalledWith(
+        expect.objectContaining({
+          surface: "project",
+      initiatingUserId: "user_1",
+          serverName: "asana",
+        }),
+        "oauth-code",
+        expect.objectContaining({
+          callbackState: "expected-state-token",
+          onTraceUpdate: expect.any(Function),
+        }),
+      );
+    });
+  });
+
+  it("reuses hosted stored OAuth credentials on reconnect before falling back to interactive OAuth", async () => {
+    const projectClientConfig = {
+      version: 1 as const,
+      clientCapabilities: {
+        ...(getDefaultClientCapabilities() as Record<string, unknown>),
+        experimental: {
+          projectProfile: {},
+        },
+      },
+      hostContext: {},
+    };
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch, {
+      projectClientConfig,
+    });
+
+    await act(async () => {
+      await result.current.handleReconnect("asana");
+    });
+
+    await waitFor(() => {
+      expect(mockReconnectServer).toHaveBeenCalledWith(
+        "srv_asana",
+        expect.objectContaining({
+          type: "http",
+          url: "https://mcp.asana.com/sse",
+          clientCapabilities: expect.objectContaining({
+            experimental: {
+              projectProfile: {},
+            },
+          }),
+        }),
+        expect.objectContaining({
+          projectId: "ws_1",
+          serverName: "asana",
+        }),
+      );
+    });
+
+    expect(mockEnsureAuthorizedForReconnect).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "CONNECT_SUCCESS",
+        name: "asana",
+        useOAuth: true,
+        tokens: undefined,
+        config: expect.not.objectContaining({
+          clientCapabilities: expect.anything(),
+        }),
+      }),
+    );
+  });
+
+  it("falls back to interactive OAuth when hosted stored-auth reconnect says authorization is required", async () => {
+    mockReconnectServer.mockResolvedValueOnce({
+      success: false,
+      error:
+        'Server "srv_asana" requires OAuth authentication. Please complete the OAuth flow first.',
+    });
+    mockEnsureAuthorizedForReconnect.mockResolvedValueOnce({
+      kind: "error",
+      error: "OAuth init failed",
+    });
+
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch);
+
+    await act(async () => {
+      await result.current.handleReconnect("asana");
+    });
+
+    await waitFor(() => {
+      expect(mockEnsureAuthorizedForReconnect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "asana",
+          useOAuth: true,
+        }),
+        expect.objectContaining({
+          allowInteractiveOAuthFlow: true,
+          beforeRedirect: expect.any(Function),
+        }),
+      );
+    });
+  });
+
+  it("also falls back to interactive OAuth when hosted reconnect throws the same auth error", async () => {
+    mockReconnectServer.mockRejectedValueOnce(
+      new Error(
+        'Server "srv_asana" requires OAuth authentication. Please complete the OAuth flow first.',
+      ),
+    );
+    mockEnsureAuthorizedForReconnect.mockResolvedValueOnce({
+      kind: "error",
+      error: "OAuth init failed",
+    });
+
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch);
+
+    await act(async () => {
+      await result.current.handleReconnect("asana");
+    });
+
+    await waitFor(() => {
+      expect(mockEnsureAuthorizedForReconnect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "asana",
+          useOAuth: true,
+        }),
+        expect.objectContaining({
+          allowInteractiveOAuthFlow: true,
+          beforeRedirect: expect.any(Function),
+        }),
+      );
+    });
+  });
+
+  it("falls back to interactive OAuth when hosted reconnect reports a missing refresh token", async () => {
+    mockReconnectServer.mockResolvedValueOnce({
+      success: false,
+      error: "Stored hosted OAuth credential is missing refresh_token",
+    });
+    mockEnsureAuthorizedForReconnect.mockResolvedValueOnce({
+      kind: "error",
+      error: "OAuth init failed",
+    });
+
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch);
+
+    await act(async () => {
+      await result.current.handleReconnect("asana");
+    });
+
+    await waitFor(() => {
+      expect(mockEnsureAuthorizedForReconnect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "asana",
+          useOAuth: true,
+        }),
+        expect.objectContaining({
+          allowInteractiveOAuthFlow: true,
+          beforeRedirect: expect.any(Function),
+        }),
+      );
+    });
+  });
+
+  it("opens the known server's OAuth flow when a user action requests readiness", async () => {
+    mockReconnectServer.mockResolvedValueOnce({ success: false, error: 'Server "srv_asana" requires OAuth authentication. Please complete the OAuth flow first.' });
+    mockEnsureAuthorizedForReconnect.mockResolvedValueOnce({ kind: "redirect" });
+    const { result } = renderHostedServerState(vi.fn());
+    await act(async () => {
+      await result.current.ensureServersReady(["asana"], { allowInteractiveOAuthFlow: true });
+    });
+    expect(mockEnsureAuthorizedForReconnect).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "asana", useOAuth: true }),
+      expect.objectContaining({ allowInteractiveOAuthFlow: true, beforeRedirect: expect.any(Function) }),
+    );
+  });
+
+  it("reports reauth instead of launching interactive OAuth during automatic readiness checks", async () => {
+    mockReconnectServer.mockResolvedValueOnce({
+      success: false,
+      error:
+        'Server "srv_asana" requires OAuth authentication. Please complete the OAuth flow first.',
+    });
+    mockEnsureAuthorizedForReconnect.mockResolvedValueOnce({
+      kind: "reauth_required",
+      error: "OAuth consent is required for asana. Click Reconnect to continue.",
+    });
+
+    const dispatch = vi.fn();
+    const { result } = renderHostedServerState(dispatch);
+    let readiness:
+      | Awaited<ReturnType<typeof result.current.ensureServersReady>>
+      | undefined;
+
+    await act(async () => {
+      readiness = await result.current.ensureServersReady(["asana"]);
+    });
+
+    expect(mockEnsureAuthorizedForReconnect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "asana",
+        useOAuth: true,
+      }),
+      expect.objectContaining({
+        allowInteractiveOAuthFlow: false,
+        beforeRedirect: expect.any(Function),
+      }),
+    );
+    expect(readiness).toEqual({
+      readyServerNames: [],
+      missingServerNames: [],
+      failedServerNames: [],
+      reauthServerNames: ["asana"],
+    });
+  });
+});

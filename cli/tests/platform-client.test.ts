@@ -1,0 +1,343 @@
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import {
+  writeStoredAuth,
+  type StoredPlatformAuth,
+} from "../src/lib/auth-store.js";
+import { CliError } from "../src/lib/output.js";
+import { PlatformApiError } from "@mcpjam/sdk/platform";
+import {
+  buildPlatformClient,
+  inspectApiUrl,
+  resolvePlatformBaseUrl,
+  resolvePlatformOrigin,
+  toCliError,
+} from "../src/lib/platform-client.js";
+
+const NOW = 1_750_000_000_000;
+
+async function tempAuthFile(): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mcpjam-auth-"));
+  return path.join(directory, "auth.json");
+}
+
+function storedAuth(
+  overrides: Partial<StoredPlatformAuth> = {},
+): StoredPlatformAuth {
+  return {
+    version: 1,
+    issuer: "https://login.example.com",
+    clientId: "client_123",
+    tokenEndpoint: "https://login.example.com/oauth2/token",
+    accessToken: "stored-access",
+    refreshToken: "stored-refresh",
+    expiresAt: NOW + 60 * 60 * 1000,
+    ...overrides,
+  };
+}
+
+/** Records request URLs and answers every call with a minimal /me payload. */
+function captureFetch(requested: string[]): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    requested.push(
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url,
+    );
+    return new Response(
+      JSON.stringify({ id: "user-1", email: "dev@example.com", name: "Dev" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+}
+
+const isUsageError = (error: unknown) =>
+  error instanceof CliError && error.code === "USAGE_ERROR";
+
+test("resolvePlatformBaseUrl prefers the flag over env over the default", () => {
+  assert.equal(
+    resolvePlatformBaseUrl(
+      { apiUrl: "https://flag.example.com/api/v1" },
+      { MCPJAM_API_URL: "https://env.example.com/api/v1" },
+    ),
+    "https://flag.example.com/api/v1",
+  );
+  assert.equal(
+    resolvePlatformBaseUrl(
+      {},
+      { MCPJAM_API_URL: "https://env.example.com/api/v1" },
+    ),
+    "https://env.example.com/api/v1",
+  );
+  assert.equal(
+    resolvePlatformBaseUrl({}, {}),
+    "https://app.mcpjam.com/api/v1",
+  );
+});
+
+test("inspectApiUrl classifies invalid values without throwing", () => {
+  const malformed = inspectApiUrl("not-a-url", "--api-url");
+  assert.equal(malformed.ok, false);
+  if (!malformed.ok) {
+    assert.match(malformed.error, /Invalid --api-url/);
+  }
+  const ftp = inspectApiUrl("ftp://example.com/api", "MCPJAM_API_URL");
+  assert.equal(ftp.ok, false);
+  const ok = inspectApiUrl("https://app.mcpjam.com/api/v1", "--api-url");
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.apiUrl, "https://app.mcpjam.com/api/v1");
+  }
+});
+
+test("an invalid --api-url hard-errors instead of falling back to prod", () => {
+  assert.throws(
+    () => resolvePlatformBaseUrl({ apiUrl: "staging.mcpjam.com" }, {}),
+    isUsageError,
+  );
+  assert.throws(
+    () => resolvePlatformOrigin({ apiUrl: "not a url" }, {}),
+    isUsageError,
+  );
+  // Non-http(s) schemes are also explicit mistakes, not prod logins.
+  assert.throws(
+    () => resolvePlatformBaseUrl({ apiUrl: "ftp://example.com/api" }, {}),
+    isUsageError,
+  );
+});
+
+test("an invalid MCPJAM_API_URL hard-errors too", () => {
+  assert.throws(
+    () => resolvePlatformBaseUrl({}, { MCPJAM_API_URL: "nope" }),
+    isUsageError,
+  );
+});
+
+test("resolvePlatformOrigin strips the API path from the base URL", () => {
+  assert.equal(
+    resolvePlatformOrigin({ apiUrl: "https://staging.mcpjam.com/api/v1" }, {}),
+    "https://staging.mcpjam.com",
+  );
+});
+
+test("buildPlatformClient defaults to the API URL stored with the login", async () => {
+  const authFilePath = await tempAuthFile();
+  await writeStoredAuth(
+    storedAuth({ apiUrl: "https://staging.mcpjam.com/api/v1" }),
+    authFilePath,
+  );
+  const requested: string[] = [];
+
+  const { client, credentialKind } = buildPlatformClient(
+    {},
+    { env: {}, authFilePath, fetchFn: captureFetch(requested), now: () => NOW },
+  );
+  await client.getMe();
+
+  assert.equal(credentialKind, "oauth");
+  assert.equal(requested.length, 1);
+  assert.ok(
+    requested[0].startsWith("https://staging.mcpjam.com/api/v1/"),
+    `expected the stored deployment to be called, got ${requested[0]}`,
+  );
+});
+
+test("an explicit --api-url overrides the stored login URL", async () => {
+  const authFilePath = await tempAuthFile();
+  await writeStoredAuth(
+    storedAuth({ apiUrl: "https://staging.mcpjam.com/api/v1" }),
+    authFilePath,
+  );
+  const requested: string[] = [];
+
+  const { client } = buildPlatformClient(
+    { apiUrl: "https://other.example.com/api/v1" },
+    { env: {}, authFilePath, fetchFn: captureFetch(requested), now: () => NOW },
+  );
+  await client.getMe();
+
+  assert.ok(requested[0].startsWith("https://other.example.com/api/v1/"));
+});
+
+test("an sk_ API key does not inherit the stored login's URL", async () => {
+  const authFilePath = await tempAuthFile();
+  await writeStoredAuth(
+    storedAuth({ apiUrl: "https://staging.mcpjam.com/api/v1" }),
+    authFilePath,
+  );
+  const requested: string[] = [];
+
+  const { client, credentialKind } = buildPlatformClient(
+    { apiKey: "sk_test" },
+    { env: {}, authFilePath, fetchFn: captureFetch(requested), now: () => NOW },
+  );
+  await client.getMe();
+
+  // The stored URL belongs to the stored OAuth session; an explicit key
+  // without an explicit URL targets the default deployment.
+  assert.equal(credentialKind, "api-key");
+  assert.ok(requested[0].startsWith("https://app.mcpjam.com/api/v1/"));
+});
+
+test("a stored login without apiUrl still defaults to prod", async () => {
+  const authFilePath = await tempAuthFile();
+  await writeStoredAuth(storedAuth(), authFilePath);
+  const requested: string[] = [];
+
+  const { client } = buildPlatformClient(
+    {},
+    { env: {}, authFilePath, fetchFn: captureFetch(requested), now: () => NOW },
+  );
+  await client.getMe();
+
+  assert.ok(requested[0].startsWith("https://app.mcpjam.com/api/v1/"));
+});
+
+test("a usage-limit refusal keeps its code and exit, and carries when to retry", () => {
+  const error = toCliError(
+    new PlatformApiError("Daily generation quota reached.", "RATE_LIMITED", {
+      status: 429,
+      retryAfter: 120,
+      details: {
+        code: "generation_rate_limited",
+        gatedBy: "organization",
+        canTopUp: false,
+      },
+    }),
+  );
+  // Not an auth or credit failure: same wire code, same exit code.
+  assert.equal(error.code, "RATE_LIMITED");
+  assert.equal(error.exitCode, 1);
+  assert.equal(
+    error.message,
+    "Daily generation quota reached. Retry after 120s, not sooner. This is a usage limit: topping up credits does not lift it.",
+  );
+  assert.deepEqual((error.details as Record<string, unknown>).refusal, {
+    status: 429,
+    code: "RATE_LIMITED",
+    reason: "generation_rate_limited",
+    gatedBy: "organization",
+    canTopUp: false,
+    retryAfterSeconds: 120,
+  });
+});
+
+test("a failing request's id rides in details, beside the server's own", () => {
+  const error = toCliError(
+    new PlatformApiError("Something broke.", "INTERNAL_ERROR", {
+      status: 500,
+      details: { reason: "upstream" },
+      requestId: "req_0123456789abcdef",
+    }),
+  );
+  assert.equal(error.code, "INTERNAL_ERROR");
+  // Prefix only: a platform fault with a request id also earns the report
+  // hint, pinned in full below.
+  assert.match(error.message, /^Something broke\./);
+  assert.deepEqual(error.details, {
+    reason: "upstream",
+    requestId: "req_0123456789abcdef",
+  });
+});
+
+test("a request id with no server details still lands in details", () => {
+  const error = toCliError(
+    new PlatformApiError("Not found.", "NOT_FOUND", {
+      status: 404,
+      requestId: "req_0123456789abcdef",
+    }),
+  );
+  assert.deepEqual(error.details, { requestId: "req_0123456789abcdef" });
+});
+
+test("a refusal carries its request id next to the retry guidance", () => {
+  const error = toCliError(
+    new PlatformApiError("Slow down.", "RATE_LIMITED", {
+      status: 429,
+      retryAfter: 30,
+      requestId: "req_0123456789abcdef",
+    }),
+  );
+  const details = error.details as Record<string, unknown>;
+  assert.equal(details.requestId, "req_0123456789abcdef");
+  assert.deepEqual(details.refusal, {
+    status: 429,
+    code: "RATE_LIMITED",
+    retryAfterSeconds: 30,
+  });
+});
+
+test("an error without a request id keeps its details untouched", () => {
+  // Client-side failures never reached the API; nothing is invented.
+  const error = toCliError(
+    new PlatformApiError("Failed to reach the MCPJam API.", "NETWORK_ERROR", {
+      status: 0,
+    }),
+  );
+  assert.equal(error.details, undefined);
+});
+
+test("a platform fault with a request id says how to report it", () => {
+  const error = toCliError(
+    new PlatformApiError("Something broke.", "INTERNAL_ERROR", {
+      status: 500,
+      requestId: "req_0123456789abcdef",
+    }),
+    { command: "cloud eval run" },
+  );
+  assert.equal(
+    error.message,
+    'Something broke. Report it: `mcpjam cloud feedback --kind bug --request-id req_0123456789abcdef --summary "…"`',
+  );
+});
+
+test("a missing capability suggests the missing_capability kind", () => {
+  const error = toCliError(
+    new PlatformApiError(
+      "This server does not support tasks.",
+      "FEATURE_NOT_SUPPORTED",
+      { status: 422, requestId: "req_0123456789abcdef" },
+    ),
+  );
+  assert.match(error.message, /--kind missing_capability --request-id/);
+});
+
+test("no report hint on a gateway failure, a client error, or without a request id", () => {
+  for (const [status, code] of [
+    [502, "INTERNAL_ERROR"],
+    [503, "INTERNAL_ERROR"],
+    [504, "INTERNAL_ERROR"],
+    [404, "NOT_FOUND"],
+    [400, "VALIDATION_ERROR"],
+  ] as const) {
+    const error = toCliError(
+      new PlatformApiError("Nope.", code, {
+        status,
+        requestId: "req_0123456789abcdef",
+      }),
+    );
+    assert.equal(error.message, "Nope.", `${status} ${code}`);
+  }
+  const withoutId = toCliError(
+    new PlatformApiError("Something broke.", "INTERNAL_ERROR", {
+      status: 500,
+    }),
+  );
+  assert.equal(withoutId.message, "Something broke.");
+});
+
+test("no report hint on the command that files reports", () => {
+  const error = toCliError(
+    new PlatformApiError("Something broke.", "INTERNAL_ERROR", {
+      status: 500,
+      requestId: "req_0123456789abcdef",
+    }),
+    { command: "cloud feedback" },
+  );
+  assert.equal(error.message, "Something broke.");
+});

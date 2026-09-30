@@ -1,0 +1,1084 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import {
+  ActiveServerSelector,
+  type ActiveServerSelectorProps,
+} from "../ActiveServerSelector";
+import type { ServerWithName } from "@/hooks/use-app-state";
+import { hasOAuthConfig } from "@/lib/oauth/mcp-oauth";
+
+// Mock posthog
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({
+    capture: vi.fn(),
+  }),
+}));
+
+// Mock PosthogUtils
+vi.mock("@/lib/PosthogUtils", () => ({
+  detectEnvironment: vi.fn().mockReturnValue("test"),
+  detectPlatform: vi.fn().mockReturnValue("web"),
+}));
+
+vi.mock("@/lib/analytics", () => ({
+  track: vi.fn(),
+}));
+
+// Mock OAuth utilities
+vi.mock("@/lib/oauth/mcp-oauth", () => ({
+  hasOAuthConfig: vi.fn().mockReturnValue(false),
+}));
+
+// Mock AddServerModal to simplify testing
+vi.mock("../connection/AddServerModal", () => ({
+  AddServerModal: ({
+    isOpen,
+    onClose,
+    onSubmit,
+  }: {
+    isOpen: boolean;
+    onClose: () => void;
+    onSubmit: (data: unknown) => void;
+  }) =>
+    isOpen ? (
+      <div data-testid="add-server-modal">
+        <button onClick={onClose}>Close</button>
+        <button
+          onClick={() => onSubmit({ name: "new-server", command: "node" })}
+        >
+          Submit
+        </button>
+      </div>
+    ) : null,
+}));
+
+describe("ActiveServerSelector", () => {
+  const createServer = (
+    overrides: Partial<ServerWithName> = {},
+  ): ServerWithName =>
+    ({
+      name: "test-server",
+      connectionStatus: "connected",
+      enabled: true,
+      retryCount: 0,
+      useOAuth: false,
+      lastConnectionTime: new Date("2024-01-01"),
+      config: {
+        transportType: "stdio",
+        command: "node",
+        args: ["server.js"],
+      },
+      ...overrides,
+    }) as ServerWithName;
+
+  // The tab's decoration — fill climb and foot rule — rides on aria-hidden
+  // spans, so tests reach for them by role in the paint rather than by index.
+  const layers = (tab: Element | null | undefined) =>
+    [
+      ...(tab?.querySelectorAll(":scope > span[aria-hidden]") ?? []),
+    ] as HTMLElement[];
+  const fillLayer = (tab: Element | null | undefined) =>
+    layers(tab).find((l) => l.className.includes("bg-background"));
+
+  const defaultProps: ActiveServerSelectorProps = {
+    serverConfigs: {},
+    selectedServer: "",
+    selectedMultipleServers: [],
+    isMultiSelectEnabled: false,
+    onServerChange: vi.fn(),
+    onMultiServerToggle: vi.fn(),
+    onConnect: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("rendering", () => {
+    it("renders server names", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      expect(screen.getByText("server-1")).toBeInTheDocument();
+      expect(screen.getByText("server-2")).toBeInTheDocument();
+    });
+
+    it("renders Add Server button", () => {
+      render(<ActiveServerSelector {...defaultProps} />);
+
+      expect(screen.getByText("Add Server")).toBeInTheDocument();
+    });
+
+    it("renders transport type for STDIO servers", () => {
+      const serverConfigs = {
+        "stdio-server": createServer({
+          name: "stdio-server",
+          config: {
+            transportType: "stdio",
+            command: "node",
+            args: ["server.js"],
+          },
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="stdio-server"
+        />,
+      );
+
+      expect(screen.getByText("STDIO")).toBeInTheDocument();
+    });
+
+    it("renders transport type for HTTP servers", () => {
+      const serverConfigs = {
+        "http-server": createServer({
+          name: "http-server",
+          config: {
+            transportType: "streamableHttp",
+            url: "http://localhost:3000/mcp",
+          },
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="http-server"
+        />,
+      );
+
+      expect(screen.getByText("HTTP")).toBeInTheDocument();
+    });
+
+    it("hides the selector when the views filter has no matching servers", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+          showOnlyServersWithViews={true}
+          serversWithViews={new Set()}
+        />,
+      );
+
+      expect(screen.queryByText("server-1")).not.toBeInTheDocument();
+      expect(screen.queryByText("server-2")).not.toBeInTheDocument();
+      expect(screen.queryByText("Add Server")).not.toBeInTheDocument();
+    });
+
+    it("filters to servers with saved views when saved views exist", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+          showOnlyServersWithViews={true}
+          serversWithViews={new Set(["server-2"])}
+        />,
+      );
+
+      expect(screen.queryByText("server-1")).not.toBeInTheDocument();
+      expect(screen.getByText("server-2")).toBeInTheDocument();
+    });
+
+    it("filters to OAuth HTTP servers when requested", () => {
+      vi.mocked(hasOAuthConfig).mockImplementation(
+        (serverName) =>
+          serverName === "stored-config-oauth" ||
+          serverName === "opted-out-stored-config",
+      );
+      const httpConfig = {
+        transportType: "streamableHttp",
+        url: "http://localhost:3000/mcp",
+      } as const;
+      const oauthTokens = {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        access_token: "access-token",
+        refresh_token: "refresh-token",
+        expires_in: 3600,
+        scope: "read",
+      };
+      const serverConfigs = {
+        "explicit-oauth": createServer({
+          name: "explicit-oauth",
+          config: httpConfig,
+          useOAuth: true,
+        }),
+        "token-oauth": createServer({
+          name: "token-oauth",
+          config: httpConfig,
+          useOAuth: undefined,
+          oauthTokens,
+        }),
+        "stored-config-oauth": createServer({
+          name: "stored-config-oauth",
+          config: httpConfig,
+          useOAuth: undefined,
+        }),
+        "flow-oauth": createServer({
+          name: "flow-oauth",
+          config: httpConfig,
+          useOAuth: undefined,
+          connectionStatus: "oauth-flow",
+        }),
+        "opted-out-token-oauth": createServer({
+          name: "opted-out-token-oauth",
+          config: httpConfig,
+          useOAuth: false,
+          oauthTokens,
+        }),
+        "opted-out-stored-config": createServer({
+          name: "opted-out-stored-config",
+          config: httpConfig,
+          useOAuth: false,
+        }),
+        "plain-http": createServer({
+          name: "plain-http",
+          config: httpConfig,
+        }),
+        "stdio-with-oauth-state": createServer({
+          name: "stdio-with-oauth-state",
+          useOAuth: true,
+          oauthTokens,
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="explicit-oauth"
+          showOnlyOAuthServers={true}
+        />,
+      );
+
+      expect(screen.getByText("explicit-oauth")).toBeInTheDocument();
+      expect(screen.getByText("token-oauth")).toBeInTheDocument();
+      expect(screen.getByText("stored-config-oauth")).toBeInTheDocument();
+      expect(screen.getByText("flow-oauth")).toBeInTheDocument();
+      expect(
+        screen.queryByText("opted-out-token-oauth"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("opted-out-stored-config"),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText("plain-http")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("stdio-with-oauth-state"),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  describe("server selection - single mode", () => {
+    it("calls onServerChange when clicking a server", () => {
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+          onServerChange={onServerChange}
+        />,
+      );
+
+      fireEvent.click(screen.getByText("server-2"));
+
+      expect(onServerChange).toHaveBeenCalledWith("server-2");
+    });
+
+    it("calls onServerChange even when clicking already selected server", () => {
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+          onServerChange={onServerChange}
+        />,
+      );
+
+      // Click on the same server
+      fireEvent.click(screen.getByText("server-1"));
+
+      // Component calls onServerChange even for already-selected server
+      expect(onServerChange).toHaveBeenCalledWith("server-1");
+    });
+
+    it("gives the panel fill to the selected tab and to nothing else", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      // Every sheet is the same size and rests on --chrome-control. The panel
+      // fill belongs to the active one alone, and it arrives on a layer of its
+      // own so it can climb the sheet.
+      const selected = screen.getByText("server-1").closest("button");
+      expect(fillLayer(selected)?.className).toContain("bg-background");
+
+      const idle = screen.getByText("server-2").closest("button");
+      expect(idle?.className).toContain("bg-chrome-control");
+      expect(fillLayer(idle)).toBeUndefined();
+
+      // Size is shared, so it lives on the base and neither branch may
+      // redeclare it — that is what keeps the row from stepping.
+      for (const tab of [selected, idle]) {
+        expect(tab?.className).toContain("h-[calc(100%-6px)]");
+        expect(tab?.className).not.toContain("h-full");
+      }
+
+      const addServer = screen.getByText("Add Server").closest("button");
+      expect(fillLayer(addServer)).toBeUndefined();
+      expect(addServer?.className).toContain("hover:bg-chrome-hover");
+      // Same text weight as the tabs beside it. Muted read as disabled on the
+      // linen ground; the dashed border is what says "not a server".
+      expect(addServer?.className).toContain("text-foreground");
+      expect(addServer?.className).not.toContain("text-muted-foreground");
+    });
+
+    it("climbs the panel fill up the active sheet and rules its foot", () => {
+      // Two marks, each doing a job the other can't. The rule: the tab is
+      // --background and so is the panel directly beneath it, and `items-end`
+      // hangs every sheet on that seam, so without a foot the active one
+      // bleeds into the pane instead of ending. The climb: the fill is the
+      // colour the tab settles at, so the sweep IS the state arriving rather
+      // than a flourish over it.
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      const selected = screen.getByText("server-1").closest("button");
+      expect(selected).toHaveAttribute("aria-current", "true");
+
+      const fill = fillLayer(selected);
+      expect(fill?.className).toContain("animate-server-tab-fill-rise");
+      // Behind the label, not over it — the button carries `isolate` so the
+      // negative z-index stays inside the tab.
+      expect(fill?.className).toContain("-z-10");
+      expect(selected?.className).toContain("isolate");
+
+      // The rule is the sheet's own bottom edge, not a bar laid over it, so
+      // it can't add to the box height. The idle sheets leave that side open —
+      // their fill already ends them against the linen.
+      expect(selected?.className).toContain("border-b-2");
+      // No colour of its own: it inherits the sheet's hairline, so the outline
+      // stays one colour all the way round and only the weight marks the foot.
+      expect(selected?.className).toContain("border-chrome-control-border");
+      const perSide = (selected?.className ?? "")
+        .split(" ")
+        .filter((c) => c.startsWith("border-b-"));
+      expect(perSide).toEqual(["border-b-2"]);
+
+      const idle = screen.getByText("server-2").closest("button");
+      expect(idle).not.toHaveAttribute("aria-current");
+      expect(idle?.className).toContain("border-b-0");
+      expect(layers(idle)).toHaveLength(0);
+    });
+
+    it("keeps a focus indicator on the selected tab, not just the idle ones", () => {
+      // The strip sets `outline-none` on every tab, so without an explicit
+      // ring the selected tab takes keyboard focus with nothing to show for
+      // it — it already carries `bg-background` at rest, so the idle tabs'
+      // `focus-visible:bg-chrome-hover` has nothing to change.
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      for (const name of ["server-1", "server-2"]) {
+        const tab = screen.getByText(name).closest("button");
+        expect(tab?.className).toContain("focus-visible:ring-2");
+        // Inset: the strip scrolls horizontally and would clip an outset ring
+        // on the first and last tab.
+        expect(tab?.className).toContain("focus-visible:ring-inset");
+      }
+    });
+  });
+
+  describe("multi-select mode", () => {
+    it("shows checkboxes in multi-select mode", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          isMultiSelectEnabled={true}
+          selectedMultipleServers={[]}
+        />,
+      );
+
+      // Check icon should be present (inside checkbox area)
+      const serverButton = screen.getByText("server-1").closest("button");
+      expect(
+        serverButton?.querySelector(".w-4.h-4.rounded"),
+      ).toBeInTheDocument();
+    });
+
+    it("calls onMultiServerToggle in multi-select mode", () => {
+      const onMultiServerToggle = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          isMultiSelectEnabled={true}
+          selectedMultipleServers={[]}
+          onMultiServerToggle={onMultiServerToggle}
+        />,
+      );
+
+      fireEvent.click(screen.getByText("server-1"));
+
+      expect(onMultiServerToggle).toHaveBeenCalledWith("server-1");
+    });
+
+    it("marks every selected sheet, and says so without aria-current", () => {
+      // aria-current names THE current item in a set. Multi-select has no
+      // such thing, so the tabs switch to aria-pressed rather than each
+      // claiming to be the one. The tick beside the label can't carry it —
+      // it is a styled div, invisible to a screen reader.
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+        "server-3": createServer({ name: "server-3" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          isMultiSelectEnabled
+          selectedMultipleServers={["server-1", "server-3"]}
+        />,
+      );
+
+      for (const name of ["server-1", "server-3"]) {
+        const tab = screen.getByText(name).closest("button");
+        expect(tab).toHaveAttribute("aria-pressed", "true");
+        expect(tab).not.toHaveAttribute("aria-current");
+        expect(fillLayer(tab)?.className).toContain("bg-background");
+        expect(tab?.className).toContain("border-b-2");
+      }
+
+      const unpicked = screen.getByText("server-2").closest("button");
+      expect(unpicked).toHaveAttribute("aria-pressed", "false");
+      expect(fillLayer(unpicked)).toBeUndefined();
+      expect(unpicked?.className).toContain("border-b-0");
+    });
+
+    it("shows check mark for selected servers in multi-select mode", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          isMultiSelectEnabled={true}
+          selectedMultipleServers={["server-1"]}
+        />,
+      );
+
+      // The selected server should have a check icon
+      const selectedButton = screen.getByText("server-1").closest("button");
+      expect(
+        selectedButton?.querySelector("svg.lucide-check"),
+      ).toBeInTheDocument();
+
+      // Unselected server should not have check icon
+      const unselectedButton = screen.getByText("server-2").closest("button");
+      expect(
+        unselectedButton?.querySelector("svg.lucide-check"),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  describe("connection status", () => {
+    it("shows green indicator for connected servers", () => {
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "connected",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      const indicator = screen.getByTitle("Connected").closest(".rounded-full");
+      expect(indicator?.className).toContain("bg-success");
+      // Settled, so it holds still.
+      expect(indicator?.className).not.toContain("animate-pulse");
+    });
+
+    it("shows the info indicator for connecting servers", () => {
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "connecting",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      // "Finishing setup...", not "Connecting...": the wording is the shared
+      // helper's now, so the strip and the server card say the same thing.
+      const indicator = screen
+        .getByTitle("Finishing setup...")
+        .closest(".rounded-full");
+      expect(indicator?.className).toContain("bg-info");
+      // The pulse the strip had before the shared helper landed.
+      expect(indicator?.className).toContain("animate-pulse");
+    });
+
+    it("shows the destructive indicator for failed servers", () => {
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "failed",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      const indicator = screen.getByTitle("Failed").closest(".rounded-full");
+      expect(indicator?.className).toContain("bg-destructive");
+    });
+
+    it("makes no claim about a status it cannot read", () => {
+      // Runtime values arrive as plain strings widened with `as
+      // ConnectionStatus`, so a value outside the union does reach here.
+      // `getConnectionStatusMeta` falls back to `disconnected`, which SAYS the
+      // server is not connected — a claim we have no basis for. Transparent
+      // holds the row's alignment and says nothing, matching the picker.
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "reticulating" as never,
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      const indicator = screen
+        .getByTitle("Connection state unavailable")
+        .closest(".rounded-full");
+      expect(indicator?.className).toContain("bg-transparent");
+      expect(screen.queryByTitle("Disconnected")).toBeNull();
+    });
+
+    it("names a server that is mid-authorization instead of calling it unknown", () => {
+      // The strip's own status vocabulary had NO `oauth-flow` branch, so this
+      // server fell through to the grey dot titled "Unknown" while the card
+      // beside it read "Authorizing in browser...". One helper, one answer.
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "oauth-flow",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+        />,
+      );
+
+      const indicator = screen
+        .getByTitle("Authorizing in browser...")
+        .closest(".rounded-full");
+      expect(indicator?.className).toContain("bg-pending");
+      expect(indicator?.className).toContain("animate-pulse");
+    });
+  });
+
+  describe("Add Server modal", () => {
+    it("opens Add Server modal when clicking Add Server button", () => {
+      render(<ActiveServerSelector {...defaultProps} />);
+
+      expect(screen.queryByTestId("add-server-modal")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("Add Server"));
+
+      expect(screen.getByTestId("add-server-modal")).toBeInTheDocument();
+    });
+
+    it("closes modal when close button clicked", () => {
+      render(<ActiveServerSelector {...defaultProps} />);
+
+      fireEvent.click(screen.getByText("Add Server"));
+      expect(screen.getByTestId("add-server-modal")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("Close"));
+      expect(screen.queryByTestId("add-server-modal")).not.toBeInTheDocument();
+    });
+
+    it("calls onConnect when form is submitted", () => {
+      const onConnect = vi.fn();
+
+      render(<ActiveServerSelector {...defaultProps} onConnect={onConnect} />);
+
+      fireEvent.click(screen.getByText("Add Server"));
+      fireEvent.click(screen.getByText("Submit"));
+
+      expect(onConnect).toHaveBeenCalled();
+    });
+  });
+
+  describe("server changes with existing messages", () => {
+    it("changes server immediately even when the chat already has messages", () => {
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+      const onServerChange = vi.fn();
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="server-1"
+          onServerChange={onServerChange}
+          hasMessages={true}
+        />,
+      );
+
+      fireEvent.click(screen.getByText("server-2"));
+
+      expect(onServerChange).toHaveBeenCalledWith("server-2");
+    });
+
+    it("toggles servers immediately in multi-select mode when the chat already has messages", () => {
+      const onMultiServerToggle = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+        "server-2": createServer({ name: "server-2" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          isMultiSelectEnabled={true}
+          selectedMultipleServers={["server-1"]}
+          hasMessages={true}
+          onMultiServerToggle={onMultiServerToggle}
+        />,
+      );
+
+      fireEvent.click(screen.getByText("server-2"));
+
+      expect(onMultiServerToggle).toHaveBeenCalledWith("server-2");
+    });
+  });
+
+  describe("auto-selection", () => {
+    it("auto-selects most recently connected server when current selection is invalid", async () => {
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          lastConnectionTime: new Date("2024-01-01"),
+        }),
+        "server-2": createServer({
+          name: "server-2",
+          lastConnectionTime: new Date("2024-01-03"),
+        }),
+        "server-3": createServer({
+          name: "server-3",
+          lastConnectionTime: new Date("2024-01-02"),
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="non-existent"
+          onServerChange={onServerChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onServerChange).toHaveBeenCalledWith("server-2");
+      });
+    });
+
+    it("does not auto-select in multi-select mode", async () => {
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="non-existent"
+          isMultiSelectEnabled={true}
+          onServerChange={onServerChange}
+        />,
+      );
+
+      // Give time for any effects to run
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(onServerChange).not.toHaveBeenCalled();
+    });
+
+    it("does not auto-select a filtered server when auto-selection is disabled", async () => {
+      const onServerChange = vi.fn();
+      const httpConfig = {
+        transportType: "streamableHttp",
+        url: "http://localhost:3000/mcp",
+      } as const;
+      const serverConfigs = {
+        "selected-plain-http": createServer({
+          name: "selected-plain-http",
+          config: httpConfig,
+        }),
+        "visible-oauth": createServer({
+          name: "visible-oauth",
+          config: httpConfig,
+          useOAuth: true,
+          lastConnectionTime: new Date("2024-01-03"),
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="selected-plain-http"
+          onServerChange={onServerChange}
+          showOnlyOAuthServers={true}
+          autoSelectFilteredServer={false}
+        />,
+      );
+
+      expect(screen.queryByText("selected-plain-http")).not.toBeInTheDocument();
+      expect(screen.getByText("visible-oauth")).toBeInTheDocument();
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(onServerChange).not.toHaveBeenCalled();
+    });
+
+    it("auto-selects an eligible debugger server when the current selection is filtered out", async () => {
+      const onServerChange = vi.fn();
+      const httpConfig = {
+        transportType: "streamableHttp",
+        url: "http://localhost:3000/mcp",
+      } as const;
+      const serverConfigs = {
+        "selected-plain-http": createServer({
+          name: "selected-plain-http",
+          config: httpConfig,
+        }),
+        "visible-oauth": createServer({
+          name: "visible-oauth",
+          config: httpConfig,
+          useOAuth: true,
+          lastConnectionTime: new Date("2024-01-03"),
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="selected-plain-http"
+          onServerChange={onServerChange}
+          showOnlyOAuthServers
+          autoSelectFilteredServer
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onServerChange).toHaveBeenCalledWith("visible-oauth");
+      });
+    });
+
+    it('"when-empty" fills a blank selection with the most recent eligible server', async () => {
+      const onServerChange = vi.fn();
+      const httpConfig = {
+        transportType: "streamableHttp",
+        url: "http://localhost:3000/mcp",
+      } as const;
+      const serverConfigs = {
+        "visible-oauth": createServer({
+          name: "visible-oauth",
+          config: httpConfig,
+          useOAuth: true,
+          lastConnectionTime: new Date("2024-01-03"),
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="none"
+          onServerChange={onServerChange}
+          showOnlyOAuthServers
+          autoSelectFilteredServer="when-empty"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onServerChange).toHaveBeenCalledWith("visible-oauth");
+      });
+    });
+
+    it('"when-empty" never replaces an existing selection, even one the filter hides', async () => {
+      // The debugger tabs fire live auth requests at their target; a target
+      // the user picked must not be silently swapped for another server.
+      const onServerChange = vi.fn();
+      const httpConfig = {
+        transportType: "streamableHttp",
+        url: "http://localhost:3000/mcp",
+      } as const;
+      const serverConfigs = {
+        "selected-plain-http": createServer({
+          name: "selected-plain-http",
+          config: httpConfig,
+        }),
+        "visible-oauth": createServer({
+          name: "visible-oauth",
+          config: httpConfig,
+          useOAuth: true,
+          lastConnectionTime: new Date("2024-01-03"),
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="selected-plain-http"
+          onServerChange={onServerChange}
+          showOnlyOAuthServers
+          autoSelectFilteredServer="when-empty"
+        />,
+      );
+
+      // Give the auto-select effect a tick to (not) fire.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(onServerChange).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("reconnect button", () => {
+    const clickReconnectButton = (serverName: string) => {
+      const row = screen.getByText(serverName).closest("button");
+      if (!row) throw new Error(`Server row not found for ${serverName}`);
+      const btn = within(row).getByTitle("Reconnect");
+      fireEvent.click(btn);
+    };
+
+    it("renders reconnect button for servers", () => {
+      const serverConfigs = {
+        "server-1": createServer({
+          name: "server-1",
+          connectionStatus: "connected",
+        }),
+        "server-2": createServer({
+          name: "server-2",
+          connectionStatus: "disconnected",
+        }),
+      };
+
+      const onReconnect = vi.fn().mockResolvedValue(undefined);
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          onReconnect={onReconnect}
+        />,
+      );
+
+      // Should render reconnect button for both
+      const buttons = screen.getAllByTitle("Reconnect");
+      expect(buttons).toHaveLength(2);
+    });
+
+    it("calls onReconnect when clicked", () => {
+      const onReconnect = vi.fn().mockResolvedValue(undefined);
+      const serverConfigs = {
+        "server-1": createServer({ name: "server-1" }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          onReconnect={onReconnect}
+        />,
+      );
+
+      clickReconnectButton("server-1");
+      expect(onReconnect).toHaveBeenCalledWith("server-1");
+    });
+
+    it("does not change selection when reconnecting a non-active server", () => {
+      const onReconnect = vi.fn().mockResolvedValue(undefined);
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "active-server": createServer({
+          name: "active-server",
+          connectionStatus: "connected",
+        }),
+        "inactive-server": createServer({
+          name: "inactive-server",
+          connectionStatus: "disconnected",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="active-server"
+          onReconnect={onReconnect}
+          onServerChange={onServerChange}
+        />,
+      );
+
+      clickReconnectButton("inactive-server");
+
+      expect(onReconnect).toHaveBeenCalledWith("inactive-server");
+      expect(onReconnect).not.toHaveBeenCalledWith("active-server");
+      expect(onServerChange).not.toHaveBeenCalled();
+    });
+
+    it("keeps selection when reconnecting the active server", () => {
+      const onReconnect = vi.fn().mockResolvedValue(undefined);
+      const onServerChange = vi.fn();
+      const serverConfigs = {
+        "active-server": createServer({
+          name: "active-server",
+          connectionStatus: "disconnected",
+        }),
+        "other-server": createServer({
+          name: "other-server",
+          connectionStatus: "connected",
+        }),
+      };
+
+      render(
+        <ActiveServerSelector
+          {...defaultProps}
+          serverConfigs={serverConfigs}
+          selectedServer="active-server"
+          onReconnect={onReconnect}
+          onServerChange={onServerChange}
+        />,
+      );
+
+      clickReconnectButton("active-server");
+
+      expect(onReconnect).toHaveBeenCalledWith("active-server");
+      expect(onReconnect).not.toHaveBeenCalledWith("other-server");
+      expect(onServerChange).not.toHaveBeenCalled();
+    });
+  });
+});

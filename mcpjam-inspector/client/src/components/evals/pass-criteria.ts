@@ -1,0 +1,385 @@
+import { evaluateToolCalls, resolveExtrasCap } from "@/shared/eval-matching";
+import { EvalIteration, EvalSuiteRun } from "./types";
+
+export type PassCriteriaType =
+  | "default"
+  | "minimumPassRate"
+  | "perTestTemplate"
+  | "perModel"
+  | "allMustPass";
+
+export type PassCriteria = {
+  type: PassCriteriaType;
+  minimumPassRate?: number; // 0-100
+  perTemplateThresholds?: Record<string, number>; // testTemplateKey -> threshold
+  perModelThresholds?: Record<string, number>; // modelId -> threshold
+  allowUnexpectedTools?: boolean;
+  ignoreArgumentMismatches?: boolean;
+};
+
+export type PassCriteriaEvaluation = {
+  passed: boolean;
+  reason?: string;
+  details?: {
+    overallPassRate?: number;
+    threshold?: number;
+    failedTemplates?: Array<{
+      templateKey: string;
+      passRate: number;
+      threshold: number;
+    }>;
+    failedModels?: Array<{
+      model: string;
+      passRate: number;
+      threshold: number;
+    }>;
+  };
+};
+
+// Default criteria - 100% pass rate required
+export const DEFAULT_CRITERIA: PassCriteria = {
+  type: "minimumPassRate",
+  minimumPassRate: 100,
+};
+
+/**
+ * Compute the result for an iteration based on its status and pass/fail logic
+ */
+export function computeIterationResult(
+  iteration: {
+    status:
+      | "pending"
+      | "running"
+      | "completed"
+      | "failed"
+      | "cancelled"
+      | "timed_out"
+      | "setup_failed"
+      | "skipped";
+    result?: "pending" | "passed" | "failed" | "cancelled" | "timed_out";
+    resultSource?: "reported" | "derived";
+    testCaseSnapshot?: {
+      expectedToolCalls: Array<{
+        toolName: string;
+        arguments: Record<string, any>;
+      }>;
+    };
+    actualToolCalls: Array<{
+      toolName: string;
+      arguments: Record<string, any>;
+    }>;
+  },
+  criteria?: PassCriteria
+):
+  | "pending"
+  | "passed"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  | "setup_failed"
+  | "skipped" {
+  if (
+    iteration.resultSource === "reported" &&
+    (iteration.result === "pending" ||
+      iteration.result === "passed" ||
+      iteration.result === "failed" ||
+      iteration.result === "cancelled" ||
+      iteration.result === "timed_out")
+  ) {
+    return iteration.result;
+  }
+
+  // Handle status-based results first
+  if (iteration.status === "pending" || iteration.status === "running") {
+    return "pending";
+  }
+  if (iteration.status === "cancelled") {
+    return "cancelled";
+  }
+  if (iteration.status === "timed_out") {
+    return "timed_out";
+  }
+  // Neither of these ever produced a gradeable trial, so they must not reach
+  // the derivation below: matching zero recorded tool calls against expected
+  // ones would score an environment that never came up as a failing SERVER.
+  // Kept as their own results so pass/fail metrics exclude them the same way
+  // `cancelled` is excluded, rather than silently counting as losses.
+  if (iteration.status === "setup_failed") {
+    return "setup_failed";
+  }
+  if (iteration.status === "skipped") {
+    return "skipped";
+  }
+
+  // Compute pass/fail for completed iterations
+  const passed = computeIterationPassed(iteration as any, criteria);
+  return passed ? "passed" : "failed";
+}
+
+/**
+ * Did this iteration pass?
+ *
+ * ── B3b W4: the stored result is the ONLY source for a row that has one ─────
+ *
+ * A STORED terminal `result` wins outright, whatever `resultSource` says. That
+ * is the retirement this step is for: the browser used to re-run the tool-call
+ * matcher over `actualToolCalls` and grade the iteration a second time, in a
+ * second implementation, from evidence that had already been graded server-side
+ * — and by the score contract at `enforce`, from evidence the browser cannot
+ * see at all (predicates, gates, tool errors, the whole gating row set). A
+ * client re-derivation is not a check on the server; it is a different answer
+ * to the same question, arrived at with less information, and the two silently
+ * disagreeing is the failure mode that ends here.
+ *
+ * ── What survives, and why it is not the same thing ─────────────────────────
+ *
+ * The matcher below is UNTOUCHED and still runs for a row with NO stored
+ * result. Two real populations need it:
+ *
+ *   - LEGACY ROWS that never persisted one. Falling back to "not passed" would
+ *     silently re-grade years of history as failures.
+ *   - LIVE GRADING (`eval-live-grading.ts`), which hands this function
+ *     synthetic per-turn projections that were never persisted at all. It is a
+ *     PREVIEW of a verdict, not a re-derivation of a decided one.
+ *
+ * So the matcher does not retire as an evaluator; what retires is the
+ * UNVERIFIED CLIENT RE-DERIVATION of an iteration that has already been graded.
+ *
+ * Restoring the old behaviour after this ships requires reverting the PR that
+ * introduced it, not flipping a flag.
+ */
+export function computeIterationPassed(
+  iteration: EvalIteration,
+  criteria?: PassCriteria
+): boolean {
+  if (iteration.result === "passed" || iteration.result === "failed") {
+    return iteration.result === "passed";
+  }
+  if (iteration.resultSource === "reported") {
+    // A reported row whose result is non-terminal (`pending`, `cancelled`,
+    // `timed_out`) still says what it says. Unchanged from before W4.
+    return false;
+  }
+
+  const actual = iteration.actualToolCalls || [];
+  const expected = iteration.testCaseSnapshot?.expectedToolCalls || [];
+  const isNegativeTest = iteration.testCaseSnapshot?.isNegativeTest;
+  const snapshotMatchOptions = iteration.testCaseSnapshot?.matchOptions;
+
+  // Use shared matching logic; honor per-iteration snapshot options when
+  // present. Missing field on old iterations → defaults preserve prior
+  // inspector behavior (order-agnostic, extras allowed, partial args).
+  const matchResult = evaluateToolCalls(expected, actual, {
+    ...snapshotMatchOptions,
+    isNegativeTest,
+  });
+
+  // For negative tests, the matcher handles everything
+  if (isNegativeTest) {
+    return matchResult.passed;
+  }
+
+  // For positive tests with no expected calls but tools were called: pass
+  // unless extras are bounded at this snapshot, in which case those calls
+  // are unexpected extras and must fail when over the cap.
+  if (expected.length === 0 && actual.length > 0) {
+    const cap = resolveExtrasCap(snapshotMatchOptions);
+    return cap === null || actual.length <= cap;
+  }
+
+  // Apply tolerances from criteria (aggregate-suite leniency, not
+  // per-call match semantics).
+  const effectiveMissing = criteria?.allowUnexpectedTools
+    ? []
+    : matchResult.missing;
+  const effectiveMismatches = criteria?.ignoreArgumentMismatches
+    ? []
+    : matchResult.argumentMismatches;
+
+  if (effectiveMissing.length > 0 || effectiveMismatches.length > 0) {
+    return false;
+  }
+
+  // Snapshot may also fail on out-of-order or extras (when bounded).
+  // Mirror the matcher's `passed` for those cases.
+  if (matchResult.outOfOrder.length > 0) {
+    return false;
+  }
+  const cap = resolveExtrasCap(snapshotMatchOptions);
+  if (cap !== null && matchResult.extra.length > cap) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Evaluate pass/fail criteria for a suite run
+ */
+export function evaluatePassCriteria(
+  run: EvalSuiteRun,
+  iterations: EvalIteration[],
+  criteria: PassCriteria = DEFAULT_CRITERIA
+): PassCriteriaEvaluation {
+  // Filter to only this run's iterations
+  const runIterations = iterations.filter((it) => it.suiteRunId === run._id);
+
+  // Compute passed/failed for each iteration (only completed ones)
+  const iterationsWithResults = runIterations
+    .map((it) => {
+      const result = computeIterationResult(it, criteria);
+      return {
+        ...it,
+        result,
+        passed: result === "passed",
+      };
+    })
+    // Only count terminal pass/fail iterations - exclude pending/cancelled.
+    .filter(
+      (it) =>
+        it.result === "passed" ||
+        it.result === "failed" ||
+        it.result === "timed_out"
+    );
+
+  const totalCount = iterationsWithResults.length;
+  const passedCount = iterationsWithResults.filter((it) => it.passed).length;
+  const overallPassRate = totalCount > 0 ? (passedCount / totalCount) * 100 : 0;
+
+  switch (criteria.type) {
+    case "default":
+    case "allMustPass":
+    case "minimumPassRate": {
+      const threshold = criteria.minimumPassRate ?? 100;
+      const passed = overallPassRate >= threshold;
+      return {
+        passed,
+        reason: passed
+          ? undefined
+          : `Pass rate ${overallPassRate.toFixed(
+              1
+            )}% below threshold ${threshold}%`,
+        details: {
+          overallPassRate,
+          threshold,
+        },
+      };
+    }
+
+    case "perTestTemplate": {
+      const threshold = criteria.minimumPassRate ?? 80;
+      const failedTemplates: Array<{
+        templateKey: string;
+        passRate: number;
+        threshold: number;
+      }> = [];
+
+      // Group by testTemplateKey
+      const byTemplate = new Map<
+        string,
+        Array<(typeof iterationsWithResults)[0]>
+      >();
+      for (const it of iterationsWithResults) {
+        const templateKey = it.testCaseSnapshot?.title || "unknown"; // Use title as fallback
+        if (!byTemplate.has(templateKey)) {
+          byTemplate.set(templateKey, []);
+        }
+        byTemplate.get(templateKey)!.push(it);
+      }
+
+      // Check each template
+      for (const [templateKey, templateIterations] of byTemplate) {
+        const templatePassed = templateIterations.filter(
+          (it) => it.passed
+        ).length;
+        const templateTotal = templateIterations.length;
+        const templatePassRate =
+          templateTotal > 0 ? (templatePassed / templateTotal) * 100 : 0;
+        const templateThreshold =
+          criteria.perTemplateThresholds?.[templateKey] ?? threshold;
+
+        if (templatePassRate < templateThreshold) {
+          failedTemplates.push({
+            templateKey,
+            passRate: templatePassRate,
+            threshold: templateThreshold,
+          });
+        }
+      }
+
+      const passed = failedTemplates.length === 0;
+      return {
+        passed,
+        reason: passed
+          ? undefined
+          : `${failedTemplates.length} test template(s) below threshold`,
+        details: {
+          overallPassRate,
+          threshold,
+          failedTemplates,
+        },
+      };
+    }
+
+    case "perModel": {
+      const threshold = criteria.minimumPassRate ?? 80;
+      const failedModels: Array<{
+        model: string;
+        passRate: number;
+        threshold: number;
+      }> = [];
+
+      // Group by model
+      const byModel = new Map<
+        string,
+        Array<(typeof iterationsWithResults)[0]>
+      >();
+      for (const it of iterationsWithResults) {
+        const model = it.testCaseSnapshot?.model || "unknown";
+        if (!byModel.has(model)) {
+          byModel.set(model, []);
+        }
+        byModel.get(model)!.push(it);
+      }
+
+      // Check each model
+      for (const [model, modelIterations] of byModel) {
+        const modelPassed = modelIterations.filter((it) => it.passed).length;
+        const modelTotal = modelIterations.length;
+        const modelPassRate =
+          modelTotal > 0 ? (modelPassed / modelTotal) * 100 : 0;
+        const modelThreshold =
+          criteria.perModelThresholds?.[model] ?? threshold;
+
+        if (modelPassRate < modelThreshold) {
+          failedModels.push({
+            model,
+            passRate: modelPassRate,
+            threshold: modelThreshold,
+          });
+        }
+      }
+
+      const passed = failedModels.length === 0;
+      return {
+        passed,
+        reason: passed
+          ? undefined
+          : `${failedModels.length} model(s) below threshold`,
+        details: {
+          overallPassRate,
+          threshold,
+          failedModels,
+        },
+      };
+    }
+
+    default:
+      return {
+        passed: overallPassRate >= 80,
+        details: {
+          overallPassRate,
+          threshold: 80,
+        },
+      };
+  }
+}

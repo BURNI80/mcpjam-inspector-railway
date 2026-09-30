@@ -1,0 +1,815 @@
+import { WidgetPlaceholder } from "@mcpjam/chat-ui";
+import { ArtifactImage } from "@/components/ui/artifact-image";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { type ToolUIPart, type DynamicToolUIPart, type UITools } from "ai";
+import { UIMessage } from "@ai-sdk/react";
+import type { ContentBlock } from "@modelcontextprotocol/client";
+
+import { ToolPart } from "./parts/tool-part";
+import { AskUserPart } from "./parts/ask-user-part";
+import {
+  ASK_USER_TOOL_NAME,
+  useAskUserCallIsOurs,
+} from "@/lib/webmcp/ask-user-store";
+import {
+  ReasoningPart,
+  type ReasoningDisplayMode,
+} from "./parts/reasoning-part";
+import { FilePart } from "./parts/file-part";
+import { SourceUrlPart } from "./parts/source-url-part";
+import { SourceDocumentPart } from "./parts/source-document-part";
+import { JsonPart } from "./parts/json-part";
+import { TextPart } from "./parts/text-part";
+import { toast } from "@/lib/toast";
+import { type DisplayMode } from "@/stores/ui-playground-store";
+import type { McpToolResultImageRenderingPolicy } from "@/lib/client-config-v2";
+import {
+  callTool,
+  executeToolApi,
+  getToolServerId,
+  ToolServerMap,
+} from "@/lib/apis/mcp-tools-api";
+import {
+  detectUIType,
+  getUIResourceUri,
+  UIType,
+} from "@/lib/mcp-ui/mcp-apps-utils";
+import {
+  AnyPart,
+  getDataLabel,
+  getToolInfo,
+  isDataPart,
+  isDynamicTool,
+  isToolPart,
+} from "./thread-helpers";
+import { useSharedAppState } from "@/state/app-state-context";
+import { UI_CONTEXT_PART_TYPE } from "@/shared/ui-context";
+import { useActiveHostCapsResolver } from "@/contexts/active-host-client-capabilities-context";
+import { useScenarioHostStyle } from "@/contexts/scenario-client-style-context";
+import { hostSupportsWidgetRendering } from "@/lib/host-capabilities";
+import {
+  ToolRenderOverride,
+  widgetSlotShouldRender,
+} from "@/components/chat-v2/thread/tool-render-overrides";
+import { WidgetReplay } from "./widget-replay";
+import {
+  computeWidgetRecordMode,
+  type RecorderReadyEvent,
+  type RecorderStepEvent,
+  type RecordingTarget,
+  type ReplayControllerEvent,
+} from "./recorder-types";
+
+import {
+  readToolResultMeta,
+  readToolResultServerId,
+} from "@/lib/tool-result-utils";
+import { readMcpToolOriginServerId,
+  readMcpToolConnectionId } from "@/shared/mcp-tool-origin-metadata";
+import type { AppToolInvocationUpdate } from "./app-tool-invocations";
+import { reportPossiblyOurFailure } from "@/lib/error-reporting";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function recorderDebug(message: string, details?: Record<string, unknown>) {
+  try {
+    if (
+      typeof window !== "undefined" &&
+      window.localStorage?.getItem("mcpjam:recorder-debug") === "1"
+    ) {
+      console.info(`[recorder] ${message}`, details ?? {});
+    }
+  } catch {
+    // best-effort debug logging only
+  }
+}
+
+/**
+ * Frozen recorded render shown in place of a live widget when a completed eval
+ * run is being replayed (see {@link ToolRenderOverride.frozenScreenshotUrl}).
+ * Faithful to what the run actually painted; no live re-mount that could drift.
+ */
+function FrozenWidgetScreenshot({
+  url,
+  toolName,
+}: {
+  url: string;
+  toolName: string;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5" data-testid="frozen-widget-replay">
+      <ArtifactImage
+        src={url}
+        alt={`${toolName} recorded render`}
+        className="w-full rounded-md border border-border/60 bg-background"
+      />
+      <span className="text-[11px] text-muted-foreground">
+        Recorded render — this run's captured widget (not re-rendered live)
+      </span>
+    </div>
+  );
+}
+
+export function PartSwitch({
+  part,
+  role,
+  chatSessionId,
+  onSendFollowUp,
+  toolsMetadata,
+  toolServerMap,
+  onWidgetStateChange,
+  onModelContextUpdate,
+  onAppToolInvocationChange,
+  pipWidgetId,
+  fullscreenWidgetId,
+  onRequestPip,
+  onExitPip,
+  onRequestFullscreen,
+  onExitFullscreen,
+  onRequestTeardown,
+  tornDownWidgetIds,
+  displayMode,
+  onDisplayModeChange,
+  onToolApprovalResponse,
+  messageParts,
+  toolRenderOverrides,
+  showInlineEdit = true,
+  minimalMode = false,
+  interactive = true,
+  widgetPolicy = "live",
+  reasoningDisplayMode = "inline",
+  mcpToolResultImageRendering,
+  recordCapable,
+  recordingTarget,
+  resolvePromptIndex,
+  onRecorderStep,
+  onRecorderReady,
+  onReplayControllerReady,
+}: {
+  part: AnyPart;
+  role: UIMessage["role"];
+  chatSessionId?: string;
+  onSendFollowUp: (text: string) => void;
+  toolsMetadata: Record<string, Record<string, any>>;
+  toolServerMap: ToolServerMap;
+  onWidgetStateChange?: (toolCallId: string, state: any) => void;
+  onModelContextUpdate?: (
+    toolCallId: string,
+    context: {
+      content?: ContentBlock[];
+      structuredContent?: Record<string, unknown>;
+    },
+  ) => void;
+  onAppToolInvocationChange?: (invocation: AppToolInvocationUpdate) => void;
+  pipWidgetId: string | null;
+  fullscreenWidgetId: string | null;
+  onRequestPip: (toolCallId: string) => void;
+  onExitPip: (toolCallId: string) => void;
+  onRequestFullscreen: (toolCallId: string) => void;
+  onExitFullscreen: (toolCallId: string) => void;
+  onRequestTeardown?: (toolCallId: string, displayWidgetId?: string) => void;
+  tornDownWidgetIds?: ReadonlySet<string>;
+  displayMode?: DisplayMode;
+  onDisplayModeChange?: (mode: DisplayMode) => void;
+  onToolApprovalResponse?: (options: { id: string; approved: boolean }) => void;
+  messageParts?: AnyPart[];
+  toolRenderOverrides?: Record<string, ToolRenderOverride>;
+  showInlineEdit?: boolean;
+  minimalMode?: boolean;
+  interactive?: boolean;
+  widgetPolicy?: "live" | "placeholder";
+  reasoningDisplayMode?: ReasoningDisplayMode;
+  mcpToolResultImageRendering?: McpToolResultImageRenderingPolicy;
+  // Tier 3 recorder (default off — see recorder-types.ts).
+  recordCapable?: boolean;
+  recordingTarget?: RecordingTarget | null;
+  resolvePromptIndex?: (toolCallId: string) => number | undefined;
+  onRecorderStep?: (event: RecorderStepEvent) => void;
+  onRecorderReady?: (event: RecorderReadyEvent) => void;
+  onReplayControllerReady?: (event: ReplayControllerEvent) => void;
+}) {
+  const [appSupportedDisplayModes, setAppSupportedDisplayModes] = useState<
+    DisplayMode[] | undefined
+  >();
+  void messageParts;
+
+  const appState = useSharedAppState();
+  const resolveHostCaps = useActiveHostCapsResolver();
+  const hostStyle = useScenarioHostStyle();
+
+  const toolInfoFromPart =
+    isToolPart(part) || isDynamicTool(part)
+      ? getToolInfo(part as ToolUIPart<UITools> | DynamicToolUIPart)
+      : null;
+
+  // Tool-call identity for the current part (drives the edit reset effect).
+  const toolCallId =
+    isToolPart(part) || isDynamicTool(part)
+      ? ((part as any).toolCallId as string | undefined)
+      : undefined;
+
+  // --- Inline live-edit of tool input/output (no persistence) ---
+  // Override state lives here so it feeds BOTH the ToolPart data editors and the
+  // sibling <WidgetReplay>; the existing sendToolInput/sendToolResult path then
+  // re-renders the live iframe with no reload. Sentinel-wrapped so "edited to
+  // null" stays distinct from pristine (null = pristine).
+  // Unconditional (hook rules): whether THIS call is a question we asked.
+  // Per call, not per page — see the ownership gate below.
+  const askUserCallIsOurs = useAskUserCallIsOurs(
+    toolInfoFromPart?.toolCallId,
+    toolInfoFromPart?.output ?? toolInfoFromPart?.rawOutput,
+  );
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedInput, setEditedInput] = useState<{ value: unknown } | null>(
+    null,
+  );
+  // Manual hand-edits to the Result JSON (null = none).
+  const [editedOutput, setEditedOutput] = useState<{ value: unknown } | null>(
+    null,
+  );
+  // The most recent server Run result, kept as the metadata anchor: it becomes
+  // the base whose _meta / toolResponseMetadata applies to later manual edits,
+  // so "Run, then tweak the result" keeps the latest run's metadata, not the
+  // original tool result's.
+  const [lastRunOutput, setLastRunOutput] = useState<{ value: unknown } | null>(
+    null,
+  );
+  const [isRunning, setIsRunning] = useState(false);
+  // Bumped to remount + reseed the JsonEditors on a hard reset (Revert /
+  // Run-result swap / new tool call). Keystroke edits never bump it.
+  const [editVersion, setEditVersion] = useState(0);
+  // True while the input editor holds unparseable JSON. The editor only emits
+  // onChange on a valid parse, so without this Run could execute the last valid
+  // value while the editor visibly shows broken JSON.
+  const [inputInvalid, setInputInvalid] = useState(false);
+  // Monotonic token invalidating in-flight Runs. Bumped on every Run start and
+  // on any reset (Revert / new tool call / display-mode switch) so a server
+  // response that lands after the context changed can't write stale output.
+  const runSeqRef = useRef(0);
+
+  const handleInputChange = useCallback(
+    (value: unknown) => setEditedInput({ value }),
+    [],
+  );
+  const handleOutputChange = useCallback(
+    (value: unknown) => setEditedOutput({ value }),
+    [],
+  );
+  // The input editor reports its parse state on every keystroke (null = valid).
+  const handleInputValidityChange = useCallback(
+    (valid: boolean) => setInputInvalid(!valid),
+    [],
+  );
+  const handleToggleEdit = useCallback(() => setIsEditing((p) => !p), []);
+  const handleRevert = useCallback(() => {
+    // Bumping runSeqRef invalidates any in-flight Run, whose guarded `finally`
+    // will then skip setIsRunning(false) — so clear it here too, or the card
+    // would stay stuck in the running state with Run disabled.
+    runSeqRef.current += 1;
+    setEditedInput(null);
+    setEditedOutput(null);
+    setLastRunOutput(null);
+    setIsRunning(false);
+    setInputInvalid(false);
+    setEditVersion((v) => v + 1);
+  }, []);
+
+  // Drop edits when the tool-call identity changes or the display mode switches.
+  useEffect(() => {
+    runSeqRef.current += 1;
+    setIsEditing(false);
+    setEditedInput(null);
+    setEditedOutput(null);
+    setLastRunOutput(null);
+    setIsRunning(false);
+    setInputInvalid(false);
+    setEditVersion((v) => v + 1);
+  }, [toolCallId, displayMode]);
+
+  if (isToolPart(part) || isDynamicTool(part)) {
+    const toolPart = part as ToolUIPart<UITools> | DynamicToolUIPart;
+    const toolInfo = toolInfoFromPart ?? getToolInfo(toolPart);
+
+    // The agent's clarifying question renders as a card, not a tool row: the
+    // whole point is that the user answers it inline. Handled before every
+    // widget / inline-edit / approval branch below, none of which apply to a
+    // question that touches no server and never gates (it is read-only).
+    //
+    // Gated on PER-CALL provenance, not the name and not page-global state:
+    // a connected MCP server may legitimately expose `ui_ask_user`, and the
+    // `ui_*` catalog is registered app-wide on ordinary routes, so "is the
+    // tool registered" would be true almost everywhere and would claim that
+    // server's call in a regular chat. See `useAskUserCallIsOurs`.
+    if (toolInfo.toolName === ASK_USER_TOOL_NAME && askUserCallIsOurs) {
+      return (
+        <AskUserPart
+          toolCallId={toolInfo.toolCallId}
+          input={toolInfo.input}
+          output={toolInfo.output ?? toolInfo.rawOutput}
+          hasOutput={
+            typeof toolInfo.toolState === "string" &&
+            toolInfo.toolState.startsWith("output-")
+          }
+          interactive={interactive}
+        />
+      );
+    }
+
+    const approvalId = toolPart.approval?.id;
+    const approvalProps =
+      interactive && approvalId
+        ? {
+            approvalId,
+            onApprove: (id: string) =>
+              onToolApprovalResponse?.({ id, approved: true }),
+            onDeny: (id: string) =>
+              onToolApprovalResponse?.({ id, approved: false }),
+          }
+        : {};
+    const renderOverride = toolInfo.toolCallId
+      ? toolRenderOverrides?.[toolInfo.toolCallId]
+      : undefined;
+    const rawToolOutput = (toolPart as any).result ?? toolInfo.rawOutput;
+    const partToolMeta = toolsMetadata[toolInfo.toolName];
+    const streamedToolMeta = readToolResultMeta(rawToolOutput);
+    const effectiveToolMeta =
+      renderOverride?.toolMetadata ?? partToolMeta ?? streamedToolMeta;
+    const uiType = detectUIType(effectiveToolMeta, rawToolOutput);
+    // MCP-UI legacy (inline ui:// resources via @mcp-ui/client) was
+    // removed during the renderer consolidation. Inline resources are no
+    // longer rendered; tools that want a widget must declare it via
+    // `_meta.ui.resourceUri` or `openai/outputTemplate`.
+    const providerMetadataServerId =
+      readMcpToolOriginServerId((toolPart as any).callProviderMetadata) ??
+      readMcpToolOriginServerId((toolPart as any).providerMetadata) ??
+      readMcpToolOriginServerId((toolPart as any).providerOptions);
+    // Which credential produced this result, when the server had more than one
+    // live. Rerun resolves a server, not a connection, so a call made on a
+    // specific account cannot be replayed faithfully yet.
+    const attributedConnectionId =
+      readMcpToolConnectionId((toolPart as any).callProviderMetadata) ??
+      readMcpToolConnectionId((toolPart as any).providerMetadata) ??
+      readMcpToolConnectionId((toolPart as any).providerOptions);
+    const serverId =
+      renderOverride?.serverId ??
+      providerMetadataServerId ??
+      getToolServerId(toolInfo.toolName, toolServerMap) ??
+      readToolResultServerId(rawToolOutput);
+    const hasRenderOverrideToolOutput =
+      renderOverride !== undefined &&
+      Object.prototype.hasOwnProperty.call(renderOverride, "toolOutput");
+    const resolvedToolOutput = hasRenderOverrideToolOutput
+      ? renderOverride.toolOutput
+      : toolInfo.output ?? toolInfo.rawOutput;
+
+    // --- Inline edit: effective values fed to BOTH the editors and the iframe ---
+    const baseInput = (toolInfo.input ?? null) as Record<
+      string,
+      unknown
+    > | null;
+    // Tool input is an arguments object. Mirror the output normalization: ignore
+    // non-object edits (null / array / string) for BOTH the live widget feed and
+    // Run, falling back to the original — otherwise the preview could render one
+    // payload while Run executes a coerced `{}`. They must stay identical.
+    const effectiveInput: Record<string, unknown> | null = editedInput
+      ? isPlainObject(editedInput.value)
+        ? editedInput.value
+        : baseInput
+      : baseInput;
+    // Metadata anchor: the latest server Run result if one has happened this
+    // session, else the original tool result. Its _meta applies to manual edits
+    // and is the raw-output meta source, so "Run, then tweak the result" keeps
+    // the latest run's toolResponseMetadata rather than reverting to the
+    // original's.
+    const metaAnchor = lastRunOutput ? lastRunOutput.value : resolvedToolOutput;
+    const effectiveOutput = (() => {
+      // Manual hand-edit takes precedence over the displayed result.
+      if (editedOutput) {
+        const edited = editedOutput.value;
+        // Tool results are always objects (CallToolResult). Ignore non-object /
+        // null edits for rendering and fall back to the anchor (the renderer
+        // coalesces a null `toolOutput` back to `rawOutput` and the streaming
+        // hook skips falsy output, so feeding null would silently diverge the
+        // widget from the editor). Object edits flow through with `_meta` pinned
+        // to the anchor so a hand-edit can't repoint the binding or change
+        // toolResponseMetadata directly.
+        if (!isPlainObject(edited)) return metaAnchor;
+        return isPlainObject(metaAnchor)
+          ? { ...edited, _meta: metaAnchor._meta }
+          : edited;
+      }
+      // No manual edit: show the latest run result verbatim (fresh _meta), or
+      // the original tool result.
+      return metaAnchor;
+    })();
+    // After a Run, only the widget's toolResponseMetadata should reflect the
+    // latest result — override that value rather than swapping `rawOutput`, so
+    // serverId / uiType / effectiveToolMeta keep deriving from the original
+    // result. A rerun is the same tool; its binding must not change. (The
+    // server execute result also lacks MCPJam's `_serverId` annotation, so
+    // swapping rawOutput would drop serverId on raw-result-resolved cards.)
+    const toolResponseMetadataOverride = lastRunOutput
+      ? (readToolResultMeta(lastRunOutput.value) as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+    const hasEdits =
+      editedInput !== null || editedOutput !== null || lastRunOutput !== null;
+
+    const isServerConnected =
+      !!serverId &&
+      appState.servers[serverId]?.connectionStatus === "connected";
+    // Run must execute exactly what the input editor shows. Block it when the
+    // editor holds invalid JSON (onChange never fired, so effectiveInput is
+    // stale) or a valid-but-non-object root (effectiveInput fell back to the
+    // original) — otherwise Run would send something other than what's visible.
+    const inputEditedToNonObject =
+      editedInput !== null && !isPlainObject(editedInput.value);
+    // Frozen eval replays render a screenshot (no live iframe) → no inline edit.
+    const allowInlineEdit =
+      interactive &&
+      showInlineEdit &&
+      !minimalMode &&
+      !renderOverride?.frozenScreenshotUrl &&
+      toolInfo.toolState === "output-available";
+    const canRun =
+      allowInlineEdit &&
+      isServerConnected &&
+      !isRunning &&
+      !inputInvalid &&
+      !inputEditedToNonObject &&
+      !attributedConnectionId;
+    const runDisabledReason = !isServerConnected
+      ? "Connect the server to run"
+      : attributedConnectionId
+      ? "This call ran on a specific account; rerun would use the server's default account"
+      : inputInvalid
+      ? "Fix the invalid input JSON to run"
+      : inputEditedToNonObject
+      ? "Input must be a JSON object to run"
+      : undefined;
+
+    const handleRun = async () => {
+      if (!serverId) return;
+      // Token this Run. A reset (new tool call / display-mode switch / Revert)
+      // or a newer Run bumps runSeqRef, after which every state write below
+      // is skipped — a late response can't clobber the current context.
+      const seq = (runSeqRef.current += 1);
+      const params = isPlainObject(effectiveInput) ? effectiveInput : {};
+      setIsRunning(true);
+      try {
+        const res = await executeToolApi(serverId, toolInfo.toolName, params);
+        if (runSeqRef.current !== seq) return;
+        if ("error" in res) {
+          toast.error(`Execution failed: ${res.error}`);
+          return;
+        }
+        if (res.status === "elicitation_required") {
+          toast.error("Tool requires elicitation (not supported here)");
+          return;
+        }
+        if (res.status === "task_created") {
+          toast.error("Background tasks are not supported here");
+          return;
+        }
+        // The run supersedes any manual output edit; anchor metadata to it.
+        setLastRunOutput({ value: res.result });
+        setEditedOutput(null);
+        setEditVersion((v) => v + 1);
+      } catch (err) {
+        reportPossiblyOurFailure(err, {
+          source: "widget_tool_run",
+          extra: { toolName: toolInfo.toolName },
+        });
+        if (runSeqRef.current === seq) {
+          toast.error(err instanceof Error ? err.message : "Execution failed");
+        }
+      } finally {
+        if (runSeqRef.current === seq) setIsRunning(false);
+      }
+    };
+
+    // Gate widget render on the active host's advertised capabilities for
+    // this tool's server. Hosts that don't advertise the MCP UI extension
+    // (Codex — elicitation-only client) fall through to the plain
+    // ToolPart result row, even when the tool itself declares
+    // `_meta.ui.resourceUri` / `openai/outputTemplate`. This mirrors what
+    // real CLI clients do: tool runs, JSON result is shown, no iframe.
+    //
+    // `serverId` (computed above for save-view routing) is passed through
+    // so the resolver picks up any per-server `clientCapabilities`
+    // override — keeping the renderer in lockstep with `initialize`,
+    // which uses the same `resolveEffectiveClientCapabilities` function.
+    //
+    // Note on Apps SDK hosts (ChatGPT, Copilot): their templates KEEP the
+    // SDK-default MCP UI extension in `clientCapabilities`, so they pass
+    // this gate today. A future explicit "window.openai" flag on
+    // HostConfigInputV2 will be OR-ed here to cover Apps-SDK hosts that
+    // choose to strip the MCP UI extension.
+    const isWidgetTornDown =
+      typeof toolInfo.toolCallId === "string" &&
+      tornDownWidgetIds?.has(toolInfo.toolCallId);
+    const shouldRenderWidget =
+      !isWidgetTornDown &&
+      hostSupportsWidgetRendering(resolveHostCaps(serverId ?? undefined), {
+        hostStyle,
+      }) &&
+      (uiType === UIType.OPENAI_SDK ||
+        uiType === UIType.MCP_APPS ||
+        uiType === UIType.OPENAI_SDK_AND_MCP_APPS);
+
+    // Session review records the presence of a widget, without mounting its
+    // runtime or fetching HTML from today's server. This policy also overrides
+    // frozen screenshots: the Browser tab owns recorded renders for Sessions.
+    if (widgetPolicy === "placeholder" && (
+      uiType === UIType.OPENAI_SDK || uiType === UIType.MCP_APPS ||
+      uiType === UIType.OPENAI_SDK_AND_MCP_APPS || renderOverride?.resourceUri ||
+      renderOverride?.cachedWidgetHtmlUrl || renderOverride?.frozenScreenshotUrl
+    )) {
+      return (
+        <>
+          <ToolPart part={toolPart} chatSessionId={chatSessionId} uiType={uiType}
+            minimalMode={minimalMode} serverId={serverId}
+            mcpToolResultImageRendering={mcpToolResultImageRendering} rawOutput={rawToolOutput} />
+          <WidgetPlaceholder toolName={toolInfo.toolName} />
+        </>
+      );
+    }
+
+    // A frozen recorded screenshot (eval replay) renders INDEPENDENTLY of live
+    // widget eligibility: a completed run's widget can fail host-caps / server /
+    // `uiType` checks at view-time, but we still have its capture. The inner
+    // ternary below shows the screenshot in place of the live <WidgetReplay>.
+    if (widgetSlotShouldRender(shouldRenderWidget, renderOverride)) {
+      const isFrozenWidget = !!renderOverride?.frozenScreenshotUrl;
+      const allowWidgetDisplayModeChanges = interactive && !isFrozenWidget;
+      return (
+        <>
+          <ToolPart
+            part={toolPart}
+            chatSessionId={chatSessionId}
+            uiType={uiType}
+            displayMode={
+              allowWidgetDisplayModeChanges ? displayMode : undefined
+            }
+            pipWidgetId={pipWidgetId}
+            fullscreenWidgetId={fullscreenWidgetId}
+            onDisplayModeChange={
+              allowWidgetDisplayModeChanges ? onDisplayModeChange : undefined
+            }
+            onRequestFullscreen={
+              allowWidgetDisplayModeChanges ? onRequestFullscreen : undefined
+            }
+            onExitFullscreen={
+              allowWidgetDisplayModeChanges ? onExitFullscreen : undefined
+            }
+            onRequestPip={
+              allowWidgetDisplayModeChanges ? onRequestPip : undefined
+            }
+            onExitPip={allowWidgetDisplayModeChanges ? onExitPip : undefined}
+            appSupportedDisplayModes={
+              allowWidgetDisplayModeChanges
+                ? appSupportedDisplayModes
+                : undefined
+            }
+            allowInlineEdit={allowInlineEdit}
+            isEditing={isEditing}
+            onToggleEdit={handleToggleEdit}
+            onInputChange={handleInputChange}
+            onOutputChange={handleOutputChange}
+            onInputValidityChange={handleInputValidityChange}
+            inputValue={effectiveInput}
+            outputValue={effectiveOutput}
+            hasEdits={hasEdits}
+            onRevert={handleRevert}
+            onRun={handleRun}
+            isRunning={isRunning}
+            canRun={canRun}
+            runDisabledReason={runDisabledReason}
+            editVersion={editVersion}
+            minimalMode={minimalMode}
+            serverId={serverId}
+            mcpToolResultImageRendering={mcpToolResultImageRendering}
+            rawOutput={rawToolOutput}
+            recordedWidgetDiagnostics={
+              isFrozenWidget
+                ? {
+                    resourceUri:
+                      renderOverride?.resourceUri ??
+                      getUIResourceUri(uiType, effectiveToolMeta) ??
+                      undefined,
+                    csp: renderOverride?.widgetCsp,
+                    permissions: renderOverride?.widgetPermissions,
+                    permissive: renderOverride?.widgetPermissive,
+                    prefersBorder: renderOverride?.prefersBorder,
+                    consoleErrors:
+                      renderOverride?.recordedWidgetErrors?.consoleErrors,
+                    blockedRequests:
+                      renderOverride?.recordedWidgetErrors?.blockedRequests,
+                  }
+                : undefined
+            }
+            {...approvalProps}
+          />
+          {renderOverride?.frozenScreenshotUrl ? (
+            <FrozenWidgetScreenshot
+              url={renderOverride.frozenScreenshotUrl}
+              toolName={toolInfo.toolName}
+            />
+          ) : (
+            <WidgetReplay
+              chatSessionId={chatSessionId}
+              toolName={toolInfo.toolName}
+              toolCallId={toolInfo.toolCallId}
+              {...(() => {
+                // Tier 3 recorder. DECOUPLED from arming: on a record-capable
+                // surface (the eval preview) EVERY widget loads the shim on first
+                // render, so arming never reloads a widget. Reloading on arm would
+                // re-run the widget's `ui/initialize` without closing the previous
+                // App instance → a second AppBridge → misrouted handshake and no
+                // `recorder:ready`. Arming is a host-side SAVE gate (handled in the
+                // editor's onRecorderStep), not a reload trigger.
+                const tcid = toolInfo.toolCallId;
+                const widgetPromptIndex = tcid
+                  ? resolvePromptIndex?.(tcid)
+                  : undefined;
+                const { recordMode, promptIndex: pi } = computeWidgetRecordMode(
+                  {
+                    recordCapable,
+                    recordingTarget,
+                    toolName: toolInfo.toolName,
+                    toolCallId: tcid,
+                    widgetPromptIndex,
+                  },
+                );
+                recorderDebug("part record decision", {
+                  toolName: toolInfo.toolName,
+                  toolCallId: tcid ?? null,
+                  hasToolCallId: !!tcid,
+                  recordCapable: !!recordCapable,
+                  recordMode,
+                  widgetPromptIndex: widgetPromptIndex ?? null,
+                  recordingTarget: recordingTarget ?? null,
+                });
+                if (!recordMode) return {};
+                const toolCallId = tcid as string;
+                return {
+                  recordMode: true,
+                  onRecorderStep: (step: unknown) => {
+                    recorderDebug("part recorder step", {
+                      toolName: toolInfo.toolName,
+                      toolCallId,
+                      promptIndex: pi,
+                    });
+                    onRecorderStep?.({
+                      promptIndex: pi,
+                      toolName: toolInfo.toolName,
+                      toolCallId,
+                      step,
+                    });
+                  },
+                  onRecorderReady: () => {
+                    recorderDebug("part recorder ready", {
+                      toolName: toolInfo.toolName,
+                      toolCallId,
+                      promptIndex: pi,
+                    });
+                    onRecorderReady?.({
+                      promptIndex: pi,
+                      toolName: toolInfo.toolName,
+                      toolCallId,
+                    });
+                  },
+                  onReplayControllerReady: (
+                    replay: ReplayControllerEvent["replay"],
+                  ) => {
+                    onReplayControllerReady?.({
+                      promptIndex: pi,
+                      toolName: toolInfo.toolName,
+                      toolCallId,
+                      replay,
+                    });
+                  },
+                };
+              })()}
+              toolState={toolInfo.toolState}
+              toolInput={effectiveInput}
+              toolOutput={effectiveOutput}
+              rawOutput={rawToolOutput}
+              toolResponseMetadataOverride={toolResponseMetadataOverride}
+              toolErrorText={toolInfo.errorText}
+              toolMetadata={effectiveToolMeta}
+              toolsMetadata={toolsMetadata}
+              toolServerMap={toolServerMap}
+              renderOverride={renderOverride}
+              // PartSwitch owns the inspector host-capabilities context; inject
+              // the gate so WidgetReplay re-checks per-server support without
+              // importing `@/contexts` / `@/lib/host-capabilities` itself.
+              resolveHostSupportsWidget={(sid) =>
+                hostSupportsWidgetRendering(resolveHostCaps(sid), { hostStyle })
+              }
+              onSendFollowUp={interactive ? onSendFollowUp : undefined}
+              onCallTool={
+                interactive
+                  ? (toolName, params) =>
+                      callTool(serverId ?? "offline-view", toolName, params)
+                  : undefined
+              }
+              onAppToolInvocationChange={onAppToolInvocationChange}
+              onWidgetStateChange={
+                interactive ? onWidgetStateChange : undefined
+              }
+              onModelContextUpdate={
+                interactive ? onModelContextUpdate : undefined
+              }
+              pipWidgetId={pipWidgetId}
+              fullscreenWidgetId={fullscreenWidgetId}
+              onRequestPip={interactive ? onRequestPip : undefined}
+              onExitPip={interactive ? onExitPip : undefined}
+              onRequestFullscreen={
+                interactive ? onRequestFullscreen : undefined
+              }
+              onExitFullscreen={interactive ? onExitFullscreen : undefined}
+              onRequestTeardown={interactive ? onRequestTeardown : undefined}
+              displayMode={interactive ? displayMode : undefined}
+              onDisplayModeChange={
+                interactive ? onDisplayModeChange : undefined
+              }
+              onAppSupportedDisplayModesChange={
+                interactive ? setAppSupportedDisplayModes : undefined
+              }
+              minimalMode={minimalMode}
+            />
+          )}
+        </>
+      );
+    }
+
+    return (
+      <ToolPart
+        part={toolPart}
+        chatSessionId={chatSessionId}
+        uiType={uiType}
+        minimalMode={minimalMode}
+        serverId={serverId}
+        mcpToolResultImageRendering={mcpToolResultImageRendering}
+        rawOutput={rawToolOutput}
+        {...approvalProps}
+      />
+    );
+  }
+
+  // Orientation context the agent surfaces attach to each user message. It
+  // is addressed to the model, not the reader — the user already knows what
+  // screen they're on, and `isDataPart` below would render it as a JSON blob
+  // in the middle of their own message.
+  if (
+    part.type === UI_CONTEXT_PART_TYPE ||
+    part.type === "data-browser-readiness"
+  ) {
+    return null;
+  }
+
+  if (isDataPart(part)) {
+    return (
+      <JsonPart
+        label={getDataLabel(part.type)}
+        value={(part as any).data}
+        autoHeight={Boolean((part as any).autoHeight)}
+        serverId={(part as any).serverId}
+        mcpToolResultImageRendering={mcpToolResultImageRendering}
+      />
+    );
+  }
+
+  switch (part.type) {
+    case "text":
+      return <TextPart text={part.text} role={role} />;
+    case "reasoning":
+      return (
+        <ReasoningPart
+          text={part.text}
+          state={part.state}
+          displayMode={reasoningDisplayMode}
+        />
+      );
+    case "file":
+      return <FilePart part={part} />;
+    case "source-url":
+      return <SourceUrlPart part={part} />;
+    case "source-document":
+      return <SourceDocumentPart part={part} />;
+    case "step-start":
+      return null;
+    default:
+      return (
+        <JsonPart
+          label="Unknown part"
+          value={part}
+          mcpToolResultImageRendering={mcpToolResultImageRendering}
+        />
+      );
+  }
+}

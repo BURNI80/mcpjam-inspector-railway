@@ -1,0 +1,126 @@
+import { MemoryRouter } from "react-router";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { SettingsTab } from "../SettingsTab";
+
+vi.stubGlobal("__APP_VERSION__", "0.0.0-test");
+
+// `SettingsNav` reaches `useGithubChecksAvailability`, which calls
+// `useConvexAuth`/`useQuery`. This suite renders without a ConvexProvider, so
+// the real hooks throw on "no ConvexProviderWithAuth ancestor".
+vi.mock("convex/react", () => ({
+  useConvexAuth: () => ({ isAuthenticated: false, isLoading: false }),
+  useQuery: () => undefined,
+  useMutation: () => vi.fn(),
+  useAction: () => vi.fn(),
+}));
+
+const { mockSetThemeMode, mockUpdateThemeMode } = vi.hoisted(() => ({
+  mockSetThemeMode: vi.fn(),
+  mockUpdateThemeMode: vi.fn(),
+}));
+
+vi.mock("@/stores/preferences/preferences-provider", () => ({
+  usePreferencesStore: (selector: any) =>
+    selector({
+      themePreference: "light",
+      setThemePreference: mockSetThemeMode,
+    }),
+}));
+
+vi.mock("@/hooks/use-ai-provider-keys", () => ({
+  useAiProviderKeys: () => ({
+    tokens: {},
+    setToken: vi.fn(),
+    clearToken: vi.fn(),
+    hasToken: vi.fn(() => false),
+    getOllamaBaseUrl: vi.fn(() => ""),
+    setOllamaBaseUrl: vi.fn(),
+    getOpenRouterSelectedModels: vi.fn(() => []),
+    setOpenRouterSelectedModels: vi.fn(),
+    getAzureBaseUrl: vi.fn(() => ""),
+    setAzureBaseUrl: vi.fn(),
+  }),
+}));
+
+vi.mock("@/hooks/use-custom-providers", () => ({
+  useCustomProviders: () => ({
+    customProviders: [],
+    addCustomProvider: vi.fn(),
+    updateCustomProvider: vi.fn(),
+    removeCustomProvider: vi.fn(),
+  }),
+}));
+
+vi.mock("@/hooks/use-byok-allowed", () => ({
+  useByokAllowed: () => true,
+}));
+
+vi.mock("@workos-inc/authkit-react", () => ({
+  useAuth: () => ({ signIn: vi.fn(), user: null }),
+}));
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: vi.fn() }),
+}));
+vi.mock("@/lib/analytics", () => ({ track: vi.fn() }));
+
+vi.mock("@/lib/config", () => ({
+  HOSTED_MODE: true,
+}));
+
+vi.mock("@/lib/theme-utils", () => ({
+  updateThemeMode: mockUpdateThemeMode,
+}));
+
+// SettingsNav (rendered by SettingsTab) resolves GitHub Checks tab
+// availability itself; this surface doesn't exercise that tab, so a
+// stubbed "not available yet" is all it needs.
+// SettingsNav asks the backend for GitHub Checks availability on every settings
+// surface. Stubbed to keep that query out of these tests.
+vi.mock("@/hooks/useGithubChecksSettings", () => ({
+  useGithubChecksAvailability: () => undefined,
+}));
+
+describe("SettingsTab", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("shows version on About without appearance controls", () => {
+    render(
+      <MemoryRouter initialEntries={["/settings/about"]}>
+        <SettingsTab />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Version")).toBeInTheDocument();
+    expect(screen.getByText("v0.0.0-test")).toBeInTheDocument();
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+  });
+
+  it("renders appearance controls in hosted mode", () => {
+    render(<SettingsTab />);
+
+    expect(screen.getByText("Appearance")).toBeInTheDocument();
+    expect(screen.getByText("Theme")).toBeInTheDocument();
+    expect(screen.getByText("Light")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Dark" })).toBeInTheDocument();
+    expect(screen.queryByText("LLM Providers")).not.toBeInTheDocument();
+  });
+
+  it("selects Dark", async () => {
+    render(<SettingsTab />);
+
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+
+    await waitFor(() => {
+      expect(mockSetThemeMode).toHaveBeenCalledWith("dark");
+    });
+  });
+  it("offers System and persists that preference", () => {
+    render(<SettingsTab />);
+    expect(screen.getByRole("radio", { name: "Light" })).toBeChecked();
+    fireEvent.click(screen.getByRole("radio", { name: "System" }));
+    expect(mockSetThemeMode).toHaveBeenCalledWith("system");
+  });
+});

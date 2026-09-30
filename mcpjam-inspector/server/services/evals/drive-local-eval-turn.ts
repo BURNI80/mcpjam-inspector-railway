@@ -1,0 +1,723 @@
+import { cloneTraceValue } from "../../utils/live-chat-trace-stream";
+import { buildResolvedModelRequestPayload } from "../../utils/model-request-payload";
+import type { LiveChatTraceRequestPayloadEntry } from "@/shared/live-chat-trace";
+import type { TimeoutMetadata } from "../../utils/run-supervisor/deadline.js";
+import type { ModelMessage, Tool as AiTool, ToolChoice, ToolSet } from "ai";
+import type { ProviderOptions } from "@ai-sdk/provider-utils";
+import type { MCPClientManager } from "@mcpjam/sdk";
+import {
+  appendToolCallsForPrompt,
+  extractFinalAssistantMessage,
+  extractToolErrors,
+  type ToolCall,
+  type ToolErrorRecord,
+} from "@/shared/eval-matching";
+import { isPinnedTurn, type PromptTurn } from "@/shared/steps";
+import type { EvalTraceSpan } from "@/shared/eval-trace";
+import type { EvalToolChoice } from "@/shared/tool-choice";
+import { logger } from "../../utils/logger.js";
+import { withDeadline } from "../../utils/run-supervisor/deadline.js";
+import {
+  runDirectChatTurn,
+  type RunDirectChatTurnHandle,
+} from "../../utils/direct-chat-turn.js";
+import type { createLlmModel } from "../../utils/chat-helpers.js";
+import type { PrepareChatV2Result } from "../../utils/chat-v2-orchestration.js";
+import { buildPinnedTurnAccounting, runPinnedTurn } from "./pinned-turn.js";
+import type { PinnedTurnSsePayload } from "./pinned-turn-sse.js";
+import { EVAL_WIDGET_MODEL_CONTEXT } from "../../config.js";
+import { withWidgetContextSystemPrompt } from "./widget-interaction-context.js";
+import {
+  createAiSdkEvalTraceContext,
+  patchAiSdkRecordedSpansMessageRangesFromSteps,
+} from "./eval-trace-capture.js";
+import type { ToolPolicyGate } from "./tool-policy-gate.js";
+import { consumeFullStreamAsEvalEvents } from "./stream-adapter.js";
+import type { BrowserSessionContext } from "../browser-session-context.js";
+import type { UsageTotals } from "./types.js";
+
+export type LocalEvalTurnAcc = {
+  conversationMessages: ModelMessage[];
+  capturedSpans: EvalTraceSpan[];
+  requestPayloads?: LiveChatTraceRequestPayloadEntry[];
+  accumulatedUsage: UsageTotals;
+  toolsCalledByPrompt: ToolCall[][];
+  assistantMessageByPrompt: (string | undefined)[];
+  toolErrorsByPrompt: ToolErrorRecord[][];
+  pinnedToolErrors: ToolErrorRecord[];
+  activePromptIndex: number;
+  activePromptInputMessages: ModelMessage[];
+  activePartialResponseMessages: ModelMessage[];
+  activeCompletedStepCount: number;
+  activeTraceCtx: ReturnType<typeof createAiSdkEvalTraceContext> | null;
+  timeout?: TimeoutMetadata;
+  iterationError: string | undefined;
+  iterationErrorDetails: string | undefined;
+  /**
+   * WHICH LAYER failed, when this driver can tell.
+   *
+   * The hosted path carries this from its catch site; the local one had no
+   * equivalent, so a local-BYOK trial that died on the model call finalized
+   * with blank stage reasons and no failure category — the exact
+   * mis-attribution the provider-error work exists to remove, surviving on the
+   * path the hosted fix never touched.
+   *
+   * Left UNSET whenever the layer is not structurally knowable. An absent
+   * source changes nothing downstream, which is the right floor: no
+   * attribution beats a wrong one.
+   */
+  stepErrorSource: "model" | undefined;
+  pinnedSetupFailure: boolean;
+};
+
+/**
+ * Whether an error span means the MODEL-CALL layer failed.
+ *
+ * The branch that finds these spans selects every non-tool error span, and
+ * `connection`, `discovery` and `oauth` spans are all reachable there — so
+ * treating the whole set as the model would blame the provider for a server we
+ * could not reach, which is the mis-attribution this work removes rather than
+ * relocates.
+ *
+ * `undefined` for everything else, deliberately. An absent source attributes
+ * nothing, and no attribution is strictly better than a confident wrong one.
+ */
+export function modelLayerForErrorSpan(
+  span: { category?: string } | undefined,
+): "model" | undefined {
+  return span?.category === "llm" ? "model" : undefined;
+}
+
+export type LocalEvalTurnOutcome =
+  | { kind: "completed" }
+  | { kind: "cancelled" }
+  | { kind: "failed"; timeout: TimeoutMetadata };
+
+export type LocalEvalTurnSinks = {
+  emit?: Parameters<typeof consumeFullStreamAsEvalEvents>[1]["emit"];
+  getStepIndex?: () => number;
+  // PR2 — streaming SSE hooks. No-op on the batch path (which passes none), so
+  // batch persisted output is unchanged. The streaming runner builds the rich
+  // SSE events (turn_start / step_finish + failure + turn_finish trace_snapshots
+  // / step_status) from these; `usage` in `onStepSnapshot` is this turn's
+  // running total (baseline + turnUsage), matching the old streaming runner's
+  // mid-run snapshots, and is computed without mutating `acc.accumulatedUsage`.
+  /** After the user prompt is appended, before the engine call. */
+  onTurnStart?: () => void;
+  /** Per completed step (for a `step_finish` trace_snapshot). */
+  onStepSnapshot?: (ctx: {
+    stepIndex: number;
+    messages: ModelMessage[];
+    spans: EvalTraceSpan[];
+    usage: UsageTotals;
+  }) => void;
+  /** A turn failed (no content / non-tool step error). */
+  onTurnFailure?: (ctx: {
+    messages: ModelMessage[];
+    spans: EvalTraceSpan[];
+    usage: UsageTotals;
+    stepIndex?: number;
+    iterationError: string;
+  }) => void;
+  /** A turn fully succeeded. */
+  onTurnSuccess?: (ctx: {
+    messages: ModelMessage[];
+    spans: EvalTraceSpan[];
+    usage: UsageTotals;
+  }) => void;
+  /**
+   * PR5 — a model-free pinned (`toolCall`) turn ran. There is no model stream
+   * to translate, so the streaming runner synthesizes the SSE sequence from
+   * this (via `emitPinnedTurnSse`). `messages` is the persisted shape (user
+   * "Pinned tool call …" + assistant summary) so the live trace matches the
+   * finalized iteration. `iterationError` set ⇒ the pinned call failed before
+   * an MCP call ran (server not connected, etc.). Typed as the shared SSE
+   * payload (minus the runner-owned `turnIndex`) so the sink and the emitter
+   * cannot drift.
+   */
+  onPinnedTurn?: (ctx: Omit<PinnedTurnSsePayload, "turnIndex">) => void;
+};
+
+/** See {@link DriveLocalEvalTurnParams.onModelCallSettled}. */
+export type LocalModelCallSettled = {
+  outcome: "ok" | "error" | "aborted";
+  /** Machine code of an `error` (`turn_timeout`, `empty_response`, …). */
+  code?: string;
+  /** This turn's token usage. */
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  finishReason?: string;
+  /** The model id the provider reported serving, when it reported one. */
+  upstreamModel?: string;
+  at: number;
+};
+
+export type DriveLocalEvalTurnParams = {
+  promptIndex: number;
+  promptTurn: PromptTurn;
+  acc: LocalEvalTurnAcc;
+  browser: BrowserSessionContext;
+  mcpClientManager: MCPClientManager;
+  selectedServers: string[];
+  resolvePinnedServerKey: (
+    pinned: NonNullable<PromptTurn["pinnedToolCall"]>
+  ) => string | undefined;
+  prepared: PrepareChatV2Result | null;
+  llmModel: ReturnType<typeof createLlmModel> | null;
+  test: {
+    model: string;
+    provider: string;
+  };
+  runStartedAt: number;
+  runIndex: number;
+  iterationId: string | undefined;
+  suiteId: string | undefined;
+  runId: string | null;
+  testCaseId: string | undefined;
+  abortSignal: AbortSignal | undefined;
+  /**
+   * This turn's slice of the run's frozen budget
+   * (`ResolvedExecutionBudgets.turnTimeoutMs`). Bounds ONE model call; the
+   * iteration's own clock still bounds the sum of them.
+   */
+  turnTimeoutMs: number;
+  /**
+   * The run's frozen `turnRetries`, handed to the AI SDK as its own
+   * transient-failure retry budget for this turn's model call.
+   */
+  turnRetries: number;
+  toolChoice: EvalToolChoice | undefined;
+  /**
+   * Provider options the case's effective settings resolve to on this direct
+   * call (a saved selection's reasoning effort). Absent ⇒ none.
+   */
+  providerOptions?: ProviderOptions;
+  /**
+   * How this turn's model call ended, once it has: `ok`, `error` (with a
+   * machine code), or `aborted` (cancelled, not by the turn clock). Fired
+   * once per model turn, never for a pinned turn. The runner uses it for the
+   * local-runtime usage writeback and its execution record.
+   */
+  onModelCallSettled?: (event: LocalModelCallSettled) => void;
+  /** Re-admit the effective toolset and transcript before a local org call. */
+  beforeModelCall?: (workload: {
+    tools: ToolSet;
+    messages: ModelMessage[];
+  }) => Promise<ReturnType<typeof createLlmModel>>;
+  toolPolicyGate?: ToolPolicyGate | null;
+  extractToolCalls: (params: {
+    steps?: ReadonlyArray<any>;
+    messages: ModelMessage[];
+  }) => ToolCall[];
+  sinks?: LocalEvalTurnSinks;
+};
+
+async function consumeDirectChatTurnViaFullStream(
+  handle: RunDirectChatTurnHandle,
+  sinks: LocalEvalTurnSinks | undefined
+) {
+  try {
+    const maybeFullStream = handle.result.fullStream;
+    if (
+      maybeFullStream &&
+      typeof maybeFullStream === "object" &&
+      Symbol.asyncIterator in maybeFullStream
+    ) {
+      await consumeFullStreamAsEvalEvents(maybeFullStream, {
+        emit: sinks?.emit ?? (() => {}),
+        getStepIndex: sinks?.getStepIndex ?? (() => 0),
+      });
+    } else {
+      await handle.result.consumeStream();
+    }
+    const response = await handle.result.response;
+    const steps = await handle.result.steps;
+    const totalUsage = await handle.result.totalUsage;
+    const finishReason = await handle.result.finishReason;
+    const messages = Array.isArray(response?.messages)
+      ? (response.messages as ModelMessage[])
+      : [];
+    const upstreamModel =
+      typeof (response as { modelId?: unknown } | undefined)?.modelId ===
+      "string"
+        ? (response as { modelId: string }).modelId
+        : undefined;
+    return {
+      messages,
+      steps,
+      totalUsage,
+      finishReason,
+      upstreamModel,
+      spans: handle.traceContext.recordedSpans,
+      aborted: handle.isAborted(),
+    };
+  } finally {
+    handle.cleanup();
+  }
+}
+
+export async function driveLocalEvalTurn(
+  params: DriveLocalEvalTurnParams
+): Promise<LocalEvalTurnOutcome> {
+  const {
+    promptIndex,
+    promptTurn,
+    acc,
+    browser,
+    mcpClientManager,
+    prepared,
+    llmModel,
+    test,
+    runStartedAt,
+    runIndex,
+    iterationId,
+    suiteId,
+    runId,
+    testCaseId,
+    abortSignal,
+    turnTimeoutMs,
+    turnRetries,
+    toolChoice,
+    toolPolicyGate,
+    sinks,
+    providerOptions,
+    onModelCallSettled,
+  } = params;
+
+  const localIsAborted = () => abortSignal?.aborted === true;
+  if (localIsAborted()) return { kind: "cancelled" };
+
+  acc.activePromptIndex = promptIndex;
+  browser.setActivePromptIndex(promptIndex);
+  browser.setActiveWidgetChecks(promptTurn.widgetChecks ?? []);
+
+  if (isPinnedTurn(promptTurn) && promptTurn.pinnedToolCall) {
+    await browser.dismissCarriedWidget();
+    const pinned = promptTurn.pinnedToolCall;
+    const serverKey = params.resolvePinnedServerKey(pinned);
+    const pinnedResult = await runPinnedTurn({
+      pinned,
+      resolvedServerKey: serverKey,
+      mcpClientManager,
+      browser,
+      promptIndex,
+      toolPolicyGate,
+    });
+    const accounting = buildPinnedTurnAccounting(pinned, pinnedResult);
+    acc.conversationMessages.push(
+      accounting.userMessage,
+      accounting.assistantMessage
+    );
+    appendToolCallsForPrompt(
+      acc.toolsCalledByPrompt,
+      promptIndex,
+      accounting.toolCalls
+    );
+    acc.assistantMessageByPrompt[promptIndex] = accounting.summary;
+    acc.toolErrorsByPrompt[promptIndex] = accounting.toolErrors;
+    acc.pinnedToolErrors.push(...accounting.toolErrors);
+    if (accounting.iterationError && !acc.iterationError) {
+      acc.iterationError = accounting.iterationError;
+      acc.pinnedSetupFailure = true;
+    }
+    sinks?.onPinnedTurn?.({
+      prompt: accounting.prompt,
+      messages: acc.conversationMessages,
+      spans: acc.capturedSpans,
+      usage: acc.accumulatedUsage,
+      ...(pinnedResult.toolCall ? { toolCall: pinnedResult.toolCall } : {}),
+      ...(pinnedResult.toolCallId
+        ? { toolCallId: pinnedResult.toolCallId }
+        : {}),
+      ...("toolResult" in pinnedResult
+        ? { toolResult: pinnedResult.toolResult }
+        : {}),
+      ...(pinnedResult.toolResultIsError
+        ? { toolResultIsError: pinnedResult.toolResultIsError }
+        : {}),
+      ...(pinnedResult.toolError ? { toolError: pinnedResult.toolError } : {}),
+      ...(pinnedResult.iterationError
+        ? { iterationError: pinnedResult.iterationError }
+        : {}),
+    });
+    return { kind: "completed" };
+  }
+
+  if (!llmModel || !prepared) {
+    throw new Error(
+      "eval: model-driven turn reached without model setup (caseNeedsModel invariant violated)"
+    );
+  }
+
+  await browser.dismissCarriedWidget();
+  acc.conversationMessages.push({ role: "user", content: promptTurn.prompt });
+  acc.activePromptInputMessages = [...acc.conversationMessages];
+  acc.activePartialResponseMessages = [];
+  acc.activeCompletedStepCount = 0;
+  // Snapshot the iteration-cumulative usage at turn start so streaming mid-run
+  // snapshots can show this turn's running total without mutating
+  // `acc.accumulatedUsage` (which the batch path reconciles post-consume).
+  const accumulatedUsageBeforeTurn = {
+    inputTokens: acc.accumulatedUsage.inputTokens ?? 0,
+    outputTokens: acc.accumulatedUsage.outputTokens ?? 0,
+    totalTokens: acc.accumulatedUsage.totalTokens ?? 0,
+  };
+  sinks?.onTurnStart?.();
+
+  const promptInputLength = acc.activePromptInputMessages.length;
+  const mergedTools = {
+    ...prepared.allTools,
+    ...browser.computerWidgetTools,
+  } as ToolSet;
+  const toolsForTurn = toolPolicyGate
+    ? toolPolicyGate.wrap(mergedTools)
+    : mergedTools;
+  const admittedModel = await params.beforeModelCall?.({
+    tools: toolsForTurn,
+    messages: acc.activePromptInputMessages,
+  });
+  // This turn's own clock, nested under the iteration's. `withDeadline`
+  // COMPOSES rather than replaces: the engine still sees a single signal, and
+  // it fires on whichever bound trips first. Without it, one wedged provider
+  // call holds the iteration until the ITERATION's budget expires — the whole
+  // remaining allowance spent on a turn that was never coming back.
+  const turnDeadline = withDeadline(abortSignal, turnTimeoutMs, "turn");
+  const handle = runDirectChatTurn({
+    llmModel: admittedModel ?? llmModel,
+    modelId: test.model,
+    messageHistory: acc.activePromptInputMessages,
+    traceStartedAt: runStartedAt,
+    // PR2 (flagged): append recorded model-visible widget interactions as a
+    // per-turn system-prompt addendum so the model reasons over them — reusing
+    // the same server-side mechanism Playground uses for ui/update-model-context
+    // (system prompt only: no transcript/matcher/persistence impact).
+    systemPrompt: EVAL_WIDGET_MODEL_CONTEXT
+      ? withWidgetContextSystemPrompt(
+          prepared.enhancedSystemPrompt ?? "",
+          browser.browserInteractionSteps
+        )
+      : prepared.enhancedSystemPrompt ?? "",
+    ...(prepared.resolvedTemperature == null
+      ? {}
+      : { temperature: prepared.resolvedTemperature }),
+    tools: toolsForTurn,
+    progressivePlan: prepared.progressivePlan,
+    discoveryState: prepared.discoveryState,
+    ...(browser.prepareAdvertisedTools
+      ? { prepareAdvertisedTools: browser.prepareAdvertisedTools }
+      : {}),
+    abortSignal: turnDeadline.signal,
+    // The SDK retries the model call itself; every attempt shares the signal
+    // above, so the turn deadline still bounds the whole sequence rather than
+    // each attempt.
+    maxRetries: turnRetries,
+    ...(providerOptions ? { providerOptions } : {}),
+    ...(toolChoice
+      ? { toolChoice: toolChoice as ToolChoice<Record<string, AiTool>> }
+      : {}),
+    experimentalTelemetry: {
+      isEnabled: true,
+      functionId: "evals.streamText",
+      recordInputs: false,
+      recordOutputs: false,
+      metadata: {
+        source: "evals",
+        ...(suiteId ? { suiteId } : {}),
+        ...(runId ? { runId } : {}),
+        ...(testCaseId ? { testCaseId } : {}),
+        ...(iterationId ? { iterationId } : {}),
+        iterationNumber: runIndex + 1,
+        provider: test.provider,
+        model: test.model,
+        promptIndex,
+      },
+    },
+    traceEvents: {
+      onRequestPayload: (request) => {
+        (acc.requestPayloads ??= []).push({
+          turnId: request.turnId,
+          promptIndex,
+          stepIndex: request.stepIndex,
+          payload: cloneTraceValue(buildResolvedModelRequestPayload(request)),
+        });
+      },
+      onStepSnapshot: ({ traceHistory, traceTurn }) => {
+        acc.activeCompletedStepCount += 1;
+        acc.activePartialResponseMessages = traceHistory.slice(
+          promptInputLength
+        ) as ModelMessage[];
+        sinks?.onStepSnapshot?.({
+          stepIndex: acc.activeCompletedStepCount - 1,
+          messages: [
+            ...acc.activePromptInputMessages,
+            ...acc.activePartialResponseMessages,
+          ],
+          spans: [...acc.capturedSpans, ...traceTurn.turnSpans],
+          usage: {
+            inputTokens:
+              accumulatedUsageBeforeTurn.inputTokens +
+              (traceTurn.turnUsage?.inputTokens ?? 0),
+            outputTokens:
+              accumulatedUsageBeforeTurn.outputTokens +
+              (traceTurn.turnUsage?.outputTokens ?? 0),
+            totalTokens:
+              accumulatedUsageBeforeTurn.totalTokens +
+              (traceTurn.turnUsage?.totalTokens ?? 0),
+          },
+        });
+      },
+      onToolResultChunk: (chunk) => browser.handleDirectToolResultChunk(chunk),
+    },
+  });
+  acc.activeTraceCtx = handle.traceContext;
+
+  // Disposed through the promise rather than after it, so a throw out of the
+  // stream does not leave the clock armed. The two readers below still work:
+  // `firedClock` and `elapsedMs` close over their own state, and `dispose`
+  // only stops the timer.
+  let headless: Awaited<ReturnType<typeof consumeDirectChatTurnViaFullStream>>;
+  try {
+    headless = await consumeDirectChatTurnViaFullStream(handle, sinks).finally(
+      () => turnDeadline.dispose()
+    );
+  } catch (error) {
+    onModelCallSettled?.({
+      outcome: localIsAborted() ? "aborted" : "error",
+      ...(localIsAborted() ? {} : { code: "provider_error" }),
+      at: Date.now(),
+    });
+    throw error;
+  }
+  const turnTimedOut = turnDeadline.firedClock() === "turn";
+  const turnElapsedMs = turnDeadline.elapsedMs();
+  // How the model call ended, reported once (see `onModelCallSettled`).
+  const settle = (outcome: "ok" | "error" | "aborted", code?: string) =>
+    onModelCallSettled?.({
+      outcome,
+      ...(code ? { code } : {}),
+      ...(headless.totalUsage
+        ? {
+            usage: {
+              inputTokens: headless.totalUsage.inputTokens,
+              outputTokens: headless.totalUsage.outputTokens,
+              totalTokens: headless.totalUsage.totalTokens,
+            },
+          }
+        : {}),
+      ...(typeof headless.finishReason === "string"
+        ? { finishReason: headless.finishReason }
+        : {}),
+      ...(headless.upstreamModel
+        ? { upstreamModel: headless.upstreamModel }
+        : {}),
+      at: Date.now(),
+    });
+
+  // Checked BEFORE the cancellation branch below, and that order is the whole
+  // point: the turn clock aborts the same composed signal a user cancel does,
+  // so `headless.aborted` cannot tell them apart. `firedClock()` reports only
+  // THIS handle's own clock, which is exactly the discriminator.
+  //
+  // A turn that ran out of clock is a FAILED turn, not a cancelled iteration.
+  // The remaining prompt turns still deserve to run and the verdict still
+  // deserves to be computed — it just computes to a failure, because
+  // `acc.iterationError` is set. Returning `cancelled` here would throw the
+  // iteration away and report nothing, which is how a budget cut ends up
+  // looking like a run that never happened.
+  if (turnTimedOut) {
+    const partial =
+      headless.messages.length > 0
+        ? headless.messages
+        : acc.activePartialResponseMessages;
+    acc.timeout = {
+      clock: "turn",
+      budgetMs: turnTimeoutMs,
+      elapsedMs: turnElapsedMs,
+    };
+    acc.iterationError = `Turn exceeded its ${turnTimeoutMs}ms budget (elapsed ${turnElapsedMs}ms)`;
+    settle("error", "turn_timeout");
+    // The provider held the connection open past the bound. No other layer
+    // reaches this branch.
+    acc.stepErrorSource = "model";
+    logger.error(
+      `[evals] local-BYOK turn exceeded its ${turnTimeoutMs}ms budget; treating as cycle failure`
+    );
+    acc.capturedSpans.push(...acc.activeTraceCtx.recordedSpans);
+    // Whatever completed before the bound tripped is kept: a timed-out turn
+    // still made tool calls worth seeing, and dropping them would leave a
+    // trace that says only "nothing happened".
+    appendToolCallsForPrompt(
+      acc.toolsCalledByPrompt,
+      promptIndex,
+      params.extractToolCalls({ steps: headless.steps, messages: partial })
+    );
+    acc.assistantMessageByPrompt[promptIndex] =
+      extractFinalAssistantMessage(partial);
+    acc.toolErrorsByPrompt[promptIndex] = extractToolErrors({
+      spans: acc.activeTraceCtx.recordedSpans,
+      messages: partial as Array<{ role: string; content: unknown }>,
+    });
+    acc.conversationMessages = [...acc.activePromptInputMessages, ...partial];
+    sinks?.onTurnFailure?.({
+      messages: acc.conversationMessages,
+      spans: acc.capturedSpans,
+      usage: acc.accumulatedUsage,
+      ...(acc.activeCompletedStepCount > 0
+        ? { stepIndex: acc.activeCompletedStepCount - 1 }
+        : {}),
+      iterationError: acc.iterationError,
+    });
+    return { kind: "failed", timeout: acc.timeout };
+  }
+
+  if (headless.aborted || localIsAborted()) {
+    settle("aborted");
+    logger.debug(
+      "[evals] local-BYOK iteration aborted mid-turn; skipping record"
+    );
+    return { kind: "cancelled" };
+  }
+
+  const promptResponseMessages =
+    headless.messages.length > 0
+      ? headless.messages
+      : acc.activePartialResponseMessages;
+
+  if (acc.activeTraceCtx.recordedSpans.length > 0) {
+    patchAiSdkRecordedSpansMessageRangesFromSteps(
+      acc.activeTraceCtx.recordedSpans,
+      acc.activePromptInputMessages.length,
+      headless.steps,
+      promptIndex
+    );
+  }
+
+  acc.accumulatedUsage.inputTokens =
+    (acc.accumulatedUsage.inputTokens ?? 0) +
+    (headless.totalUsage?.inputTokens ?? 0);
+  acc.accumulatedUsage.outputTokens =
+    (acc.accumulatedUsage.outputTokens ?? 0) +
+    (headless.totalUsage?.outputTokens ?? 0);
+  acc.accumulatedUsage.totalTokens =
+    (acc.accumulatedUsage.totalTokens ?? 0) +
+    (headless.totalUsage?.totalTokens ?? 0);
+
+  if (promptResponseMessages.length === 0) {
+    acc.iterationError =
+      "Stream returned no content (local-BYOK driver failed)";
+    settle("error", "empty_response");
+    // The model stream itself returned nothing. Unambiguously the model-call
+    // layer — there is no other layer this branch can be reached from.
+    acc.stepErrorSource = "model";
+    logger.error(
+      "[evals] streamText returned no new messages this turn; treating as cycle failure"
+    );
+    acc.capturedSpans.push(...acc.activeTraceCtx.recordedSpans);
+    appendToolCallsForPrompt(acc.toolsCalledByPrompt, promptIndex, []);
+    acc.assistantMessageByPrompt[promptIndex] = extractFinalAssistantMessage(
+      promptResponseMessages
+    );
+    acc.toolErrorsByPrompt[promptIndex] = extractToolErrors({
+      spans: acc.activeTraceCtx.recordedSpans,
+      messages: promptResponseMessages as Array<{
+        role: string;
+        content: unknown;
+      }>,
+    });
+    sinks?.onTurnFailure?.({
+      messages: acc.activePromptInputMessages,
+      spans: acc.capturedSpans,
+      usage: acc.accumulatedUsage,
+      ...(acc.activeCompletedStepCount > 0
+        ? { stepIndex: acc.activeCompletedStepCount - 1 }
+        : {}),
+      iterationError: acc.iterationError ?? "",
+    });
+    return { kind: "completed" };
+  }
+
+  const stepErrorSpan = acc.activeTraceCtx.recordedSpans.find(
+    (span) =>
+      span.status === "error" &&
+      span.category !== "tool" &&
+      !(span as { toolCallId?: string }).toolCallId
+  );
+  if (stepErrorSpan) {
+    acc.iterationError = `Local-BYOK step failed mid-turn: ${stepErrorSpan.name}`;
+    settle("error", "provider_error");
+    acc.stepErrorSource = modelLayerForErrorSpan(stepErrorSpan);
+    logger.error(
+      `[evals] streamText recorded non-tool error span; treating as cycle failure (span=${stepErrorSpan.name} category=${stepErrorSpan.category})`
+    );
+    acc.capturedSpans.push(...acc.activeTraceCtx.recordedSpans);
+    appendToolCallsForPrompt(
+      acc.toolsCalledByPrompt,
+      promptIndex,
+      params.extractToolCalls({
+        steps: headless.steps,
+        messages: promptResponseMessages,
+      })
+    );
+    acc.assistantMessageByPrompt[promptIndex] = extractFinalAssistantMessage(
+      promptResponseMessages
+    );
+    acc.toolErrorsByPrompt[promptIndex] = extractToolErrors({
+      spans: acc.activeTraceCtx.recordedSpans,
+      messages: promptResponseMessages as Array<{
+        role: string;
+        content: unknown;
+      }>,
+    });
+    acc.conversationMessages = [
+      ...acc.activePromptInputMessages,
+      ...promptResponseMessages,
+    ];
+    sinks?.onTurnFailure?.({
+      messages: acc.conversationMessages,
+      spans: acc.capturedSpans,
+      usage: acc.accumulatedUsage,
+      ...(acc.activeCompletedStepCount > 0
+        ? { stepIndex: acc.activeCompletedStepCount - 1 }
+        : {}),
+      iterationError: acc.iterationError ?? "",
+    });
+    return { kind: "completed" };
+  }
+
+  settle("ok");
+  const promptToolsCalled = params.extractToolCalls({
+    steps: headless.steps,
+    messages: promptResponseMessages,
+  });
+  appendToolCallsForPrompt(
+    acc.toolsCalledByPrompt,
+    promptIndex,
+    promptToolsCalled
+  );
+  acc.assistantMessageByPrompt[promptIndex] = extractFinalAssistantMessage(
+    promptResponseMessages
+  );
+  acc.toolErrorsByPrompt[promptIndex] = extractToolErrors({
+    spans: acc.activeTraceCtx.recordedSpans,
+    messages: promptResponseMessages as Array<{
+      role: string;
+      content: unknown;
+    }>,
+  });
+  acc.capturedSpans.push(...acc.activeTraceCtx.recordedSpans);
+  acc.conversationMessages = [
+    ...acc.activePromptInputMessages,
+    ...promptResponseMessages,
+  ];
+  sinks?.onTurnSuccess?.({
+    messages: acc.conversationMessages,
+    spans: acc.capturedSpans,
+    usage: acc.accumulatedUsage,
+  });
+
+  acc.activeTraceCtx = null;
+  acc.activePromptInputMessages = [];
+  acc.activePartialResponseMessages = [];
+  acc.activeCompletedStepCount = 0;
+
+  return { kind: "completed" };
+}

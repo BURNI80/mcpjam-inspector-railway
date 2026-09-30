@@ -1,0 +1,456 @@
+import {
+  CircleAlert,
+  ChevronDown,
+  ChevronRight,
+  RefreshCw,
+  ShieldAlert,
+  SlidersHorizontal,
+} from "lucide-react";
+import { Button } from "@mcpjam/design-system/button";
+import { useState } from "react";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@mcpjam/design-system/collapsible";
+import { JsonEditor } from "@/components/ui/json-editor";
+import {
+  isMCPJamModelLimitError,
+  isSpendBudgetReachedCode,
+  SPEND_BUDGET_REACHED_MESSAGE,
+} from "@/lib/mcpjam-limit";
+import {
+  describeProviderNotAllowlisted,
+  isProviderNotAllowlistedCode,
+} from "@/lib/provider-not-allowlisted";
+import { cn } from "@/lib/utils";
+import { useModelPickerIntentStore } from "@/stores/model-picker-intent-store";
+
+interface ErrorBoxProps {
+  message: string;
+  errorDetails?: string;
+  onResetChat?: () => void;
+  // New props for enhanced error display
+  code?: string;
+  statusCode?: number;
+  isRetryable?: boolean;
+  isMCPJamPlatformError?: boolean;
+  onRetry?: () => void;
+  canTopUp?: boolean;
+  onTopUp?: () => void;
+  creditActionLabel?: string;
+  /** When top-up is the relevant fix but the current user lacks permission
+   * to buy credits, render an "ask org admin" hint instead of the button. */
+  askAdminToTopUp?: boolean;
+  /** When true, render the locked-account banner instead of any other state. */
+  walletLocked?: boolean;
+  /** Sub-classification of a rate-limit error. `"concurrency"` triggers the
+   * transient retry banner. */
+  limitKind?: "total" | "concurrency";
+  /** Raw retry hint in milliseconds. Used by the concurrency banner to render
+   * second-level granularity ("Retry in N seconds"). */
+  retryAfterMs?: number;
+  /**
+   * Open the client's MCP Protocol settings.
+   *
+   * Rendered INSTEAD of a retry, never beside it: this banner's failure is a
+   * pinned protocol version the server doesn't offer, and resending the same
+   * turn fails identically until the setting changes. A named pair rather than
+   * a generic action slot, matching how every other affordance here is passed
+   * — the caller owns navigation, this component owns the button.
+   */
+  onChangeProtocolVersion?: () => void;
+}
+
+const parseErrorDetails = (details: string | undefined) => {
+  if (!details) return null;
+  try {
+    const parsed = JSON.parse(details);
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+export function ErrorBox({
+  message,
+  errorDetails,
+  onResetChat,
+  code,
+  statusCode: _statusCode,
+  isRetryable,
+  isMCPJamPlatformError,
+  onRetry,
+  canTopUp,
+  onTopUp,
+  creditActionLabel = "Buy credits to keep chatting",
+  askAdminToTopUp,
+  walletLocked,
+  limitKind,
+  retryAfterMs,
+  onChangeProtocolVersion,
+}: ErrorBoxProps) {
+  const [isErrorDetailsOpen, setIsErrorDetailsOpen] = useState(false);
+  // Only a mounted `ModelSelector` acts on the providers-tab nonce. Hosted
+  // study chats run in minimal mode without one, so there the button would
+  // do nothing.
+  const canOpenProvidersTab = useModelPickerIntentStore(
+    (state) => state.providersTabResponderCount > 0,
+  );
+  const errorDetailsJson = parseErrorDetails(errorDetails);
+
+  const refusalCode = code ?? errorDetailsJson?.code;
+  if (refusalCode === "account_suspended") {
+    return <div role="alert" className="rounded border border-warning bg-warning/20 p-4 text-warning-foreground">
+      Account suspended. <a className="underline" href="mailto:founders@mcpjam.com">Contact support</a> to request a review.
+    </div>;
+  }
+  if (refusalCode === "platform_free_budget_exhausted") {
+    const resetAt = errorDetailsJson?.resetAt;
+    return <div role="alert" className="flex flex-col gap-2 rounded border border-warning bg-warning/20 p-4 text-warning-foreground">
+      <p>MCPJam&apos;s shared free allowance is currently unavailable.</p>
+      {typeof resetAt === "number" && Number.isFinite(resetAt) && <p>Resets {new Date(resetAt).toLocaleString()}.</p>}
+      <div className="flex gap-2">
+        <Button variant="outline" onClick={() => useModelPickerIntentStore.getState().requestOpenProvidersTab()}>Use your own API key</Button>
+        {canTopUp && onTopUp && <Button variant="outline" onClick={onTopUp}>{creditActionLabel}</Button>}
+      </div>
+    </div>;
+  }
+
+  if (isProviderNotAllowlistedCode(refusalCode)) {
+    // The hosted gateway does not serve this model's provider. Neither a
+    // retry nor a new API key changes that, so this banner offers neither:
+    // only a different model, or the user's own key for that provider.
+    const described = describeProviderNotAllowlisted(message);
+    return (
+      <div
+        role="alert"
+        data-testid="chat-error-provider-not-allowlisted"
+        className="flex flex-col gap-3 rounded border border-warning bg-warning/20 p-4 text-warning-foreground"
+      >
+        <div className="flex items-start gap-3">
+          <CircleAlert className="h-6 w-6 flex-shrink-0 text-warning" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium leading-6">{described.title}</p>
+            <p className="text-sm leading-6 opacity-90">{described.oneLine}</p>
+            <ul className="mt-1 list-disc pl-5 text-xs leading-5 opacity-90">
+              {described.nextSteps.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ul>
+          </div>
+          <div className="ml-auto flex flex-shrink-0 flex-wrap items-center gap-2">
+            {canOpenProvidersTab ? (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() =>
+                  useModelPickerIntentStore.getState().requestOpenProvidersTab()
+                }
+              >
+                Use your own provider key
+              </Button>
+            ) : null}
+            {onResetChat ? (
+              <Button type="button" variant="outline" onClick={onResetChat}>
+                Reset chat
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Three priority states for the rate-limit-adjacent variants. Order
+  // matters: walletLocked is the highest-priority terminal state (no
+  // self-serve recovery), then the concurrency throttle (transient,
+  // user-driven retry), then everything else falls back to the existing
+  // model-limit / generic error rendering.
+  const isWalletLocked = walletLocked === true;
+  // The org's admin-set spend budget refused. Terminal like walletLocked
+  // (no retry, no top-up) but with a different fix, so it gets its own
+  // priority slot rather than borrowing the wallet's copy.
+  const isSpendBudgetReached = !isWalletLocked && isSpendBudgetReachedCode(code);
+  const isConcurrencyThrottle =
+    !isWalletLocked &&
+    !isSpendBudgetReached &&
+    code === "user_rate_limit" &&
+    limitKind === "concurrency";
+
+  const isMCPJamModelLimit =
+    !isWalletLocked &&
+    !isSpendBudgetReached &&
+    !isConcurrencyThrottle &&
+    isMCPJamModelLimitError({
+      code,
+      details: errorDetails,
+      message,
+      limitKind,
+    });
+
+  // Guests and signed-in users alike see the global MCPJamLimitDialog for
+  // daily-limit errors; the inline banner stays out of their way. The
+  // concurrency carve-out is already handled above via its dedicated
+  // transient banner.
+  if (isMCPJamModelLimit) {
+    return null;
+  }
+
+  // Platform and quota errors use warning styling to indicate recoverable state.
+  const isPlatformError = isMCPJamPlatformError === true || isMCPJamModelLimit;
+
+  const containerClasses = isPlatformError
+    ? "border-warning bg-warning/20 text-warning-foreground"
+    : "border-destructive bg-destructive/20 text-destructive";
+
+  const iconClasses = isPlatformError ? "text-warning" : "text-destructive";
+
+  const triggerClasses = isPlatformError
+    ? "text-warning hover:text-warning/80"
+    : "text-destructive hover:text-destructive/80";
+
+  const borderClasses = isPlatformError
+    ? "border-warning/30"
+    : "border-destructive/30";
+
+  const preClasses = isPlatformError
+    ? "text-warning-foreground"
+    : "text-destructive";
+
+  const isAuthError = code === "auth_error";
+
+  const errorLabel = isMCPJamModelLimit
+    ? "Free daily credits used up"
+    : isPlatformError
+    ? "MCPJam platform issue"
+    : "An error occurred";
+  const errorPrefix = isMCPJamModelLimit ? `${errorLabel}.` : `${errorLabel}:`;
+
+  if (isWalletLocked) {
+    // Server has paused this account from spending or topping up. The user
+    // cannot self-serve out of this; only support can clear it. Render a
+    // dedicated locked-state banner with a contact link — no top-up, no
+    // retry, just a way to reach out.
+    return (
+      <div className="flex flex-col gap-3 border rounded p-4 border-warning bg-warning/20 text-warning-foreground">
+        <div className="flex items-start gap-3">
+          <ShieldAlert className="h-6 w-6 flex-shrink-0 text-warning" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium leading-6">
+              Account under review
+            </p>
+            <p className="text-sm leading-6 opacity-90">
+              We&apos;ve paused this account while a recent payment is reviewed.{" "}
+              <a
+                className="underline hover:no-underline"
+                href="mailto:founders@mcpjam.com?subject=MCPJam%20Account%20Review"
+              >
+                Reach out to support
+              </a>{" "}
+              to get back in.
+            </p>
+          </div>
+          {onResetChat ? (
+            <div className="ml-auto flex flex-shrink-0 flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" onClick={onResetChat}>
+                Reset chat
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  if (isSpendBudgetReached) {
+    // An owner or admin capped what this organization may spend per billing
+    // window, and the window is spent. Buying credits does not clear it and
+    // retrying sends the same request into the same cap, so this banner
+    // offers neither — it names the one thing that does work.
+    return (
+      <div className="flex flex-col gap-3 border rounded p-4 border-warning bg-warning/20 text-warning-foreground">
+        <div className="flex items-start gap-3">
+          <ShieldAlert className="h-6 w-6 flex-shrink-0 text-warning" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium leading-6">Spend budget reached</p>
+            <p className="text-sm leading-6 opacity-90">
+              {SPEND_BUDGET_REACHED_MESSAGE}
+            </p>
+          </div>
+          {onResetChat ? (
+            <div className="ml-auto flex flex-shrink-0 flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" onClick={onResetChat}>
+                Reset chat
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  if (isConcurrencyThrottle) {
+    // Another credit-funded chat is still in flight server-side. Short
+    // wait, then retry — render a transient-feeling banner with a retry
+    // button. Top-up doesn't help here; just wait it out.
+    const retrySeconds = Math.max(1, Math.ceil((retryAfterMs ?? 0) / 1000));
+    return (
+      <div className="flex flex-col gap-2 border rounded p-3 border-border bg-muted/40 text-foreground">
+        <div className="flex items-start gap-3">
+          <CircleAlert className="h-4 w-4 flex-shrink-0 text-muted-foreground mt-0.5" />
+          <div className="min-w-0 flex-1">
+            <p className="text-xs leading-5">
+              Another credit-funded chat is finishing. Retry in {retrySeconds}{" "}
+              second{retrySeconds === 1 ? "" : "s"}.
+            </p>
+          </div>
+          <div className="ml-auto flex flex-shrink-0 flex-wrap items-center gap-2">
+            {onRetry && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={onRetry}
+                className="gap-1.5"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Retry
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn("flex flex-col gap-3 border rounded p-4", containerClasses)}
+    >
+      <div className="flex items-start gap-3">
+        <CircleAlert className={cn("h-6 w-6 flex-shrink-0", iconClasses)} />
+        <div className="min-w-0 flex-1">
+          {isMCPJamModelLimit && !isAuthError ? (
+            <>
+              <p className="text-sm font-medium leading-6">{errorLabel}</p>
+              <p className="text-sm leading-6 opacity-90">{message}</p>
+            </>
+          ) : (
+            // Bounded and scrollable rather than clamped: the formatter
+            // summarizes opaque payloads before they reach here, but this is
+            // the last line of defense — an unforeseen multi-kilobyte message
+            // must cost a scrollbar, never the whole screen.
+            <p className="text-sm leading-6 max-h-40 overflow-y-auto break-words">
+              {isAuthError ? (
+                message
+              ) : (
+                <>
+                  <span className="font-medium">{errorPrefix}</span> {message}
+                </>
+              )}
+            </p>
+          )}
+          {isPlatformError && !isMCPJamModelLimit && (
+            <p className="text-xs opacity-75 mt-0.5">
+              This is a temporary issue on our end.
+            </p>
+          )}
+        </div>
+        <div className="ml-auto flex flex-shrink-0 flex-wrap items-center gap-2">
+          {canTopUp && onTopUp ? (
+            <Button type="button" onClick={onTopUp}>
+              {creditActionLabel}
+            </Button>
+          ) : askAdminToTopUp ? (
+            <span
+              className="self-center text-sm text-muted-foreground"
+              data-testid="chat-error-ask-admin"
+            >
+              Ask an owner or admin to add credits
+            </span>
+          ) : null}
+          {onChangeProtocolVersion ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onChangeProtocolVersion}
+              className="gap-1.5"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              Change protocol version
+            </Button>
+          ) : null}
+          {isRetryable && onRetry && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onRetry}
+              className="gap-1.5"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Retry
+            </Button>
+          )}
+          {onResetChat ? (
+            <Button type="button" variant="outline" onClick={onResetChat}>
+              Reset chat
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      {errorDetails && (
+        <Collapsible
+          open={isErrorDetailsOpen}
+          onOpenChange={setIsErrorDetailsOpen}
+        >
+          <CollapsibleTrigger
+            className={cn(
+              "flex items-center gap-1.5 text-xs transition-colors",
+              triggerClasses
+            )}
+          >
+            <span>More details</span>
+            {isErrorDetailsOpen ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+          </CollapsibleTrigger>
+          <CollapsibleContent className="mt-2">
+            <div
+              className={cn(
+                "rounded border bg-background/50 p-2",
+                borderClasses
+              )}
+            >
+              {errorDetailsJson ? (
+                <JsonEditor
+                  height="100%"
+                  value={errorDetailsJson}
+                  readOnly
+                  showToolbar={false}
+                />
+              ) : (
+                <pre
+                  className={cn(
+                    // Bounded: `errorDetails` carries raw upstream payloads
+                    // (a gateway's HTML error page, for one), and an
+                    // unbounded `<pre>` grows the card until it owns the
+                    // viewport.
+                    "text-xs font-mono whitespace-pre-wrap overflow-x-auto max-h-64 overflow-y-auto",
+                    preClasses
+                  )}
+                >
+                  {errorDetails}
+                </pre>
+              )}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </div>
+  );
+}

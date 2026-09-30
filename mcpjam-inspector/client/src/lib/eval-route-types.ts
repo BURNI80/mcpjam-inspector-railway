@@ -1,0 +1,63 @@
+export type SuiteOverviewView =
+  | "runs"
+  | "test-cases"
+  | "executions"
+  | "cross-host";
+
+/**
+ * Unified eval routes for both Evaluate modes: Suites (`/evals`) and Runs
+ * (`/evals/runs`). Runs-only shapes (`commit-detail`, `fromCommit`) are
+ * omitted from Suites URLs at runtime.
+ */
+
+export type EvalRoute =
+  | { type: "list" }
+  | { type: "create" }
+  /** Frontend-first preview of suites we'd generate from a connected server. */
+  | { type: "eval-server"; serverId: string }
+  | {
+      type: "suite-overview";
+      suiteId: string;
+      view?: SuiteOverviewView;
+      /** CI: commit sidebar when drilling from Group by commit */
+      fromCommit?: string;
+      /**
+       * Open the import review on one authoring job's drafts.
+       *
+       * How an API import hands its unfinished cases back to a person: the
+       * reply's `reviewUrl` carries this, and the drafts are read from the
+       * job rather than from whatever this browser happens to remember.
+       */
+      importJob?: string;
+    }
+  | {
+      type: "run-detail";
+      suiteId: string;
+      runId: string;
+      iteration?: string;
+      /** Drill into a test case's iterations within this run. */
+      testCaseId?: string;
+      insightsFocus?: boolean;
+      compareToRunId?: string;
+      comparison?: boolean;
+    }
+  | { type: "test-detail"; suiteId: string; testId: string; iteration?: string }
+  | {
+      type: "test-edit";
+      suiteId: string;
+      testId: string;
+      /** Deep-link: open compare run surface (same as View results) when iterations exist. */
+      openCompare?: boolean;
+      checks?: boolean;
+      /** Deep-link: prefer the clicked iteration/session when hydrating compare results. */
+      iteration?: string;
+      /** Return to the Eval my server first-run preview after editing. */
+      fromEvalServer?: string;
+    }
+  | { type: "suite-edit"; suiteId: string; fromCaseChecks?: string }
+  | {
+      type: "commit-detail";
+      commitSha: string;
+      suite?: string;
+      iteration?: string;
+    };

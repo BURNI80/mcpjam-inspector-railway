@@ -1,0 +1,211 @@
+import { useMemo } from "react";
+import { useQuery, useMutation } from "convex/react";
+import { useDbUserReady } from "@/contexts/db-user-ready-context";
+
+export type OrganizationMembershipRole = "owner" | "admin" | "member" | "guest";
+
+export interface Organization {
+  _id: string;
+  name: string;
+  description?: string;
+  imageUrl?: string;
+  logoUrl?: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  myRole?: string;
+  isCreator?: boolean;
+  /**
+   * The user was invited by email to a paid-seat org, but the membership stays
+   * unlinked until that seat is paid — so every org-scoped query for it is
+   * denied server-side. Surface it as unavailable; never make it the active
+   * org (opening one crashed the route: Sentry INSPECTOR-CLIENT-24C).
+   */
+  seatPending?: boolean;
+  /**
+   * A guest's own organization, created implicitly to give their projects a
+   * billing subject. It has no admins to configure anything, so org-admin
+   * surfaces (today: the spend budget) hide themselves for it.
+   */
+  isPersonal?: boolean;
+}
+
+export const ORGANIZATION_CREATION_LIMIT = 1;
+
+export interface OrganizationMember {
+  _id: string;
+  organizationId: string;
+  userId?: string;
+  email: string;
+  role?: OrganizationMembershipRole;
+  isOwner: boolean;
+  addedBy: string;
+  addedAt: number;
+  user: {
+    name: string;
+    email: string;
+    imageUrl: string;
+  } | null;
+}
+
+export function resolveOrganizationRole(
+  member: Pick<OrganizationMember, "role" | "isOwner">,
+  role?: OrganizationMembershipRole,
+): OrganizationMembershipRole {
+  if (role) return role;
+  if (member.role) return member.role;
+  return member.isOwner ? "owner" : "member";
+}
+
+/**
+ * Whether the current user may purchase shared credits for an org.
+ * Allowed for owners, admins, and the org creator. Mirrors the backend
+ * gate on `createCreditCheckoutSession` so the UI never offers a top-up
+ * the server would reject.
+ */
+export function canManageOrgCredits(
+  org: Pick<Organization, "myRole" | "isCreator"> | null | undefined,
+): boolean {
+  if (!org) return false;
+  return (
+    org.myRole === "owner" ||
+    org.myRole === "admin" ||
+    org.isCreator === true
+  );
+}
+
+/**
+ * Whether the current user may reach the organization settings screens, where
+ * provider keys are configured. `OrganizationsTab` route-gates on this same
+ * owner/admin pair, so offering the link to anyone else would only land them on
+ * the access-restricted screen. Deliberately narrower than
+ * `canManageOrgCredits`: `isCreator` alone does not open those screens.
+ */
+export function canManageOrgModels(
+  org: Pick<Organization, "myRole"> | null | undefined,
+): boolean {
+  if (!org) return false;
+  return org.myRole === "owner" || org.myRole === "admin";
+}
+
+/**
+ * Whether the current user may change the GitHub Checks integration.
+ *
+ * The backend's `authorizeWrite` requires org ADMIN for every write on that
+ * page, while the availability query it renders behind requires only MEMBER —
+ * on purpose, so a member is told the integration exists rather than that the
+ * org does not. Without this the page rendered every control live for someone
+ * the backend was always going to refuse, and the refusal arrived as a toast
+ * after the click. Same owner/admin pair as `canManageOrgModels`, kept separate
+ * because the two surfaces are free to diverge.
+ */
+export function canManageGithubChecks(
+  org: Pick<Organization, "myRole"> | null | undefined,
+): boolean {
+  if (!org) return false;
+  return org.myRole === "owner" || org.myRole === "admin";
+}
+
+export function useOrganizationQueries({
+  isAuthenticated,
+}: {
+  isAuthenticated: boolean;
+}) {
+  const isUserReady = useDbUserReady();
+  const canQuery = isAuthenticated && isUserReady;
+  const organizations = useQuery(
+    "organizations:getMyOrganizations" as any,
+    canQuery ? ({} as any) : "skip",
+  ) as Organization[] | undefined;
+
+  const isLoading =
+    isAuthenticated && (!isUserReady || organizations === undefined);
+
+  const sortedOrganizations = useMemo(() => {
+    if (!organizations) return [];
+    return [...organizations].sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [organizations]);
+
+  const createdCount = useMemo(
+    () =>
+      organizations
+        ? organizations.filter((org) => org.isCreator).length
+        : 0,
+    [organizations],
+  );
+
+  const canCreateOrganization =
+    !isAuthenticated ||
+    organizations === undefined ||
+    createdCount < ORGANIZATION_CREATION_LIMIT;
+
+  return {
+    sortedOrganizations,
+    isLoading,
+    createdCount,
+    canCreateOrganization,
+  };
+}
+
+export function useOrganizationMembers({
+  isAuthenticated,
+  organizationId,
+}: {
+  isAuthenticated: boolean;
+  organizationId: string | null;
+}) {
+  const enableQuery = isAuthenticated && !!organizationId;
+
+  const members = useQuery(
+    "organizations:getOrganizationMembers" as any,
+    enableQuery ? ({ organizationId } as any) : "skip",
+  ) as OrganizationMember[] | undefined;
+
+  const isLoading = enableQuery && members === undefined;
+
+  const activeMembers = useMemo(() => {
+    if (!members) return [];
+    return members.filter((m) => m.userId !== undefined);
+  }, [members]);
+
+  const pendingMembers = useMemo(() => {
+    if (!members) return [];
+    return members.filter((m) => m.userId === undefined);
+  }, [members]);
+
+  return {
+    activeMembers,
+    pendingMembers,
+    isLoading,
+  };
+}
+
+export function useOrganizationMutations() {
+  const createOrganization = useMutation(
+    "organizations:createOrganization" as any,
+  );
+  const updateOrganization = useMutation(
+    "organizations:updateOrganization" as any,
+  );
+  const deleteOrganization = useMutation(
+    "organizations:deleteOrganization" as any,
+  );
+  const addMember = useMutation("organizations:addMember" as any);
+  const changeMemberRole = useMutation("organizations:changeMemberRole" as any);
+  const transferOrganizationOwnership = useMutation(
+    "organizations:transferOrganizationOwnership" as any,
+  );
+  const removeMember = useMutation("organizations:removeMember" as any);
+
+  // Logo uploads go through the backend upload route (`useImageUpload`), not
+  // a Convex mutation.
+  return {
+    createOrganization,
+    updateOrganization,
+    deleteOrganization,
+    addMember,
+    changeMemberRole,
+    transferOrganizationOwnership,
+    removeMember,
+  };
+}

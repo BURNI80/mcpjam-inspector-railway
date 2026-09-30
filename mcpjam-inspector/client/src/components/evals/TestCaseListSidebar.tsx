@@ -1,0 +1,522 @@
+import { useMemo } from "react";
+import {
+  Plus,
+  MoreVertical,
+  Copy,
+  Trash2,
+  Sparkles,
+  RotateCw,
+  Loader2,
+  FileCode2,
+} from "lucide-react";
+import { track } from "@/lib/analytics";
+import { Button } from "@mcpjam/design-system/button";
+import { Checkbox } from "@mcpjam/design-system/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@mcpjam/design-system/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@mcpjam/design-system/tooltip";
+import { cn } from "@/lib/utils";
+import { buildEvaluatePath, navigateApp } from "@/lib/app-navigation";
+import type { EvalCase, EvalSuite } from "./types";
+import { getEffectiveSuiteServers, suiteHasRunnableServers } from "./helpers";
+import { ImportClaimBadge } from "./import-claim-badge";
+import { isModelFree } from "@/shared/steps";
+import {
+  getDefaultTestCaseModelValue,
+  getRunnableCaseModels,
+} from "./single-test-case-runner";
+import { QuickCaseRunCostEstimateHint } from "./run-cost-estimate-hint";
+import {
+  formatCaseTitleForSidebar,
+  getEvalCaseSidebarGroupKey,
+  groupEvalCasesForSidebar,
+} from "./case-name-utils";
+import {
+  RUN_INSIGHTS_SIDEBAR_LABEL,
+  RunInsightsNavRow,
+} from "./run-insights-sidebar";
+
+interface TestCaseListSidebarProps {
+  testCases: EvalCase[];
+  suiteId: string | null;
+  selectedTestId: string | null;
+  isLoading: boolean;
+  onCreateTestCase: () => void;
+  onDeleteTestCase: (testCaseId: string, testCaseTitle: string) => void;
+  onDuplicateTestCase: (testCaseId: string) => void;
+  onGenerateTests?: () => void;
+  /** Explore: copy agent brief with explore cases + embedded explore-to-sdk-evals skill */
+  onCopySdkEvalBrief?: () => void;
+  isCopyingSdkEvalBrief?: boolean;
+  deletingTestCaseId: string | null;
+  duplicatingTestCaseId: string | null;
+  isGeneratingTests?: boolean;
+  showingOverview: boolean;
+  noServerSelected?: boolean;
+  selectedServer?: string;
+  suite?: EvalSuite | null;
+  connectedServerNames?: Set<string>;
+  onRunTestCase?: (testCase: EvalCase) => void;
+  runningTestCaseId?: string | null;
+  onNavigateToOverview?: (suiteId: string) => void;
+  onSelectTestCase?: (suiteId: string, testCaseId: string) => void;
+  heading?: string;
+  emptyLabel?: string;
+  onToggleSelection?: (testCaseId: string, selected: boolean) => void;
+  selectedCaseIds?: string[];
+  showSelection?: boolean;
+  hideRunAction?: boolean;
+  /** Playground: hide suite-level Run Insights row (replaced by breadcrumbs + run-detail sidebar). */
+  hideRunInsightsRow?: boolean;
+  /** Overrides nav row label below the header (playground uses e.g. "Runs"). */
+  insightsNavLabel?: string;
+  /**
+   * Iteration override the Run control will send (quick-run state), forwarded to
+   * the credit estimate so it prices the run this button actually launches.
+   */
+  quickRunIterationOverride?: number;
+}
+
+export function TestCaseListSidebar({
+  testCases,
+  suiteId,
+  selectedTestId,
+  isLoading,
+  onCreateTestCase,
+  onDeleteTestCase,
+  onDuplicateTestCase,
+  onGenerateTests,
+  onCopySdkEvalBrief,
+  isCopyingSdkEvalBrief = false,
+  deletingTestCaseId,
+  duplicatingTestCaseId,
+  isGeneratingTests,
+  showingOverview,
+  noServerSelected,
+  selectedServer,
+  suite,
+  connectedServerNames,
+  onRunTestCase,
+  runningTestCaseId,
+  onNavigateToOverview,
+  onSelectTestCase,
+  heading = "Cases",
+  emptyLabel = "No cases yet",
+  onToggleSelection,
+  selectedCaseIds = [],
+  showSelection = false,
+  hideRunAction = false,
+  hideRunInsightsRow = false,
+  insightsNavLabel = RUN_INSIGHTS_SIDEBAR_LABEL,
+  quickRunIterationOverride,
+}: TestCaseListSidebarProps) {
+  const selectedTestCase = useMemo(
+    () => testCases.find((testCase) => testCase._id === selectedTestId) ?? null,
+    [selectedTestId, testCases],
+  );
+  // Effective list = legacy `environment.servers` merged with any host
+  // attachments' `resolvedServerNames`. Without the merge, sidebar Run
+  // buttons stay disabled on attachment-only suites.
+  // An environment suite's Run executes its environments, whose servers
+  // resolve server-side (the browser's connections do not gate it), and the
+  // per-model estimate does not describe that run, so none is shown.
+  const isEnvironmentSuite = (suite?.environmentIds?.length ?? 0) > 0;
+  const suiteServers = suite ? getEffectiveSuiteServers(suite) : [];
+  const hasConfiguredSuiteServers =
+    suite && isEnvironmentSuite
+      ? suiteHasRunnableServers(suite)
+      : suiteServers.length > 0;
+  const missingServers = isEnvironmentSuite
+    ? []
+    : suiteServers.filter(
+        (serverName) => !connectedServerNames?.has(serverName),
+      );
+  const selectedCaseIsProbe = selectedTestCase
+    ? isModelFree(selectedTestCase.steps)
+    : false;
+  // The models quick-run will REALLY execute. A case whose entries are all
+  // malformed has `models.length > 0` yet still toasts "Add a model first".
+  const runnableSelectedCaseModels = getRunnableCaseModels(selectedTestCase);
+  const canRunSelectedCase =
+    Boolean(selectedTestCase) &&
+    !selectedCaseIsProbe &&
+    Boolean(selectedTestCase?.models?.length) &&
+    Boolean(suite) &&
+    Boolean(onRunTestCase) &&
+    hasConfiguredSuiteServers;
+  const isRunningSelectedCase = runningTestCaseId === selectedTestCase?._id;
+  const handleNavigateToOverview = () => {
+    if (suiteId) {
+      if (onNavigateToOverview) {
+        onNavigateToOverview(suiteId);
+        return;
+      }
+      navigateApp(buildEvaluatePath({ type: "suite-overview", suiteId }));
+    }
+  };
+
+  const sidebarCaseGroups = useMemo(
+    () => groupEvalCasesForSidebar(testCases),
+    [testCases],
+  );
+
+  if (noServerSelected) {
+    return (
+      <>
+        <div className="p-4 border-b">
+          <h2 className="text-sm font-semibold">{heading}</h2>
+        </div>
+        <div className="flex-1 flex items-center justify-center p-4">
+          <p className="text-xs text-muted-foreground text-center">
+            Select a server to view cases.
+          </p>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {/* Header */}
+      <div className="p-4 border-b flex items-center justify-between">
+        <h2 className="text-sm font-semibold">
+          {heading}
+          {selectedServer && (
+            <span className="text-muted-foreground font-normal">
+              {" "}
+              [{selectedServer}]
+            </span>
+          )}
+        </h2>
+        <div className="flex items-center gap-1">
+          {!hideRunAction ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Run selected case"
+                    onClick={() => {
+                      if (selectedTestCase && onRunTestCase) {
+                        track("run_selected_case_button_clicked", {
+                          location: "test_case_list_sidebar",
+                          test_case_id: selectedTestCase._id,
+                        });
+                        onRunTestCase(selectedTestCase);
+                      }
+                    }}
+                    disabled={
+                      !canRunSelectedCase ||
+                      isRunningSelectedCase ||
+                      testCases.length === 0
+                    }
+                    className="h-7 w-7 p-0"
+                  >
+                    <RotateCw
+                      className={cn(
+                        "h-4 w-4",
+                        isRunningSelectedCase && "animate-spin",
+                      )}
+                    />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {testCases.length === 0
+                  ? "Add cases first"
+                  : !selectedTestCase
+                    ? "Select a case first"
+                    : selectedCaseIsProbe
+                      ? "Render checks run with the full suite or on its schedule"
+                      : !selectedTestCase.models?.length
+                        ? "Add a model first"
+                        : !hasConfiguredSuiteServers
+                          ? "Configure suite servers first"
+                          : missingServers.length > 0
+                            ? "Connect and run."
+                            : isRunningSelectedCase
+                              ? "Running..."
+                              : "Run selected case"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          {!hideRunAction ? (
+            // Suppressed wherever the estimate would not describe the run: an
+            // environment suite (it runs its environments, not these models),
+            // a case with no models, a render check, or no selection at all.
+            <QuickCaseRunCostEstimateHint
+              suiteId={suiteId}
+              caseId={selectedTestCase?._id ?? null}
+              models={runnableSelectedCaseModels}
+              {...(quickRunIterationOverride !== undefined
+                ? { runs: quickRunIterationOverride }
+                : {})}
+              suppressed={
+                !canRunSelectedCase ||
+                isEnvironmentSuite ||
+                runnableSelectedCaseModels.length === 0 ||
+                // Same index-0 default-model guard `handleRunTestCase` applies.
+                !getDefaultTestCaseModelValue(selectedTestCase)
+              }
+            />
+          ) : null}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if (onGenerateTests) {
+                      track("generate_tests_button_clicked", {
+                        location: "test_case_list_sidebar",
+                      });
+                      onGenerateTests();
+                    }
+                  }}
+                  disabled={isGeneratingTests || !onGenerateTests}
+                  className="h-7 w-7 p-0"
+                >
+                  <Sparkles
+                    className={cn(
+                      "h-4 w-4",
+                      isGeneratingTests && "animate-pulse",
+                    )}
+                  />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isGeneratingTests ? "Generating..." : "Generate cases with AI"}
+            </TooltipContent>
+          </Tooltip>
+          {onCopySdkEvalBrief ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Copy SDK eval agent brief"
+                    onClick={() => onCopySdkEvalBrief()}
+                    disabled={testCases.length === 0 || isCopyingSdkEvalBrief}
+                    className="h-7 w-7 p-0"
+                  >
+                    {isCopyingSdkEvalBrief ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <FileCode2 className="h-4 w-4" />
+                    )}
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {testCases.length === 0
+                  ? "Add at least one case first"
+                  : isCopyingSdkEvalBrief
+                    ? "Copying…"
+                    : "Copy markdown brief with all cases and the explore-to-sdk-evals skill—paste into your coding agent to generate @mcpjam/sdk tests"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  track("create_test_case_button_clicked", {
+                    location: "test_case_list_sidebar",
+                  });
+                  onCreateTestCase();
+                }}
+                className="h-7 w-7 p-0"
+              >
+                <Plus className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Create new case</TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+
+      {/* Run Insights — opens latest completed run detail with metrics + vs-prior narrative when available */}
+      {suiteId && !hideRunInsightsRow ? (
+        <RunInsightsNavRow
+          selected={showingOverview}
+          onClick={handleNavigateToOverview}
+          label={insightsNavLabel}
+        />
+      ) : null}
+
+      {/* Cases List */}
+      <div className="flex-1 overflow-y-auto">
+        {isLoading ? (
+          <div className="p-4 text-center text-xs text-muted-foreground">
+            Loading cases...
+          </div>
+        ) : isGeneratingTests ? (
+          <div className="p-4 flex flex-col items-center justify-center gap-2 text-xs text-muted-foreground">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            <span>Generating cases...</span>
+          </div>
+        ) : testCases.length === 0 ? (
+          <div className="p-4 text-center text-xs text-muted-foreground">
+            {emptyLabel}
+          </div>
+        ) : (
+          <div className="py-2">
+            {sidebarCaseGroups.map(({ groupKey, cases: groupCases }) => {
+              const showGroupLabel =
+                groupCases.length > 1 ||
+                groupCases.some(
+                  (c) =>
+                    getEvalCaseSidebarGroupKey(c.title || "") !==
+                    c.title?.trim(),
+                );
+
+              return (
+                <div key={groupKey} className="mb-1">
+                  {showGroupLabel ? (
+                    <div
+                      className="px-4 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground truncate"
+                      title={groupKey}
+                    >
+                      {groupKey}
+                    </div>
+                  ) : null}
+                  {groupCases.map((testCase) => {
+                    const isTestSelected = selectedTestId === testCase._id;
+                    const isTestDeleting = deletingTestCaseId === testCase._id;
+                    const isTestDuplicating =
+                      duplicatingTestCaseId === testCase._id;
+                    const isCaseChecked = selectedCaseIds.includes(
+                      testCase._id,
+                    );
+                    const { line1, line2, fullTitle } =
+                      formatCaseTitleForSidebar(testCase.title || "");
+                    const useLineClampForTitle =
+                      line2 == null && fullTitle.length > 44;
+
+                    return (
+                      <div
+                        key={testCase._id}
+                        onClick={() => {
+                          if (suiteId) {
+                            if (onSelectTestCase) {
+                              onSelectTestCase(suiteId, testCase._id);
+                              return;
+                            }
+                            navigateApp(buildEvaluatePath({
+                              type: "test-edit",
+                              suiteId: suiteId,
+                              testId: testCase._id,
+                            }));
+                          }
+                        }}
+                        className={cn(
+                          "group w-full flex items-center gap-1 px-4 py-2 text-left text-sm hover:bg-accent/50 transition-colors cursor-pointer",
+                          isTestSelected && "bg-accent font-medium",
+                        )}
+                        title={fullTitle}
+                      >
+                        {showSelection && (
+                          <Checkbox
+                            checked={isCaseChecked}
+                            onCheckedChange={(checked) => {
+                              onToggleSelection?.(
+                                testCase._id,
+                                checked === true,
+                              );
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Select ${fullTitle}`}
+                          />
+                        )}
+                        <div className="flex-1 min-w-0 text-left flex flex-col gap-0.5">
+                          <div
+                            className={cn(
+                              "flex gap-1.5 min-w-0",
+                              useLineClampForTitle
+                                ? "items-start"
+                                : "items-center",
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                "min-w-0 leading-tight",
+                                useLineClampForTitle
+                                  ? "line-clamp-2 break-words"
+                                  : "truncate",
+                              )}
+                            >
+                              {line1}
+                            </span>
+                            <ImportClaimBadge claim={testCase.import} />
+                          </div>
+                          {line2 ? (
+                            <span
+                              className="truncate text-[11px] text-muted-foreground leading-tight"
+                              title={fullTitle}
+                            >
+                              {line2}
+                            </span>
+                          ) : null}
+                        </div>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              onClick={(e) => e.stopPropagation()}
+                              className="shrink-0 p-1 hover:bg-accent/50 rounded transition-colors opacity-0 group-hover:opacity-100"
+                              aria-label="Case options"
+                            >
+                              <MoreVertical className="h-4 w-4" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDuplicateTestCase(testCase._id);
+                              }}
+                              disabled={isTestDuplicating}
+                            >
+                              <Copy className="h-4 w-4 mr-2 text-foreground" />
+                              {isTestDuplicating
+                                ? "Duplicating..."
+                                : "Duplicate"}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDeleteTestCase(testCase._id, testCase.title);
+                              }}
+                              disabled={isTestDeleting}
+                              variant="destructive"
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" />
+                              {isTestDeleting ? "Deleting..." : "Delete"}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}

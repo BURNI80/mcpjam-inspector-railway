@@ -1,0 +1,343 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { EvalRunDiff } from "../types";
+import { RunDiffView } from "../run-diff-view";
+
+const mocks = vi.hoisted(() => ({
+  getRunDiff: vi.fn(),
+}));
+
+vi.mock("convex/react", () => ({
+  useAction: () => mocks.getRunDiff,
+}));
+
+function makeDiff(): EvalRunDiff {
+  return {
+    suite: { id: "suite-1", name: "Checkout Suite", source: "ui" },
+    baseRun: {
+      id: "base-run-123",
+      runNumber: 1,
+      source: "ui",
+      framework: null,
+      createdAt: 1_000,
+      completedAt: 2_000,
+      result: "passed",
+      summary: { total: 1, passed: 1, failed: 0, passRate: 1 },
+    },
+    compareRun: {
+      id: "compare-run-456",
+      runNumber: 2,
+      source: "ui",
+      framework: null,
+      createdAt: 3_000,
+      completedAt: 5_000,
+      result: "failed",
+      summary: { total: 1, passed: 0, failed: 1, passRate: 0 },
+    },
+    metrics: {
+      startOffsetMs: {
+        base: -2_000,
+        compare: 0,
+        delta: 2_000,
+        percentDelta: -100,
+      },
+      wallDurationMs: {
+        base: 1_000,
+        compare: 2_000,
+        delta: 1_000,
+        percentDelta: 100,
+      },
+      totalTokens: { base: 10, compare: 12, delta: 2, percentDelta: 20 },
+      inputTokens: { base: 4, compare: 5, delta: 1, percentDelta: 25 },
+      outputTokens: { base: 6, compare: 7, delta: 1, percentDelta: 16.666 },
+      cachedInputTokens: {
+        base: null,
+        compare: null,
+        delta: null,
+        percentDelta: null,
+      },
+      reasoningTokens: {
+        base: null,
+        compare: null,
+        delta: null,
+        percentDelta: null,
+      },
+      estimatedCostUsd: {
+        base: 0.001,
+        compare: 0.002,
+        delta: 0.001,
+        percentDelta: 100,
+      },
+    },
+    scores: {
+      passRatePercent: {
+        base: 100,
+        compare: 0,
+        delta: -100,
+        percentDelta: -100,
+      },
+      total: { base: 1, compare: 1, delta: 0, percentDelta: 0 },
+      passed: { base: 1, compare: 0, delta: -1, percentDelta: -100 },
+      failed: { base: 0, compare: 1, delta: 1, percentDelta: null },
+    },
+    cases: [
+      {
+        caseKey: "case-1",
+        title: "Find checkout total",
+        testCaseId: "case-doc-1",
+        status: "regressed",
+        configChanged: false,
+        base: {
+          outcome: "passed",
+          iterationIds: ["iter-base"],
+          representativeIterationId: "iter-base",
+          traceBlobIds: ["blob-base"],
+          input: { text: "Base prompt", truncated: false },
+          output: { text: "Base answer", truncated: false },
+          expectedToolCalls: [],
+          actualToolCalls: [],
+          error: null,
+          metrics: {
+            durationMs: 1_000,
+            totalTokens: 10,
+            inputTokens: 4,
+            outputTokens: 6,
+            cachedInputTokens: null,
+            reasoningTokens: null,
+            estimatedCostUsd: 0.001,
+          },
+        },
+        compare: {
+          outcome: "failed",
+          iterationIds: ["iter-compare"],
+          representativeIterationId: "iter-compare",
+          traceBlobIds: ["blob-compare"],
+          input: { text: "Compare prompt", truncated: false },
+          output: { text: "Compare answer", truncated: false },
+          expectedToolCalls: [],
+          actualToolCalls: [{ toolName: "search", arguments: {} }],
+          error: null,
+          metrics: {
+            durationMs: 2_000,
+            totalTokens: 12,
+            inputTokens: 5,
+            outputTokens: 7,
+            cachedInputTokens: null,
+            reasoningTokens: null,
+            estimatedCostUsd: 0.002,
+          },
+        },
+        metrics: {
+          durationMs: {
+            base: 1_000,
+            compare: 2_000,
+            delta: 1_000,
+            percentDelta: 100,
+          },
+          totalTokens: { base: 10, compare: 12, delta: 2, percentDelta: 20 },
+          inputTokens: { base: 4, compare: 5, delta: 1, percentDelta: 25 },
+          outputTokens: { base: 6, compare: 7, delta: 1, percentDelta: 16.666 },
+          cachedInputTokens: {
+            base: null,
+            compare: null,
+            delta: null,
+            percentDelta: null,
+          },
+          reasoningTokens: {
+            base: null,
+            compare: null,
+            delta: null,
+            percentDelta: null,
+          },
+          estimatedCostUsd: {
+            base: 0.001,
+            compare: 0.002,
+            delta: 0.001,
+            percentDelta: 100,
+          },
+        },
+      },
+    ],
+  };
+}
+
+describe("RunDiffView", () => {
+  beforeEach(() => {
+    mocks.getRunDiff.mockReset();
+    mocks.getRunDiff.mockResolvedValue(makeDiff());
+  });
+
+  it("loads and renders run diff rows", async () => {
+    render(
+      <RunDiffView
+        baseRunId="base-run-123"
+        compareRunId="compare-run-456"
+        onOpenIteration={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Find checkout total")).toBeInTheDocument();
+    expect(screen.getByText("Regressed")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Trace/i })).toHaveLength(2);
+    expect(mocks.getRunDiff).toHaveBeenCalledWith({
+      baseRunId: "base-run-123",
+      compareRunId: "compare-run-456",
+      previewChars: 0,
+    });
+  });
+
+  it("opens representative iterations from each side", async () => {
+    const onOpenIteration = vi.fn();
+    render(
+      <RunDiffView
+        baseRunId="base-run-123"
+        compareRunId="compare-run-456"
+        onOpenIteration={onOpenIteration}
+      />,
+    );
+
+    const user = userEvent.setup();
+    const traceButtons = await screen.findAllByRole("button", {
+      name: /Trace/i,
+    });
+    await user.click(traceButtons[1]);
+
+    expect(onOpenIteration).toHaveBeenCalledWith(
+      "compare-run-456",
+      "iter-compare",
+    );
+  });
+});
+
+describe("RunDiffView — skill changes", () => {
+  beforeEach(() => {
+    mocks.getRunDiff.mockReset();
+  });
+
+  function renderWithSkills(skills: EvalRunDiff["skills"]) {
+    mocks.getRunDiff.mockResolvedValue({ ...makeDiff(), skills });
+    render(
+      <RunDiffView
+        baseRunId="base-run-123"
+        compareRunId="compare-run-456"
+        onOpenIteration={vi.fn()}
+      />,
+    );
+  }
+
+  it("names the edited skill and its version move", async () => {
+    // The whole point: the regression below now has a candidate explanation.
+    renderWithSkills({
+      base: { excluded: false, count: 1 },
+      compare: { excluded: false, count: 1 },
+      changes: [
+        {
+          key: "skill:refunds",
+          name: "refunds",
+          channels: ["environment"],
+          kind: "changed",
+          base: { contentHash: "aaaaaaa1", versionNumber: 3 },
+          compare: { contentHash: "bbbbbbb2", versionNumber: 4 },
+          versionDelta: "v3 → v4",
+        },
+      ],
+      unchangedCount: 2,
+    });
+
+    expect(await screen.findByText("Skill changes")).toBeInTheDocument();
+    expect(screen.getByText("refunds")).toBeInTheDocument();
+    expect(screen.getByText("v3 → v4")).toBeInTheDocument();
+    expect(screen.getByText("Changed")).toBeInTheDocument();
+    expect(screen.getByText("2 unchanged")).toBeInTheDocument();
+  });
+
+  it("falls back to hashes when a run predates versioning", async () => {
+    // A real change whose revisions are unknown must still read as a change,
+    // not as "nothing moved".
+    renderWithSkills({
+      base: { excluded: false, count: 1 },
+      compare: { excluded: false, count: 1 },
+      changes: [
+        {
+          key: "skill:refunds",
+          name: "refunds",
+          channels: ["environment"],
+          kind: "changed",
+          base: { contentHash: "abc1234def" },
+          compare: { contentHash: "999888777x" },
+        },
+      ],
+      unchangedCount: 0,
+    });
+
+    expect(await screen.findByText("abc1234 → 9998887")).toBeInTheDocument();
+  });
+
+  it("shows an added skill's recorded revision rather than its hash", async () => {
+    // An added or removed skill has only one side, so it never carries a
+    // versionDelta — but it usually knows its revision, and `v2` says more to a
+    // reader than seven characters of hash.
+    renderWithSkills({
+      base: { excluded: false, count: 0 },
+      compare: { excluded: false, count: 1 },
+      changes: [
+        {
+          key: "serverSkill:lookup",
+          name: "lookup",
+          channels: ["mcp-server"],
+          kind: "added",
+          compare: {
+            contentHash: "server_skill_lookup_hash",
+            serverSkillVersionNumber: 2,
+          },
+        },
+      ],
+      unchangedCount: 0,
+    });
+
+    expect(await screen.findByText("v2")).toBeInTheDocument();
+    expect(screen.queryByText(/server_/)).not.toBeInTheDocument();
+  });
+
+  it("renders nothing when no skills changed", async () => {
+    // An empty card on every comparison is noise; silence is the right answer.
+    renderWithSkills({
+      base: { excluded: false, count: 3 },
+      compare: { excluded: false, count: 3 },
+      changes: [],
+      unchangedCount: 3,
+    });
+
+    await screen.findByText("Cases");
+    expect(screen.queryByText("Skill changes")).not.toBeInTheDocument();
+  });
+
+  it("renders nothing for runs that predate skill pinning entirely", async () => {
+    renderWithSkills(null);
+    await screen.findByText("Cases");
+    expect(screen.queryByText("Skill changes")).not.toBeInTheDocument();
+  });
+
+  it("calls out an arm that deliberately ran without skills", async () => {
+    renderWithSkills({
+      base: { excluded: false, count: 1 },
+      compare: { excluded: true, count: 0 },
+      changes: [
+        {
+          key: "skill:refunds",
+          name: "refunds",
+          channels: ["environment"],
+          kind: "removed",
+          base: { contentHash: "aaaaaaa1", versionNumber: 3 },
+        },
+      ],
+      unchangedCount: 0,
+    });
+
+    expect(
+      await screen.findByText("The compared run ran with skills disabled."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Removed")).toBeInTheDocument();
+  });
+});

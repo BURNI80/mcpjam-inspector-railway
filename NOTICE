@@ -1,0 +1,59 @@
+MCPJam Inspector on Railway — deployment packaging
+===================================================
+
+This repository is a **Railway deployment mirror** of MCPJam Inspector, a
+community-contributed packaging. It vendors the upstream source tree verbatim
+at a pinned commit so that the Railway build is reproducible, and adds nothing
+to the application itself.
+
+Upstream project
+----------------
+
+*   Name: **MCPJam Inspector** (`@mcpjam/inspector`), by MCPJam
+*   Website: https://www.mcpjam.com
+*   Source: https://github.com/MCPJam/inspector
+*   Docs: https://docs.mcpjam.com
+*   License: Apache License 2.0 — see `LICENSE` (upstream's, unmodified)
+
+The vendored commit is recorded in `UPSTREAM_COMMIT`.
+
+What was changed relative to upstream
+-------------------------------------
+
+Only packaging and documentation. No application code, no build definition and
+no dependency was modified.
+
+*   `mcpjam-inspector/Dockerfile` — unmodified, upstream's own multi-stage
+    image build. Upstream ships a `railway.json` that points Railway at this
+    exact file, so the image Railway builds here is byte-for-byte the image
+    upstream documents for `docker build -f mcpjam-inspector/Dockerfile .`.
+*   `railway.json` — unmodified, upstream's.
+*   `.dockerignore` — added. Every excluded path is not copied by any stage of
+    the Dockerfile, so the built image is unchanged; it only trims ~35 MB of
+    documentation screenshots and GitHub automation from the build context.
+*   `README.md` — replaced. The deployment guide for this repository. The
+    upstream README is preserved verbatim as `UPSTREAM_README.md`.
+*   `NOTICE`, `UPSTREAM_COMMIT` — added (attribution and pin).
+*   `assets/` — four screenshots from the upstream documentation, used by the
+    README. Screenshots are the property of their authors; they are reused from
+    the upstream repository under its Apache 2.0 license and are not modified.
+*   Removed, because they are not needed to build or run the image and are not
+    part of the product: `.github/workflows/` (upstream CI, which requires
+    MCPJam's own secrets), `.github/scripts/`, `.github/rulesets/`,
+    `.github/ISSUE_TEMPLATE/`, `.github/dependabot.yml`,
+    `.github/FUNDING.yml`, `docs/` (kept only the four screenshots above),
+    `examples/`, `notes/`, `ops/`, `actions/`, `skills/`, `design-explorations/`,
+    `preview-router/`, `.release-plan/`, `.spike-codex-appserver/`,
+    `.changeset/`, `NOTES-item-2.md`, `NOTES-item-3.md`.
+
+Apache 2.0 compliance
+---------------------
+
+The upstream `LICENSE` is retained unmodified at the root of this repository,
+as §4(a) requires. This file and `README.md` carry the attribution that §4(b)
+requires. The vendored source is unmodified, so no source-change notice is
+required.
+
+This packaging is not endorsed by, affiliated with, or supported by MCPJam.
+For the canonical distribution of MCPJam Inspector use the upstream repository
+and the hosted app at https://app.mcpjam.com.

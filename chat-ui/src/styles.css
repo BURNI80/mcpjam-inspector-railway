@@ -1,0 +1,297 @@
+/*
+ * @mcpjam/chat-ui — package-owned tokens.
+ *
+ * The renderer uses shadcn-style semantic utility classes (text-muted-foreground,
+ * bg-card, border-border, ...). Those utilities are produced by Tailwind in the
+ * consuming app; this file supplies sensible *token values* (scoped to
+ * `.mcpjam-chat-ui`) so the colors resolve with reasonable light/dark defaults
+ * even when the host hasn't defined them.
+ *
+ * Consumers need a Tailwind v4-compatible utility layer (or the future compiled
+ * CSS bundle) for spacing/layout utilities. Override any `--token` below to
+ * theme the transcript.
+ *
+ * HSL channel triplets (shadcn convention): `hsl(var(--foreground))`.
+ */
+
+/*
+ * Light tokens: the base, an explicit `themeMode="light"`, AND a forced-light
+ * transcript even when embedded in a dark host (a `.dark` ancestor). That last
+ * selector is what makes `themeMode="light"` actually win inside a dark app —
+ * without it, `.dark .mcpjam-chat-ui` would keep the transcript dark.
+ */
+/* BEGIN GENERATED: light — sync via `npm run chatui:sync-tokens` */
+.mcpjam-chat-ui,
+.mcpjam-chat-ui.light,
+.dark .mcpjam-chat-ui.light {
+  --background: 48 33.4% 97.1%;
+  --foreground: 48 19.6% 20%;
+  --card: 48 33.4% 97.1%;
+  --card-foreground: 60 2.6% 7.6%;
+  --muted: 44 29.4% 90%;
+  --muted-foreground: 50 2.4% 50.2%;
+  --border: 50 7.5% 84.3%;
+  --destructive: 359.6 81.1% 58.6%;
+  --destructive-foreground: 0 0% 100%;
+  /* Trace-timeline-only tokens (popover tooltip, focus ring, warning badge). */
+  --popover: 0 0% 100%;
+  --popover-foreground: 50.8 19.4% 13.1%;
+  --accent: 46.2 22.9% 88.8%;
+  --accent-foreground: 50.8 19.4% 13.1%;
+  --ring: 15.1 55.5% 52.3%;
+  --warning: 43 100% 45.8%;
+  --warning-foreground: 26.6 100% 10%;
+  /* JSON syntax colors for the token spans JsonView emits. Raw, not HSL
+     triplets: these are consumed as `var(--json-key)` directly, not through
+     `hsl(var(…))` like the role tokens above. */
+  --json-key: oklch(0.55 0.2 255);
+  --json-string: oklch(0.5 0.1 55);
+  --json-number: oklch(0.5 0.1 55);
+  --json-boolean: oklch(0.5 0.15 145);
+  --json-boolean-false: oklch(0.55 0.18 25);
+  --json-null: oklch(0.55 0.02 270);
+  --json-punctuation: oklch(0.55 0.01 270);
+}
+/* END GENERATED: light */
+
+.mcpjam-chat-ui {
+  color: hsl(var(--foreground));
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+}
+
+/*
+ * Dark tokens: an explicit `themeMode="dark"`, OR inherited from a dark host
+ * when `themeMode="system"`. `:not(.light)` keeps a forced-light transcript
+ * from being pulled dark by the host.
+ */
+/* BEGIN GENERATED: dark — sync via `npm run chatui:sync-tokens` */
+.mcpjam-chat-ui.dark,
+.dark .mcpjam-chat-ui:not(.light) {
+  --background: 60 2.7% 14.5%;
+  --foreground: 46.2 9.8% 73.9%;
+  --card: 60 2.7% 14.5%;
+  --card-foreground: 48 33.4% 97.1%;
+  --muted: 60 3.8% 10.2%;
+  --muted-foreground: 51.4 8.9% 69%;
+  --border: 60 5.1% 23.1%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 100%;
+  /* Trace-timeline-only tokens (popover tooltip, focus ring, warning badge). */
+  --popover: 60 2.1% 18.4%;
+  --popover-foreground: 60 5.4% 89.2%;
+  --accent: 48 10.6% 9.2%;
+  --accent-foreground: 51.4 25.9% 94.7%;
+  --ring: 14.8 63.1% 59.6%;
+  --warning: 30.5 100% 52.7%;
+  --warning-foreground: 37.1 100% 88.3%;
+  /* JSON syntax colors for the token spans JsonView emits. Raw, not HSL
+     triplets: these are consumed as `var(--json-key)` directly, not through
+     `hsl(var(…))` like the role tokens above. */
+  --json-key: oklch(0.7 0.18 255);
+  --json-string: oklch(0.7 0.1 55);
+  --json-number: oklch(0.7 0.1 55);
+  --json-boolean: oklch(0.65 0.15 145);
+  --json-boolean-false: oklch(0.68 0.16 25);
+  --json-null: oklch(0.6 0.02 270);
+  --json-punctuation: oklch(0.5 0.01 270);
+}
+/* END GENERATED: dark */
+
+/* Keep long tool input/output readable without a horizontal scrollbar war. */
+.mcpjam-chat-ui .mcpjam-chat-json {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+}
+
+/*
+ * JSON syntax colours for the token spans `JsonView` emits. The `--json-*`
+ * values themselves are in the generated blocks above, synced from
+ * design-system/src/tokens.css like every other token.
+ *
+ * WHERE THIS APPLIES. Only where `@mcpjam/chat-ui/styles.css` is loaded, which
+ * the inspector does not do — in the app the transcript paints from the global
+ * `.json-*` rules in `mcpjam-inspector/client/src/index.css`, which is what
+ * gives Sessions the Playground's exact colours. This block is for standalone
+ * embedders, who would otherwise get the monochrome payload Sessions used to
+ * show (BB-239).
+ *
+ * Where it IS loaded it WINS: `.mcpjam-chat-ui .json-key` is two classes
+ * against the host's one. A host theming `.json-key` at single-class
+ * specificity has to raise its own, or re-theme by overriding `--json-*` on
+ * `.mcpjam-chat-ui` — the supported route.
+ */
+.mcpjam-chat-ui .json-key {
+  color: var(--json-key);
+}
+.mcpjam-chat-ui .json-string {
+  color: var(--json-string);
+}
+.mcpjam-chat-ui .json-number {
+  color: var(--json-number);
+}
+.mcpjam-chat-ui .json-boolean {
+  color: var(--json-boolean);
+}
+.mcpjam-chat-ui .json-boolean-false {
+  color: var(--json-boolean-false);
+}
+.mcpjam-chat-ui .json-null {
+  color: var(--json-null);
+}
+.mcpjam-chat-ui .json-punctuation {
+  color: var(--json-punctuation);
+}
+
+.mcpjam-chat-ui .mcpjam-chat-markdown {
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Trace timeline waterfall — category bar fills, glyph colors and row accents.
+ * Ported from the inspector's global `index.css`; here the classes + their
+ * `--trace-waterfall-*` color variables are scoped to `.mcpjam-chat-ui` so they
+ * travel with the package stylesheet. Light values are the base; the dark block
+ * overrides bar/accent tokens. Relative-color `oklch(from …)` darkens glyphs and
+ * row-accent borders to match the (lighter) bar fills.
+ */
+.mcpjam-chat-ui {
+  --trace-waterfall-bar-prompt: oklch(0.885 0.082 292);
+  --trace-waterfall-bar-llm: oklch(0.885 0.076 255);
+  --trace-waterfall-bar-tool: oklch(0.905 0.105 96);
+  --trace-waterfall-bar-step: oklch(0.88 0.055 250);
+  --trace-waterfall-bar-error: oklch(0.88 0.115 25);
+  --trace-waterfall-row-selected: oklch(0.67 0.1 288 / 0.12);
+}
+
+.mcpjam-chat-ui.dark,
+.dark .mcpjam-chat-ui:not(.light) {
+  --trace-waterfall-bar-prompt: oklch(0.79 0.11 292 / 0.58);
+  --trace-waterfall-bar-llm: oklch(0.79 0.1 255 / 0.58);
+  --trace-waterfall-bar-tool: oklch(0.83 0.12 88 / 0.58);
+  --trace-waterfall-bar-step: oklch(0.77 0.06 250 / 0.56);
+  --trace-waterfall-bar-error: oklch(0.78 0.14 25 / 0.58);
+  --trace-waterfall-row-selected: oklch(0.8 0.09 288 / 0.18);
+  --trace-waterfall-accent-prompt: oklch(0.84 0.11 292 / 0.82);
+  --trace-waterfall-accent-llm: oklch(0.84 0.1 255 / 0.82);
+  --trace-waterfall-accent-tool: oklch(0.87 0.11 88 / 0.82);
+  --trace-waterfall-accent-step: oklch(0.8 0.065 250 / 0.82);
+  --trace-waterfall-accent-error: oklch(0.84 0.12 25 / 0.82);
+}
+
+.mcpjam-chat-ui .trace-waterfall-bar-prompt {
+  background-color: var(--trace-waterfall-bar-prompt);
+}
+.mcpjam-chat-ui .trace-waterfall-bar-llm {
+  background-color: var(--trace-waterfall-bar-llm);
+}
+.mcpjam-chat-ui .trace-waterfall-bar-tool {
+  background-color: var(--trace-waterfall-bar-tool);
+}
+.mcpjam-chat-ui .trace-waterfall-bar-step {
+  background-color: var(--trace-waterfall-bar-step);
+}
+.mcpjam-chat-ui .trace-waterfall-bar-error {
+  background-color: var(--trace-waterfall-bar-error);
+}
+.mcpjam-chat-ui .trace-waterfall-bar-prompt,
+.mcpjam-chat-ui .trace-waterfall-bar-llm,
+.mcpjam-chat-ui .trace-waterfall-bar-tool,
+.mcpjam-chat-ui .trace-waterfall-bar-step,
+.mcpjam-chat-ui .trace-waterfall-bar-error {
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.28),
+    0 1px 3px rgb(15 23 42 / 0.08);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-bar-prompt,
+.mcpjam-chat-ui.dark .trace-waterfall-bar-llm,
+.mcpjam-chat-ui.dark .trace-waterfall-bar-tool,
+.mcpjam-chat-ui.dark .trace-waterfall-bar-step,
+.mcpjam-chat-ui.dark .trace-waterfall-bar-error,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-bar-prompt,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-bar-llm,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-bar-tool,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-bar-step,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-bar-error {
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.12),
+    0 1px 4px rgb(0 0 0 / 0.26);
+}
+.mcpjam-chat-ui .trace-waterfall-row-selected {
+  background-color: var(--trace-waterfall-row-selected);
+}
+
+.mcpjam-chat-ui .trace-waterfall-glyph-prompt {
+  color: oklch(from var(--trace-waterfall-bar-prompt) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-glyph-llm {
+  color: oklch(from var(--trace-waterfall-bar-llm) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-glyph-tool {
+  color: oklch(from var(--trace-waterfall-bar-tool) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-glyph-step {
+  color: oklch(from var(--trace-waterfall-bar-step) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-glyph-error {
+  color: oklch(from var(--trace-waterfall-bar-error) calc(l - 0.36) c h);
+}
+
+.mcpjam-chat-ui .trace-waterfall-row-accent-prompt {
+  border-left-color: oklch(from var(--trace-waterfall-bar-prompt) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-row-accent-llm {
+  border-left-color: oklch(from var(--trace-waterfall-bar-llm) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-row-accent-tool {
+  border-left-color: oklch(from var(--trace-waterfall-bar-tool) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-row-accent-step {
+  border-left-color: oklch(from var(--trace-waterfall-bar-step) calc(l - 0.36) c h);
+}
+.mcpjam-chat-ui .trace-waterfall-row-accent-error {
+  border-left-color: oklch(from var(--trace-waterfall-bar-error) calc(l - 0.36) c h);
+}
+
+.mcpjam-chat-ui.dark .trace-waterfall-glyph-prompt,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-glyph-prompt {
+  color: var(--trace-waterfall-accent-prompt);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-glyph-llm,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-glyph-llm {
+  color: var(--trace-waterfall-accent-llm);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-glyph-tool,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-glyph-tool {
+  color: var(--trace-waterfall-accent-tool);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-glyph-step,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-glyph-step {
+  color: var(--trace-waterfall-accent-step);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-glyph-error,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-glyph-error {
+  color: var(--trace-waterfall-accent-error);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-row-accent-prompt,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-row-accent-prompt {
+  border-left-color: var(--trace-waterfall-accent-prompt);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-row-accent-llm,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-row-accent-llm {
+  border-left-color: var(--trace-waterfall-accent-llm);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-row-accent-tool,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-row-accent-tool {
+  border-left-color: var(--trace-waterfall-accent-tool);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-row-accent-step,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-row-accent-step {
+  border-left-color: var(--trace-waterfall-accent-step);
+}
+.mcpjam-chat-ui.dark .trace-waterfall-row-accent-error,
+.dark .mcpjam-chat-ui:not(.light) .trace-waterfall-row-accent-error {
+  border-left-color: var(--trace-waterfall-accent-error);
+}

@@ -1,0 +1,1090 @@
+import { createConvexEvidenceReadTransport } from "../../utils/harness/harness-evidence-reader.js";
+import { expandPersistedRequestPayloads } from "@/shared/live-chat-trace";
+import type { LiveChatTraceRequestPayloadEntry } from "@/shared/live-chat-trace";
+import { getHostedTurnFailure } from "../../utils/hosted-turn-failure.js";
+import type { TimeoutMetadata } from "../../utils/run-supervisor/deadline.js";
+/**
+ * drive-hosted-eval-turn.ts — the shared per-turn body of the two hosted eval
+ * runners (`runIterationViaBackendWithBrowser` — batch — and
+ * `streamIterationViaBackendWithBrowser` — SSE).
+ *
+ * Both runners drive turns through `runAssistantTurn` with identical engine
+ * options, browser-pipeline hooks, accumulator drains, and the three-shape
+ * failure detection; the stream runner additionally wires SSE emitters into
+ * the engine callbacks and emits failure/turn-finish events. This helper owns
+ * the shared skeleton; the stream runner layers its SSE concerns through
+ * {@link HostedEvalTurnSinks} (built per turn via a factory so the emit
+ * closures can see the turn context).
+ *
+ * Unification notes (deliberate convergences, both directions reviewed):
+ *  - `lastEngineError` preference in the failure branches (the PR
+ *    5b-followup-2 guardrail-detail fix) now applies to the batch runner too —
+ *    previously only the stream runner surfaced the structured 429/guardrail
+ *    reason instead of the generic fallback.
+ *  - The step-error-span filter excludes spans carrying a `toolCallId`
+ *    (the stream runner's Cursor/Codex review fix — child error spans that
+ *    `wrapToolSetForEvalTrace` emits alongside a failed tool span must flow
+ *    through the `failOnToolError` gate, not force a cycle failure). The
+ *    batch runner previously matched only on `category !== "tool"`.
+ *  - `toolsCalledByPrompt` gets its per-turn array pushed BEFORE the engine
+ *    call (the stream runner's shape, where `onToolCall` populates it live).
+ *    For the batch runner this means a turn whose engine call THROWS now
+ *    contributes an empty entry instead of no entry — verdict-neutral (the
+ *    accompanying `iterationError` already gates the iteration).
+ */
+import type { ModelMessage } from "@ai-sdk/provider-utils";
+import type { MCPClientManager, Harness } from "@mcpjam/sdk";
+import type { EvalTraceSpan } from "@/shared/eval-trace";
+import type { ModelDefinition } from "@/shared/types";
+import type { EvalToolChoice } from "@/shared/tool-choice";
+import type { ScriptedWidgetCheck } from "@/shared/scripted-steps";
+import { logger } from "../../utils/logger";
+import {
+  withDeadline,
+  type DeadlineHandle,
+} from "../../utils/run-supervisor/deadline.js";
+import {
+  reconcileTurnEvidence,
+  selectGradedToolCalls,
+  type TurnEvidenceResult,
+} from "./harness-evidence-turn.js";
+import {
+  evidenceToolCallId,
+  type CanonicalMcpCall,
+} from "./harness-evidence-merge.js";
+import type { FrictionResultEntry } from "@mcpjam/sdk/contract";
+import { runAssistantTurn } from "../../utils/assistant-turn.js";
+import type { RunAssistantTurnOptions } from "../../utils/assistant-turn.js";
+import { EVAL_WIDGET_MODEL_CONTEXT } from "../../config.js";
+import { withWidgetContextSystemPrompt } from "./widget-interaction-context.js";
+import type {
+  MCPJamEngineErrorEvent,
+  MCPJamStepFinishEvent,
+  MCPJamToolCallEvent,
+  MCPJamToolResultEvent,
+} from "../../utils/mcpjam-stream-handler.js";
+import type { PrepareChatV2Result } from "../../utils/chat-v2-orchestration.js";
+import type { BrowserSessionContext } from "../browser-session-context.js";
+import {
+  createAiSdkEvalTraceContext,
+  wrapToolSetForEvalTrace,
+} from "./eval-trace-capture";
+import type { ToolPolicyGate } from "./tool-policy-gate";
+import type { UsageTotals } from "./types";
+
+type ToolCall = {
+  toolName: string;
+  arguments: Record<string, any>;
+  /** Present when the projection carried one; the evidence merge joins on it. */
+  toolCallId?: string;
+};
+
+export type HostedEvalTurnOutcome =
+  | { kind: "completed" }
+  /** Abort fired (between callbacks or mid-engine); record nothing. */
+  | { kind: "cancelled" }
+  /** Turn failed; the runner records the iteration with this error. */
+  | {
+      kind: "failed";
+      timeout?: TimeoutMetadata;
+      iterationError: string;
+      iterationErrorDetails?: string;
+      /**
+       * WHICH LAYER failed, decided by the catch site rather than by reading
+       * the message.
+       *
+       * `model` means the model-call layer — the engine's stream, or a throw
+       * escaping the assistant turn. A failure there is ours or our
+       * provider's: an outage, an exhausted credit balance, a spend guardrail.
+       * It says nothing about the MCP server under test, which is exactly why
+       * the chain must not file it as an unattributed server failure.
+       *
+       * `setup` is pre-turn work that never reached the model.
+       *
+       * Deliberately NOT derived from the error text. A message classifier
+       * would be one provider's wording away from silently mis-attributing a
+       * whole class of run, and the catch site already knows the answer.
+       */
+      errorSource?: "model" | "setup";
+      /** The engine's structured code, when the failure carried one. */
+      errorCode?: string;
+      /** HTTP status, when the failure came from a non-OK response. */
+      errorHttpStatus?: number;
+    };
+
+/** Stream-runner SSE concerns, layered over the shared skeleton per turn. */
+export interface HostedEvalTurnSinks {
+  /** After the user prompt is appended, before the engine call (`turn_start`). */
+  onTurnStart?: () => void;
+  /** Engine callback wires (SSE emitters). The helper composes them with the
+   *  browser-pipeline hooks: `onToolCall` runs after the input cache write;
+   *  `onToolResult` runs BEFORE the harness render (live consumers shouldn't
+   *  wait on Chromium). */
+  onLiveTextDelta?: (delta: string) => void;
+  onToolCall?: (event: MCPJamToolCallEvent) => void;
+  onToolResult?: (event: MCPJamToolResultEvent) => void | Promise<void>;
+  onStepFinish?: (event: MCPJamStepFinishEvent) => void;
+  /** Before a failed turn returns (failure trace_snapshot + error SSE). */
+  onTurnFailure?: (failure: {
+    iterationError: string;
+    iterationErrorDetails?: string;
+  }) => void;
+  /** After a fully-successful turn (turn_finish snapshot + SSE). */
+  onTurnSuccess?: () => void;
+}
+
+/** Per-turn context handed to the sink factory so SSE closures can read the
+ *  turn's accumulators (the stream runner's snapshot/step-delta math). */
+export interface HostedEvalTurnSinkContext {
+  promptIndex: number;
+  /** This turn's user prompt. Distinct from the authored turn for widget
+   *  follow-up turns (a `ui/message` the widget sent), so SSE `turn_start`
+   *  labels the actual message rather than the authored prompt. */
+  prompt: string;
+  /** Iteration-cumulative usage snapshot taken at turn start. */
+  baselineUsage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+  /** This turn's tool-instrumentation span context (`wrapToolSetForEvalTrace`). */
+  traceCtx: ReturnType<typeof createAiSdkEvalTraceContext>;
+  /** The per-turn tool-call accumulator (already pushed onto
+   *  `acc.toolsCalledByPrompt`); `onToolCall` sinks may populate it live. */
+  promptToolsCalled: ToolCall[];
+}
+
+export interface DriveHostedEvalTurnParams {
+  harnessExecutionTarget?: RunAssistantTurnOptions["harnessExecutionTarget"];
+  promptIndex: number;
+  prompt: string;
+  /** This turn's scripted widget interaction checks. Armed on the harness
+   *  before the turn runs so a group replays when its widget mounts; a group
+   *  whose widget never renders flushes to `browser.scriptedCheckFailures`.
+   *  The runner's post-loop verdict gate reads those failures. */
+  widgetChecks?: ScriptedWidgetCheck[];
+  browser: BrowserSessionContext;
+  prepared: PrepareChatV2Result;
+  modelDefinition: ModelDefinition;
+  /** Canonical model id override for the wire payload (wallet/quota keys). */
+  modelId: string;
+  selectedServers: string[];
+  /** Host harness selector (resolvedExecution.harness). When set (claude-code |
+   *  codex) the turn runs that real runtime; absent ⇒ emulated (today's path). */
+  harness?: Harness;
+  /** Host approval intent (resolvedExecution.requireToolApproval). Forwarded to
+   *  runAssistantTurn ONLY for harness turns — runHarnessTurn fail-closes on it
+   *  (no interactive approval yet). The emulated eval path is unchanged (it
+   *  doesn't pass requireToolApproval; it relies on approvalMode "auto-deny"). */
+  requireToolApproval?: boolean;
+  toolPolicyGate?: ToolPolicyGate | null;
+  /** Project that owns the host's computer — required by runHarnessTurn to
+   *  resolve the E2B sandbox. Forwarded (harness turns only) from the eval's
+   *  resolved billing target; absent for org-level evals (no project/computer,
+   *  so a harness turn there fails fast with a clear projectId error). */
+  projectId?: string;
+  /**
+   * The Project Environment this run launched from — the GRANT BOUNDARY for its
+   * project secrets, and the same id `resolveGrantForSandbox` derives for this
+   * iteration's box from the run's `configSnapshot.environmentRef`.
+   *
+   * Forwarded (harness turns only) so an EXTERNAL-ACCOUNT credential delivered
+   * by a BROKERED secret is checked against what THIS environment selects. A
+   * project-wide check would report a bound-but-unselected secret available and
+   * start an iteration whose box carries no egress transform — it would
+   * provision, then fail vendor auth against a placeholder.
+   *
+   * Absent for a legacy (non-environment) suite run, which grants no secrets.
+   */
+  environmentId?: string;
+  /**
+   * Why `environmentId` is absent on a run that HAS an environment — set by the
+   * REPLAY path, which inherits the source run's `environmentRef` on the
+   * backend but cannot read it back out. Copy only; see the option's docblock
+   * on `MCPJamHandlerOptions`.
+   */
+  environmentUnresolvedReason?: string;
+  /**
+   * THIS iteration's disposable box, handed to the harness.
+   *
+   * The SAME box the tool resolver already exposes as `bash` — one box per
+   * iteration, never two. It rides the handler options rather than the host
+   * config because the run's config snapshot is member-readable, and a binding
+   * that could be written there would be a binding a reader could forge.
+   *
+   * Absent ⇒ the harness would fall back to the acting member's personal
+   * computer, which admission refuses outright: an eval iteration is
+   * disposable, and a shared box would carry state between runs.
+   */
+  harnessSandboxBinding?: RunAssistantTurnOptions["harnessSandboxBinding"];
+  /**
+   * How the sandbox reaches this inspector's MCP proxy.
+   *
+   * NOT optional in practice for an eval: a suite always has servers, and
+   * `runHarnessTurn` throws when servers are selected without a strategy. The
+   * runner resolves the same one the hosted chat routes do — an eval run builds
+   * an ephemeral authorized manager exactly as they do, so the plane decision
+   * is identical and must not be re-derived here.
+   */
+  harnessMcpProxy?: RunAssistantTurnOptions["harnessMcpProxy"];
+  /**
+   * D4b: resolved `toolPolicy` decisions per selected server, sealed into the
+   * harness's proxy token so its out-of-process `tools/call`s are enforced at
+   * the MCP proxy, plus the sink that accounts the refusals back onto this
+   * iteration. Absent on the emulated path, which is gated in process.
+   */
+  harnessToolPolicy?: RunAssistantTurnOptions["harnessToolPolicy"];
+  /**
+   * The eval iteration this turn belongs to. Threaded to the harness turn,
+   * where it becomes the authorized claim on the proxy tokens that lets
+   * firsthand tool-call evidence be recorded against this iteration.
+   *
+   * Absent for a quick run (no run row, so nothing evidence could attach to)
+   * and for the emulated engine, which records firsthand results already.
+   */
+  evalIterationId?: RunAssistantTurnOptions["evalIterationId"];
+  /** Reports what the run FROZE about evidence, as the mint saw it. */
+  onHarnessEvidenceDecision?: RunAssistantTurnOptions["onHarnessEvidenceDecision"];
+  onHarnessPolicyBlocks?: RunAssistantTurnOptions["onHarnessPolicyBlocks"];
+  /**
+   * The run's PINNED skills, delivered to the harness verbatim.
+   *
+   * Present (even empty) ⇒ the harness turn delivers exactly these and skips
+   * the live project-wide fetch, which is what keeps a frozen run frozen. An
+   * empty set is how `skillsOverride: "exclude"` reaches the harness — the A/B
+   * arm has to be deliberately skill-free, not accidentally so.
+   *
+   * The FROZEN-RUN channel (`pinnedHarnessSkills`), not the live-environment
+   * one (`runtimeSkillsOverride`). `selectHarnessSkillSource` ranks
+   * pinned → environment → live, and only the top rank promises that nothing
+   * live is consulted; `runtimeSkillsOverride` is for a turn whose environment
+   * re-resolves each time, which is the opposite of what a pinned run wants.
+   */
+  pinnedHarnessSkills?: RunAssistantTurnOptions["pinnedHarnessSkills"];
+  /**
+   * MCPJam's SERVER-EXECUTED built-ins for the harness path.
+   *
+   * Passed EXPLICITLY because `runHarnessTurn` reads built-ins off this field
+   * and nowhere else: a caller that supplies only `tools` silently gives a
+   * harness turn none at all, which is the same silent-degradation shape this
+   * whole program exists to eliminate.
+   */
+  builtInTools?: RunAssistantTurnOptions["builtInTools"];
+  /**
+   * The host's MCP tool-CONSTRUCTION policies, for the HARNESS path.
+   *
+   * ## Why these are passed explicitly, like `builtInTools`
+   *
+   * On the emulated path this facade hands `runAssistantTurn` a tool set that
+   * `prepareChatV2` / `getEvalToolsForAiSdkOrThrow` already built under exactly
+   * these policies, so nothing downstream has to re-derive them. A HARNESS turn
+   * does not consume that set: `runHarnessTurn` rebuilds the model-facing MCP
+   * tools itself (`projectSelectedMcpServersAsHostTools`), because a
+   * host-executed runtime needs its own projection. It reads each policy off
+   * these fields **and nowhere else** — so omitting one does not fall back to
+   * the host's intent, it falls back to the SDK's default. That is the same
+   * silent-degradation shape `builtInTools` above is documented against:
+   * content the eval's host disabled reaches the model, an explicit visibility
+   * opt-out is ignored, and MCP Tasks drops to the no-`_meta` path, all without
+   * a single error.
+   *
+   * ## What is deliberately NOT done here
+   *
+   * The prepared/traced tool set (`tracedTools` below) is NOT handed to the
+   * harness. It is the EMULATED engine's tool set wrapped in eval-trace
+   * instrumentation; the harness path layers its own model-output projection,
+   * scope-step-up observer and policy gate over the manager's tools, and
+   * feeding it `tracedTools` would double-wrap and collide with that layering.
+   * The fix for a dropped policy is to forward the POLICY, not to reuse the
+   * prepared tools.
+   *
+   * ## Emulated evals are unchanged
+   *
+   * All three ride inside the `params.harness` gate at the `runAssistantTurn`
+   * call, for the same reason `requireToolApproval` / `projectId` /
+   * `harnessMcpProxy` already do. Two of them could not affect an emulated turn
+   * even ungated (`MCPJamHandlerOptions.respectToolVisibility` and `.tasks` are
+   * read only by `runHarnessTurn`), but `modelVisibleMcpToolResults` IS read by
+   * the emulated loop's tool-result projection — so the gate is what keeps an
+   * emulated eval byte-identical rather than an argument about read sites.
+   */
+  modelVisibleMcpToolResults?: RunAssistantTurnOptions["modelVisibleMcpToolResults"];
+  /** See {@link DriveHostedEvalTurnParams.modelVisibleMcpToolResults}. Only an
+   *  explicit `false` opts out of SEP-1865 filtering, so this is forwarded on
+   *  definedness. */
+  respectToolVisibility?: RunAssistantTurnOptions["respectToolVisibility"];
+  /** See {@link DriveHostedEvalTurnParams.modelVisibleMcpToolResults}. The run
+   *  resolves ONE seam for the whole run (`resolveToolTaskSeam`, surface
+   *  `"eval"`, bound to the run's abort signal); it is threaded here, never
+   *  re-derived per turn. */
+  tasks?: RunAssistantTurnOptions["tasks"];
+  mcpClientManager: MCPClientManager;
+  evalAuthContext: { kind: "user_bearer"; token: string };
+  endpointPath: string;
+  extraBodyFields: Record<string, unknown> | undefined;
+  /**
+   * Extra headers on every per-step Convex request — the bench worker's
+   * `x-mcpjam-benchmark-grant` carrier. Read per step by the engine, so the
+   * object is forwarded by reference and never spread into a copy.
+   */
+  extraHeaders?: Record<string, string>;
+  toolChoice: EvalToolChoice | undefined;
+  abortSignal: AbortSignal | undefined;
+  /**
+   * This turn's slice of the run's frozen budget
+   * (`ResolvedExecutionBudgets.turnTimeoutMs`). Bounds ONE model call; the
+   * iteration's own clock still bounds the sum of them.
+   */
+  turnTimeoutMs: number;
+  maxSteps: number;
+  runStartedAt: number;
+  isAborted: () => boolean;
+  /** `" (stream)"` on the SSE runner so log lines stay distinguishable. */
+  logSuffix?: string;
+  /** The runner's `extractToolCallsFromConversation`, passed in (rather than
+   *  imported) to avoid a module cycle with evals-runner.ts. */
+  extractToolCalls: (messages: ModelMessage[]) => ToolCall[];
+  /** The policy gate's refused `toolCallId`s, read fresh per turn — the
+   *  evidence reconciler must exclude them (they never reached a server, so
+   *  their absence from the wire record is not a hole). */
+  policyBlockedToolCallIds?: () => ReadonlySet<string>;
+  /** Shared mutable iteration state. The helper appends/rolls in place. */
+  acc: {
+    messageHistory: ModelMessage[];
+    /**
+     * The TRACE transcript — `messageHistory`'s evidence-enriched twin, and
+     * never called plain `messages` anywhere (that naming ambiguity is the
+     * failure mode the two-transcript contract exists to kill). Mutated at
+     * exactly the same sites as `messageHistory`, except a driven turn's
+     * slice is the evidence projection: matched calls as narrated, wire-only
+     * calls appended as reconstructed tool results. On a capture-off run the
+     * two are element-identical, which is what keeps off runs byte-equivalent.
+     */
+    traceMessageHistory: ModelMessage[];
+    capturedSpans: EvalTraceSpan[];
+    requestPayloads?: LiveChatTraceRequestPayloadEntry[];
+    /**
+     * Wire results, keyed by the `toolCallId` the GRADED call array uses:
+     * a matched call under its narrated id, a wire-only call under
+     * `evidence:<requestId>`. Carries the per-call timing, which is the only
+     * thing that can establish availability on a harness run — the graded
+     * array appends wire-only calls, so a later POSITION proves nothing.
+     *
+     * Optional: a caller that does not collect them simply has none, and the
+     * friction deriver then falls back to the transcript.
+     */
+    evidenceResults?: Map<string, FrictionResultEntry>;
+    /**
+     * Whether ANY turn's evidence came back incomplete.
+     *
+     * A box rather than a boolean because the accumulator is shared and
+     * mutated in place. One incomplete turn taints the whole iteration's
+     * identifier claims: "no later call used this identifier" cannot be
+     * answered from a set we know has a hole in it.
+     */
+    evidenceHadHole?: { value: boolean };
+    accumulatedUsage: UsageTotals;
+    toolsCalledByPrompt: ToolCall[][];
+  };
+  buildSinks?: (ctx: HostedEvalTurnSinkContext) => HostedEvalTurnSinks;
+}
+
+/**
+ * Fold one turn's wire results into the iteration accumulator.
+ *
+ * Keyed the way the GRADED array keys its calls, because that is the array a
+ * friction signal's `callIndex` points into: a matched call keeps its narrated
+ * `toolCallId`, and a wire-only call is appended under
+ * `evidence:<requestId>`. Every entry carries the row's own
+ * `startedAtMs`/`settledAtMs` — the identifier rules refuse to claim
+ * availability from array position on a harness run, so without the timing
+ * they would report `orderingUnknown` and measure nothing.
+ *
+ * A turn whose evidence is INCOMPLETE contributes no results and sets the
+ * hole flag instead: half a wire record answers "nobody used this identifier"
+ * from calls we know are missing.
+ */
+export function collectEvidenceResults(
+  acc: {
+    evidenceResults?: Map<string, FrictionResultEntry>;
+    evidenceHadHole?: { value: boolean };
+  },
+  evidence: TurnEvidenceResult,
+): void {
+  const merge = evidence.merge;
+  if (!merge) return;
+  if (merge.completeness.status !== "complete") {
+    if (acc.evidenceHadHole) acc.evidenceHadHole.value = true;
+    return;
+  }
+  const results = acc.evidenceResults;
+  if (!results) return;
+  // `outcomeKind` travels with the result, because it is the ONLY place the
+  // failure of a JSON-RPC call is recorded: that response is the error
+  // envelope (`{code, message}`) and carries no `isError` anywhere, so a
+  // reader looking at the payload alone would take it for a success and mine
+  // it for identifiers.
+  const entry = (call: CanonicalMcpCall): FrictionResultEntry => ({
+    raw: call.response,
+    ...(call.outcomeKind !== "success" ? { isError: true } : {}),
+    startedAtMs: call.startedAtMs,
+    settledAtMs: call.settledAtMs,
+  });
+  for (const [toolCallId, call] of merge.matchedByToolCallId) {
+    results.set(toolCallId, entry(call));
+  }
+  for (const call of merge.wireOnlyCalls) {
+    results.set(evidenceToolCallId(call.requestId), entry(call));
+  }
+}
+
+const truncateError = (message: string): string =>
+  message.length > 500 ? message.substring(0, 497) + "..." : message;
+
+/** Cap on widget `ui/message` follow-up turns driven **per authored step** (the
+ *  step-executor resets this budget for each step's `drainAndDriveFollowUps`
+ *  loop). Bounds a widget that re-sends a message on every render from looping
+ *  forever. Consumed by the executor (R3); this module only exports the value. */
+export const MAX_WIDGET_FOLLOWUP_TURNS = 3;
+
+/**
+ * Which layer failed, from what the engine REPORTED rather than from where
+ * this was called.
+ *
+ * The first version of this decision lived inline and assumed every engine
+ * error was a stream failure. `runHarnessTurn` wraps its whole turn —
+ * preparation included — in one try, so a missing `projectId`, a missing auth
+ * bearer, or disabled broker credential delivery arrives looking exactly like
+ * a provider outage. Calling those `model` files our own setup bug as the
+ * provider's, which is the mis-attribution this work exists to remove, moved
+ * one layer over.
+ *
+ * TWO EARLIER CLAIMS HERE WERE WRONG, and both said the same comfortable
+ * thing — that the gap was narrower than it was:
+ *
+ *   - "that holds for the chat engine": it did not. `runChatEngineLoop`'s
+ *     outer catch covers its own preparation just as broadly — the
+ *     trace-payload `structuredClone`, message scrubbing, tool narrowing,
+ *     `emitTurnStart`. It was simply never given a phase to report.
+ *   - "every emitter that omits it today is a real stream failure": that
+ *     engine's three emitters ALL omitted it, so every emulated-path failure,
+ *     preparation bugs included, resolved here to `model`. On the hosted path
+ *     that also WITHDREW the eval failures a provider outage excuses.
+ *
+ * Both engines now report a phase, so the default below governs only emitters
+ * outside them. It stays `model` deliberately: with the in-repo emitters
+ * truthful, an unknown emitter is far likelier to be a stream failure, and
+ * flipping it would un-attribute the outages this work was built for.
+ */
+export function failedLayerForEngineError(
+  event: { phase?: "setup" | "stream" } | undefined,
+): "model" | "setup" {
+  return event?.phase === "setup" ? "setup" : "model";
+}
+
+export async function driveHostedEvalTurn(
+  params: DriveHostedEvalTurnParams,
+): Promise<HostedEvalTurnOutcome> {
+  const {
+    promptIndex,
+    browser,
+    prepared,
+    acc,
+    isAborted,
+    abortSignal,
+    turnTimeoutMs,
+  } = params;
+  const logSuffix = params.logSuffix ?? "";
+
+  // Browser-rendered MCP App eval (PR 14): stamp collected artifacts with
+  // this turn.
+  browser.setActivePromptIndex(promptIndex);
+  // Arm this turn's per-widget interaction checks. The harness replays a group
+  // when its widget mounts (from a model tool call's result); a group whose
+  // widget never renders flushes to `scriptedCheckFailures`. The runner's
+  // post-loop verdict gate reads those failures.
+  browser.setActiveWidgetChecks(params.widgetChecks ?? []);
+
+  // Per-turn span-capture context. `wrapToolSetForEvalTrace` instruments
+  // each tool's `execute` to push to `traceCtx.recordedSpans`; we drain
+  // into `acc.capturedSpans` after the engine finishes. The Computer Use
+  // tools ride the same wrap so `computer` / `finish_widget` executions
+  // land as tool spans in the trace UI like every other local tool.
+  const traceCtx = createAiSdkEvalTraceContext(params.runStartedAt);
+  const mergedTools = {
+    ...prepared.allTools,
+    ...browser.computerWidgetTools,
+  };
+  const tracedTools = wrapToolSetForEvalTrace(
+    params.toolPolicyGate
+      ? params.toolPolicyGate.wrap(mergedTools)
+      : mergedTools,
+    traceCtx,
+    promptIndex,
+  );
+
+  // Push the user prompt into `messageHistory` BEFORE the engine call so a
+  // failed turn still persists the user side of the transcript (Cursor
+  // review round-2 — the transcript stays honest about WHICH turn errored).
+  // Mirrored into the trace transcript at the same site — the two histories
+  // move together everywhere or the trace view drifts silently.
+  acc.messageHistory.push({ role: "user", content: params.prompt });
+  acc.traceMessageHistory.push({ role: "user", content: params.prompt });
+  const messageCountBeforeTurn = acc.messageHistory.length;
+  const inputMessages: ModelMessage[] = [...acc.messageHistory];
+
+  const baselineUsage = {
+    inputTokens: acc.accumulatedUsage.inputTokens ?? 0,
+    outputTokens: acc.accumulatedUsage.outputTokens ?? 0,
+    totalTokens: acc.accumulatedUsage.totalTokens ?? 0,
+  };
+
+  // Per-turn tool-call accumulator. Index by `promptIndex` (get-or-create)
+  // rather than `push()` so a widget `ui/message` follow-up turn — which
+  // reuses its parent authored turn's `promptIndex` (it is NOT a new authored
+  // prompt) — folds INTO the parent's bucket instead of orphaning its calls at
+  // a fresh slot the grader (`evaluateMultiTurnResults`, which maps only over
+  // authored `promptTurns`) never reads. `promptToolsBaseline` marks where the
+  // parent's already-committed calls end so the post-turn reconcile below
+  // replaces only THIS turn's live entries (the stream runner's `onToolCall`
+  // populates the array live) without wiping the parent's.
+  const promptToolsCalled: ToolCall[] = (acc.toolsCalledByPrompt[
+    promptIndex
+  ] ??= []);
+  const promptToolsBaseline = promptToolsCalled.length;
+
+  // Built inside the pre-turn try below; `{}` until then so the failure
+  // mapper can always call `sinks.onTurnFailure?.()` safely.
+  let sinks: HostedEvalTurnSinks = {};
+
+  /**
+   * This turn's clock. Assigned only just before the engine call, so the turn
+   * budget does not start running during the pre-turn setup (Chromium widget
+   * dismissal and friends) that precedes it.
+   *
+   * Declared HERE rather than there because `mapThrownTurnError` below reads
+   * it, and the pre-turn setup calls that mapper — with a `const` beside the
+   * engine call, a setup throw hit the temporal dead zone and raised a
+   * `ReferenceError` in place of the outcome it was supposed to map.
+   */
+  let turnDeadline: DeadlineHandle | undefined;
+  /**
+   * True once THIS turn's bound tripped — not the run's, not the user's, and
+   * never before the clock is armed.
+   */
+  const turnTimedOut = () => turnDeadline?.firedClock() === "turn";
+  /**
+   * Was this turn cancelled — as opposed to having run out of its own clock?
+   *
+   * Reads the COMPOSED signal as well as the caller's, because the composed
+   * one is what the engine actually observed. The two agree whenever the
+   * caller's fires (composition forwards it), but the engine can also be
+   * handed an abort that never reached the caller's handle, and a turn the
+   * engine saw cancelled is cancelled whatever the parent says.
+   *
+   * Only meaningful AFTER `turnTimedOut()` has been ruled out: the turn clock
+   * aborts this same signal.
+   */
+  const cancelledMidTurn = () =>
+    isAborted() || turnDeadline?.signal.aborted === true;
+  const turnTimeoutFailure = (): HostedEvalTurnOutcome => {
+    acc.capturedSpans.push(...traceCtx.recordedSpans);
+    const failure = {
+      timeout: {
+        clock: "turn" as const,
+        budgetMs: turnTimeoutMs,
+        elapsedMs: turnDeadline?.elapsedMs() ?? turnTimeoutMs,
+      },
+      iterationError: truncateError(
+        `Turn exceeded its ${turnTimeoutMs}ms budget (elapsed ${
+          turnDeadline?.elapsedMs() ?? turnTimeoutMs
+        }ms)`,
+      ),
+    };
+    logger.error(
+      `[evals] backend iteration${logSuffix} turn exceeded its ${turnTimeoutMs}ms budget`,
+    );
+    sinks.onTurnFailure?.(failure);
+    // `failed`, never `cancelled`. A turn that ran out of clock produced a
+    // real result — a failure — and the iteration still deserves its verdict.
+    // Reporting it as cancellation would discard the turn and leave a budget
+    // cut looking like a run that never happened.
+    return {
+      kind: "failed" as const,
+      ...failure,
+      errorSource: "model" as const,
+    };
+  };
+
+  // Shared throw → outcome mapping for the pre-turn setup AND the engine
+  // call. Cancellation: AbortError can surface either as a thrown exception
+  // (fetch aborted mid-flight) or as the engine's internal
+  // silent-cancellation path (handled by the `isAborted()` check after the
+  // success path below) — check `abortSignal.aborted` to catch BOTH paths
+  // consistently. Non-abort errors map to `iterationError` for the post-loop
+  // verdict gate, preserving a truncated message and, when available, a
+  // `responseBody` for `errorDetails`. The turn's tool-instrumentation spans
+  // are drained first so the persisted iteration (and the stream sink's
+  // failure snapshot, which reads the same array) keeps whatever tool
+  // executions completed before the throw — aligning with the (a)/(b)/(c)
+  // failure branches below (CodeRabbit, PR 2610).
+  const mapThrownTurnError = (
+    error: unknown,
+    failedStage: string,
+  ): HostedEvalTurnOutcome => {
+    // Ahead of the cancellation arm, and that order is the whole point: a
+    // turn-budget abort reaches here as an AbortError on the same composed
+    // signal a user cancel does. `firedClock()` reports only THIS handle's own
+    // clock, which is the only thing that tells the two apart.
+    if (turnTimedOut()) return turnTimeoutFailure();
+    if (
+      cancelledMidTurn() ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      logger.debug(
+        `[evals] backend iteration${logSuffix} aborted due to cancellation`,
+      );
+      return { kind: "cancelled" };
+    }
+
+    acc.capturedSpans.push(...traceCtx.recordedSpans);
+    let iterationError: string;
+    let iterationErrorDetails: string | undefined;
+    if (error instanceof Error) {
+      iterationError = error.message || error.toString();
+      const responseBody = (error as { responseBody?: unknown }).responseBody;
+      if (responseBody && typeof responseBody === "string") {
+        iterationErrorDetails = responseBody;
+      }
+    } else if (typeof error === "string") {
+      iterationError = error;
+    } else {
+      iterationError = String(error);
+    }
+    iterationError = truncateError(iterationError);
+    logger.error(`[evals] ${failedStage}${logSuffix} failed`, error);
+    const failure = {
+      iterationError,
+      ...(iterationErrorDetails ? { iterationErrorDetails } : {}),
+    };
+    sinks.onTurnFailure?.(failure);
+    // `failedStage` already names the layer; "pre-turn setup" is the one call
+    // site that never reached the model.
+    return {
+      kind: "failed" as const,
+      ...failure,
+      errorSource:
+        failedStage === "pre-turn setup"
+          ? ("setup" as const)
+          : ("model" as const),
+    };
+  };
+
+  // Pre-turn setup that can genuinely throw: the Chromium widget dismissal
+  // (start the turn with a clean surface — a widget kept mounted by a
+  // previous prompt turn must not bleed into this one, otherwise Computer
+  // Use could be advertised against the prior turn's widget before this
+  // turn's own MCP App tool runs), the caller-built SSE sinks, and the
+  // turn-start emit. Route their failures through the same mapping as the
+  // engine call so hosted callers always receive an outcome and run normal
+  // iteration persistence, instead of the throw escaping to the coarse
+  // iteration-abort path (CodeRabbit, PR 2610).
+  try {
+    await browser.dismissCarriedWidget();
+    sinks =
+      params.buildSinks?.({
+        promptIndex,
+        prompt: params.prompt,
+        baselineUsage,
+        traceCtx,
+        promptToolsCalled,
+      }) ?? {};
+    sinks.onTurnStart?.();
+  } catch (error) {
+    return mapThrownTurnError(error, "pre-turn setup");
+  }
+
+  // PR 5b-followup-2: capture the engine's structured-error event (429
+  // daily-cap, hosted-model setup errors, …). The engine writes a generic
+  // `error` UI chunk to the no-op writer (`streamSink: "none"`); the callback
+  // gives the parsed `{ code?, message, details? }` so failure branches can
+  // surface the actual reason instead of the generic fallback.
+  let lastEngineError: MCPJamEngineErrorEvent | undefined;
+  /**
+   * What the run FROZE about evidence, as the mint reported it on this turn.
+   *
+   * Undefined until the harness turn mints — and on the emulated path, never.
+   * Read rather than derived: this is the decision the control plane recorded
+   * at RUN CREATION, so a flag flipped mid-run cannot change what this turn
+   * does.
+   */
+  let harnessEvidence:
+    | {
+        captureEnabled: boolean;
+        gradingSource: "narration" | "evidence";
+        turnId: string;
+      }
+    | undefined;
+
+  // Cursor + Codex review fix: thread `toolChoice` AND `maxOutputTokens`
+  // through `extraBodyFields` since the engine options don't expose them as
+  // first-class fields. `maxOutputTokens: 16384` matches the legacy per-step
+  // Convex body (Cursor round-2 "Dropped eval maxOutputTokens limit").
+  const mergedExtraBodyFields: Record<string, unknown> = {
+    maxOutputTokens: 16384,
+    ...(params.extraBodyFields ?? {}),
+    ...(params.toolChoice ? { toolChoice: params.toolChoice } : {}),
+  };
+
+  // This turn's own clock, nested under the iteration's. `withDeadline`
+  // COMPOSES rather than replaces: the engine still sees a single signal and
+  // it fires on whichever bound trips first. Without it, one wedged hosted
+  // turn holds the iteration until the ITERATION's budget expires — the whole
+  // remaining allowance spent on a turn that was never coming back.
+  turnDeadline = withDeadline(abortSignal, turnTimeoutMs, "turn");
+
+  let turnResult: Awaited<ReturnType<typeof runAssistantTurn>>;
+  try {
+    turnResult = await runAssistantTurn({
+      messages: inputMessages,
+      // Eval's `runTestCase` already resolved the canonical model id
+      // (`getCanonicalModelId(modelDefinition.id, provider)`) and threads it
+      // in as `modelId`. The engine reads `modelDefinition.id` for the wire
+      // payload, so override here so backend wallet/quota lookup keys match
+      // what live chat sends.
+      modelDefinition: { ...params.modelDefinition, id: params.modelId },
+      // PR2 (flagged): append recorded model-visible widget interactions to the
+      // system prompt so the model reasons over them (system prompt only — no
+      // transcript/matcher/persistence impact; mirrors the local path).
+      systemPrompt: EVAL_WIDGET_MODEL_CONTEXT
+        ? withWidgetContextSystemPrompt(
+            prepared.enhancedSystemPrompt,
+            browser.browserInteractionSteps,
+          )
+        : prepared.enhancedSystemPrompt,
+      ...(prepared.resolvedTemperature != null
+        ? { temperature: prepared.resolvedTemperature }
+        : {}),
+      tools: tracedTools,
+      ...(params.selectedServers.length
+        ? { selectedServerIds: params.selectedServers }
+        : {}),
+      mcpClientManager: params.mcpClientManager,
+      authContext: params.evalAuthContext,
+      sourceType: "eval",
+      origin: "eval",
+      streamSink: "none",
+      persistMode: "caller",
+      approvalMode: "auto-deny",
+      // Harness eval (host harness === "claude-code"): forward the selector and
+      // the host's real approval intent so runHarnessTurn fail-closes on a
+      // requireToolApproval host (it can't do interactive approval yet) while
+      // still running non-approval hosts under allow-all. Gated on harness so
+      // emulated evals stay byte-identical (they forward neither today).
+      ...(params.harness
+        ? {
+            harness: params.harness,
+            ...(params.harnessExecutionTarget ? { harnessExecutionTarget: params.harnessExecutionTarget } : {}),
+            ...(params.requireToolApproval !== undefined
+              ? { requireToolApproval: params.requireToolApproval }
+              : {}),
+            // runHarnessTurn needs projectId to resolve the host's computer
+            // (authHeader already rides authContext.token). Harness-gated so
+            // emulated evals stay byte-identical.
+            ...(params.projectId ? { projectId: params.projectId } : {}),
+            // The run's environment — the grant boundary the brokered
+            // external-account credential check is scoped to.
+            ...(params.environmentId
+              ? { environmentId: params.environmentId }
+              : {}),
+            ...(!params.environmentId && params.environmentUnresolvedReason
+              ? {
+                  environmentUnresolvedReason:
+                    params.environmentUnresolvedReason,
+                }
+              : {}),
+            // THIS iteration's box, so the harness runs on it instead of
+            // reserving the acting member's personal computer.
+            ...(params.harnessSandboxBinding
+              ? { harnessSandboxBinding: params.harnessSandboxBinding }
+              : {}),
+            // Required whenever servers are selected — and an eval suite always
+            // has servers, so its absence is a thrown turn, not a degraded one.
+            ...(params.harnessMcpProxy
+              ? { harnessMcpProxy: params.harnessMcpProxy }
+              : {}),
+            // Policied harness run: the sealed snapshot rides the `.mcp.json`
+            // proxy token, and refusals come back through this sink.
+            ...(params.evalIterationId
+              ? { evalIterationId: params.evalIterationId }
+              : {}),
+            ...(params.harnessToolPolicy
+              ? { harnessToolPolicy: params.harnessToolPolicy }
+              : {}),
+            ...(params.onHarnessPolicyBlocks
+              ? { onHarnessPolicyBlocks: params.onHarnessPolicyBlocks }
+              : {}),
+            // Present-but-empty is meaningful (the "without skills" arm), so
+            // this checks for undefined rather than truthiness. Absent would
+            // fall through to the harness's LIVE project-wide fetch, which is
+            // what unfreezes a frozen run.
+            ...(params.pinnedHarnessSkills !== undefined
+              ? { pinnedHarnessSkills: params.pinnedHarnessSkills }
+              : {}),
+            // The harness reads built-ins ONLY off this field. Omitting it
+            // would hand the runtime a turn with no web_search and no way to
+            // tell that anything was missing.
+            ...(params.builtInTools
+              ? { builtInTools: params.builtInTools }
+              : {}),
+            // The host's MCP tool-CONSTRUCTION policies. `runHarnessTurn`
+            // rebuilds this turn's MCP tools instead of consuming `tools`
+            // above, and reads each of these off the handler options and
+            // nowhere else — omitting one hands the harness the SDK's default,
+            // not the host's choice. Harness-gated like every field in this
+            // block: `modelVisibleMcpToolResults` is also read by the EMULATED
+            // loop, so the gate is what keeps emulated evals byte-identical.
+            // Forwarded on DEFINEDNESS — `respectToolVisibility: false` is the
+            // opt-out and a truthy check would erase it.
+            ...(params.modelVisibleMcpToolResults !== undefined
+              ? {
+                  modelVisibleMcpToolResults: params.modelVisibleMcpToolResults,
+                }
+              : {}),
+            ...(params.respectToolVisibility !== undefined
+              ? { respectToolVisibility: params.respectToolVisibility }
+              : {}),
+            ...(params.tasks !== undefined ? { tasks: params.tasks } : {}),
+          }
+        : {}),
+      endpointPath: params.endpointPath,
+      extraBodyFields: mergedExtraBodyFields,
+      ...(params.extraHeaders ? { extraHeaders: params.extraHeaders } : {}),
+      abortSignal: turnDeadline.signal,
+      maxSteps: params.maxSteps,
+      progressivePlan: prepared.progressivePlan,
+      discoveryState: prepared.discoveryState,
+      ...(sinks.onLiveTextDelta
+        ? { onLiveTextDelta: sinks.onLiveTextDelta }
+        : {}),
+      // Browser-rendered MCP App eval (PR 14): cache tool-call inputs for the
+      // widget shim, render MCP App tool results in the harness (the engine
+      // awaits the hook, so a mounted widget is visible to the next step's
+      // gate), and hide `computer` / `finish_widget` until a widget has
+      // actually rendered. SSE sinks compose around the browser hooks:
+      // `onToolResult` SSE fires BEFORE the render so live consumers don't
+      // wait on Chromium.
+      onToolCall: (event) => {
+        browser.noteToolCallInput(event);
+        sinks.onToolCall?.(event);
+      },
+      onToolResult: async (event) => {
+        await sinks.onToolResult?.(event);
+        await browser.handleEngineToolResult(event);
+      },
+      ...(sinks.onStepFinish ? { onStepFinish: sinks.onStepFinish } : {}),
+      onEngineError: (event) => {
+        lastEngineError = event;
+      },
+      // The run's FROZEN evidence decision, as the mint reported it. Captured
+      // here as well as forwarded to the caller: this turn needs it to decide
+      // whether to read evidence at all, and the caller needs it to decide how
+      // the iteration is graded.
+      onHarnessEvidenceDecision: (decision) => {
+        harnessEvidence = decision;
+        params.onHarnessEvidenceDecision?.(decision);
+      },
+      ...(browser.prepareAdvertisedTools
+        ? { prepareAdvertisedTools: browser.prepareAdvertisedTools }
+        : {}),
+    });
+  } catch (error) {
+    return mapThrownTurnError(error, "runAssistantTurn");
+  } finally {
+    turnDeadline?.dispose();
+  }
+
+  // The engine's SILENT path: it catches AbortError, omits the `turnTrace` and
+  // returns normally, so a blown turn budget arrives here looking exactly like
+  // a cancel. Same discrimination as in `mapThrownTurnError`, and the same
+  // reason it comes first.
+  if (turnTimedOut()) return turnTimeoutFailure();
+
+  // Cancellation that fired DURING `runAssistantTurn` without surfacing as a
+  // throw: the engine catches AbortError, sets its internal `aborted` flag,
+  // omits the `turnTrace`, and returns normally. Without this check we'd
+  // fall through to the silent-cycle-failure branch below and record an
+  // aborted run as a verdict failure.
+  if (cancelledMidTurn()) {
+    logger.debug(
+      `[evals] backend iteration${logSuffix} aborted mid-turn; skipping record`,
+    );
+    return { kind: "cancelled" };
+  }
+
+  // Drain per-turn outputs into the iteration-level accumulators BEFORE the
+  // failure checks below — preserves whatever partial good state the engine
+  // produced (tool spans, partial transcript, usage), so the persisted
+  // iteration shows what completed before the failure point.
+  //
+  // Codex round-3 (P2 "Preserve backend tool step indices"): the wrap's tool
+  // spans land with `stepIndex: -1` (no `prepareStep` bridge to the engine);
+  // the engine's own LLM-step spans land on `turnTrace.spans` with correct
+  // per-step indices. Merge both.
+  //
+  // EVIDENCE runs BEFORE the drain, not after: the spans it annotates are the
+  // ones being pushed here, and annotating a copy the accumulator already
+  // holds would leave the persisted trace unprovenanced while the in-memory
+  // one looked right.
+  const turnSpans = [
+    ...traceCtx.recordedSpans,
+    ...(turnResult.turnTrace?.spans ?? []),
+  ];
+  // The turn's OWN messages: the engine returns the full transcript, and
+  // reconciling against all of it would try to match this turn's evidence
+  // to earlier turns' calls. ONE slice, consumed by the reconciler, the
+  // grading projection and the trace roll below — three slices could
+  // disagree if the engine ever mutated the array between them.
+  const newMessages = turnResult.messages.slice(messageCountBeforeTurn);
+  const evidence = await reconcileTurnEvidence({
+    ...(params.harnessExecutionTarget ? { transport: createConvexEvidenceReadTransport(params.evalAuthContext.token) } : {}),
+    ...(params.evalIterationId ? { iterationId: params.evalIterationId } : {}),
+    ...(harnessEvidence?.turnId ? { turnId: harnessEvidence.turnId } : {}),
+    captureEnabled: harnessEvidence?.captureEnabled === true,
+    spans: turnSpans,
+    newMessages,
+    // Policy-refused calls never reached a server; without this the
+    // reconciler would count each one as a narrated MCP call with no wire
+    // row and degrade every policy-exercising turn to narration grading.
+    ...(params.policyBlockedToolCallIds
+      ? { policyBlockedToolCallIds: params.policyBlockedToolCallIds() }
+      : {}),
+  });
+  acc.capturedSpans.push(...evidence.spans);
+  (acc.requestPayloads ??= []).push(
+    ...expandPersistedRequestPayloads(
+      turnResult.turnTrace?.requestPayloads ?? [],
+    ).map((entry) => ({ ...entry, promptIndex: params.promptIndex })),
+  );
+  collectEvidenceResults(acc, evidence);
+  // Reconcile accumulated usage to the engine's canonical post-turn total
+  // against the pre-turn baseline. The stream runner's `onStepFinish` sink
+  // rolls `accumulatedUsage` per step for live snapshots; this final
+  // assignment lands on the same value (PR 4b "totalUsage merged BEFORE
+  // failure branches" invariant).
+  if (turnResult.usage) {
+    acc.accumulatedUsage.inputTokens =
+      baselineUsage.inputTokens + (turnResult.usage.inputTokens ?? 0);
+    acc.accumulatedUsage.outputTokens =
+      baselineUsage.outputTokens + (turnResult.usage.outputTokens ?? 0);
+    acc.accumulatedUsage.totalTokens =
+      baselineUsage.totalTokens + (turnResult.usage.totalTokens ?? 0);
+  }
+
+  // Per-turn tool calls — rebuilt from the new messages only, then run
+  // through the GRADING-SOURCE selection: under frozen evidence grading a
+  // complete turn's set comes from the canonical wire record (matched calls
+  // carry server-received arguments, wire-only calls join, narration-only
+  // MCP calls stop counting), and everything else — narration grading,
+  // capture off, an incomplete turn — is exactly the narrated projection.
+  // Replaces whatever the live `onToolCall` sink accumulated so the grader
+  // sees the canonical shape.
+  const canonicalPromptToolsCalled = selectGradedToolCalls({
+    narration: params.extractToolCalls(newMessages),
+    evidence,
+    gradingSource: harnessEvidence?.gradingSource,
+  }) as ToolCall[];
+  // Truncate to the baseline (NOT 0) so a follow-up turn sharing the parent's
+  // `promptIndex` drops only its own live entries and keeps the parent's
+  // committed calls; for a fresh authored turn the baseline is 0 (unchanged).
+  promptToolsCalled.length = promptToolsBaseline;
+  promptToolsCalled.push(...canonicalPromptToolsCalled);
+
+  // Roll the engine's transcript forward as the next turn's starting point —
+  // and the TRACE transcript alongside it. The model history is replaced
+  // wholesale with the engine's full transcript; the trace history appends
+  // this turn's evidence-enriched slice (identical to `newMessages` plus any
+  // reconstructed wire-only tool results), so prior turns' enrichment is
+  // never lost to the wholesale roll.
+  acc.messageHistory.length = 0;
+  acc.messageHistory.push(...turnResult.messages);
+  acc.traceMessageHistory.push(...(evidence.traceMessages ?? newMessages));
+
+  // Failure detection (ordered most-specific → least-specific). Three engine
+  // failure shapes the runner must catch:
+  //
+  //  (a) Engine catch fired AFTER partial messages were appended — the
+  //      engine's `executeEngine` catch leaves `runSucceeded: false` →
+  //      `turnTrace` is NOT captured even though messages may have grown.
+  //      `!turnTrace` is the reliable signal.
+  //  (b) Engine succeeded (turnTrace captured) but produced no new content
+  //      (step-level non-OK → `shouldContinue: false`, synthetic finish).
+  //      Detect via `newMessages.length === 0`.
+  //  (c) Step 1 succeeded, a later step errored: `turnTrace` captured,
+  //      messages grew, but `turnTrace.spans` carries a non-tool
+  //      error-status span.
+  //
+  // PR 5b-followup-2: prefer the engine's captured structured error when
+  // present (429 daily-cap text, hosted-model setup errors, …) over the
+  // generic fallbacks.
+  const failTurn = (
+    fallbackError: string,
+    logLine: string,
+  ): HostedEvalTurnOutcome => {
+    const failure = lastEngineError
+      ? {
+          iterationError: lastEngineError.message,
+          iterationErrorDetails: lastEngineError.rawText,
+        }
+      : { iterationError: fallbackError };
+    logger.error(logLine);
+    sinks.onTurnFailure?.(failure);
+    // WHICH LAYER, from the engine's own report rather than from this call
+    // site's position.
+    //
+    // The first version of this said "every path through here is the engine's
+    // stream failing". That is true of the chat engine and false of the
+    // HARNESS: `runHarnessTurn` wraps its entire turn — preparation included —
+    // in one try, so a missing projectId, a missing auth bearer or disabled
+    // broker credential delivery arrives here exactly like a provider outage.
+    // Calling those `model` would file our own setup bug as the provider's,
+    // which is the mis-attribution this whole change exists to remove, just
+    // moved one layer over.
+    //
+    // So the engine's `phase` decides when it is reported, and `model` remains
+    // the default only for emitters that do not report one — every such
+    // emitter today is a real stream failure.
+    const failedLayer = failedLayerForEngineError(lastEngineError);
+    // The structured code and status ride along when the engine captured them
+    // — they are diagnostics, never the basis for the classification.
+    return {
+      kind: "failed" as const,
+      ...failure,
+      errorSource: failedLayer,
+      ...(lastEngineError?.code ? { errorCode: lastEngineError.code } : {}),
+      ...(typeof lastEngineError?.httpStatus === "number"
+        ? { errorHttpStatus: lastEngineError.httpStatus }
+        : {}),
+    };
+  };
+
+  const turnFailure = getHostedTurnFailure({
+    turnTrace: turnResult.turnTrace,
+    newMessageCount: newMessages.length,
+  });
+  if (turnFailure) {
+    return failTurn(
+      turnFailure,
+      `[evals] runAssistantTurn${logSuffix} failed: ${turnFailure} (engineError=${
+        lastEngineError ? lastEngineError.code ?? "uncoded" : "none"
+      })`,
+    );
+  }
+
+  sinks.onTurnSuccess?.();
+
+  // Widget `ui/message` follow-ups are drained + re-driven by the step-executor
+  // after EACH authored step (R3 consolidation — `drainAndDriveFollowUps`), so
+  // local and hosted share one loop policy. This helper drives exactly one turn.
+  return { kind: "completed" };
+}

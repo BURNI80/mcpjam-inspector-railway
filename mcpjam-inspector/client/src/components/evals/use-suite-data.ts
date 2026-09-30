@@ -1,0 +1,615 @@
+import { useMemo } from "react";
+import { desanitizeFromConvexTransport } from "@/shared/convex-sanitize";
+import {
+  formatTime,
+  formatRunId,
+  computeIterationSummary,
+  getTemplateKey,
+} from "./helpers";
+import { computeIterationResult } from "./pass-criteria";
+import type { RunMetricsByRun } from "./run-metrics";
+import {
+  EvalCase,
+  EvalIteration,
+  EvalSuite,
+  EvalSuiteRun,
+  SuiteAggregate,
+} from "./types";
+
+/**
+ * Run-level advisory judge score: the mean of the goal-completion judge's
+ * per-case scores, as a whole percent — or null when the run carries no
+ * completed judge verdict.
+ *
+ * Null, never zero: an unjudged run is not a run that scored 0, and the trend
+ * chart DROPS null points rather than plotting them (the same honesty rule
+ * the swarm overview's daily trend applies to 0/0 buckets).
+ *
+ * Unit note: `goalCompletion.cases[].score` is a 0..1 fraction (unlike
+ * `passCriteria.minimumPassRate`, which is 0-100); this returns 0-100 to
+ * match `passRate` in the same trend rows.
+ */
+export function computeRunJudgeScore(run: EvalSuiteRun): number | null {
+  const cases = run.goalCompletion?.cases;
+  if (!cases || cases.length === 0) return null;
+  const scores = cases
+    .map((c) => c.score)
+    .filter((score) => typeof score === "number" && Number.isFinite(score));
+  if (scores.length === 0) return null;
+  const mean = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+  return Math.round(mean * 100);
+}
+
+function desanitizeEvalIteration(iter: EvalIteration): EvalIteration {
+  return {
+    ...iter,
+    actualToolCalls: desanitizeFromConvexTransport(iter.actualToolCalls),
+    testCaseSnapshot: iter.testCaseSnapshot
+      ? {
+          ...iter.testCaseSnapshot,
+          expectedToolCalls: desanitizeFromConvexTransport(
+            iter.testCaseSnapshot.expectedToolCalls,
+          ),
+        }
+      : undefined,
+  };
+}
+
+export function useSuiteData(
+  suite: EvalSuite,
+  cases: EvalCase[],
+  rawIterations: EvalIteration[],
+  rawAllIterations: EvalIteration[],
+  runs: EvalSuiteRun[],
+  aggregate: SuiteAggregate | null,
+) {
+  const iterations = useMemo(
+    () => rawIterations.map(desanitizeEvalIteration),
+    [rawIterations],
+  );
+  const allIterations = useMemo(
+    () => rawAllIterations.map(desanitizeEvalIteration),
+    [rawAllIterations],
+  );
+  const activeRunIds = useMemo(
+    () => new Set(runs.map((run) => run._id)),
+    [runs],
+  );
+
+  // General overview summary (all iterations)
+  const generalSummary = useMemo(() => {
+    const totals = aggregate?.totals;
+    if (!totals) {
+      return {
+        passRate: 0,
+        passed: 0,
+        failed: 0,
+        total: 0,
+        cancelled: 0,
+        pending: 0,
+      };
+    }
+
+    const total =
+      totals.passed + totals.failed + totals.cancelled + totals.pending;
+    const passRate = total > 0 ? Math.round((totals.passed / total) * 100) : 0;
+
+    return {
+      passRate,
+      passed: totals.passed,
+      failed: totals.failed,
+      total,
+      cancelled: totals.cancelled,
+      pending: totals.pending,
+    };
+  }, [aggregate]);
+
+  const runTrendData = useMemo(() => {
+    const data = [...runs]
+      .slice()
+      .reverse()
+      .map((run) => {
+        // Policy-2 inconclusive runs deliberately have no pass/fail verdict.
+        // Do not fall back to their legacy-looking summary counts in charts.
+        if (run.result === "inconclusive") return null;
+        const runIterations = allIterations.filter(
+          (iter) => iter.suiteRunId === run._id,
+        );
+        // Only count completed iterations - exclude pending/cancelled
+        const iterationResults = runIterations.map((i) =>
+          computeIterationResult(i),
+        );
+        const realTimePassed = iterationResults.filter(
+          (r) => r === "passed",
+        ).length;
+        const realTimeTotal = iterationResults.filter(
+          (r) => r === "passed" || r === "failed",
+        ).length;
+
+        let passRate: number;
+        if (realTimeTotal > 0) {
+          passRate = Math.round((realTimePassed / realTimeTotal) * 100);
+        } else if (run.summary) {
+          passRate = Math.round(run.summary.passRate * 100);
+        } else {
+          return null;
+        }
+
+        const passed =
+          realTimeTotal > 0
+            ? realTimePassed
+            : (run.summary?.passed ?? 0);
+        const total =
+          realTimeTotal > 0
+            ? realTimeTotal
+            : (run.summary?.total ?? 0);
+
+        return {
+          runId: run._id,
+          runIdDisplay: formatRunId(run._id),
+          passRate,
+          passed,
+          total,
+          label: formatTime(run.completedAt ?? run.createdAt),
+          runNumber: run.runNumber,
+          judgeScore: computeRunJudgeScore(run),
+          // Ran under a per-run judge override — divergence from the suite's
+          // judge calibration must be visible on the trend, not silent.
+          judgeOffConfig: run.judgeConfigOverride !== undefined,
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is {
+          runId: string;
+          runIdDisplay: string;
+          passRate: number;
+          passed: number;
+          total: number;
+          label: string;
+          runNumber: number;
+          judgeScore: number | null;
+          judgeOffConfig: boolean;
+        } => item !== null,
+      );
+    return data;
+  }, [runs, allIterations]);
+
+  const modelStats = useMemo(() => {
+    const activeIterations = allIterations.filter(
+      (iteration) =>
+        !iteration.suiteRunId || activeRunIds.has(iteration.suiteRunId),
+    );
+
+    const modelMap = new Map<
+      string,
+      { passed: number; failed: number; total: number; modelName: string }
+    >();
+
+    activeIterations.forEach((iteration) => {
+      const model = iteration.testCaseSnapshot?.model || "Unknown";
+      const modelName = iteration.testCaseSnapshot?.model || "Unknown Model";
+
+      // Only count terminal pass/fail iterations - exclude pending/cancelled.
+      const result = computeIterationResult(iteration);
+      if (
+        result !== "passed" &&
+        result !== "failed" &&
+        result !== "timed_out"
+      ) {
+        return;
+      }
+
+      if (!modelMap.has(model)) {
+        modelMap.set(model, { passed: 0, failed: 0, total: 0, modelName });
+      }
+
+      const stats = modelMap.get(model)!;
+      stats.total += 1;
+
+      if (result === "passed") {
+        stats.passed += 1;
+      } else {
+        stats.failed += 1;
+      }
+    });
+
+    const data = Array.from(modelMap.entries()).map(([_model, stats]) => ({
+      model: stats.modelName,
+      passRate:
+        stats.total > 0 ? Math.round((stats.passed / stats.total) * 100) : 0,
+      passed: stats.passed,
+      failed: stats.failed,
+      total: stats.total,
+    }));
+
+    // Sort alphabetically by model name for consistent, fixed ordering
+    return data.sort((a, b) => a.model.localeCompare(b.model));
+  }, [allIterations, activeRunIds]);
+
+  // Case groups
+  const caseGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      {
+        testCase: EvalCase | null;
+        iterations: EvalIteration[];
+        summary: {
+          runs: number;
+          passed: number;
+          failed: number;
+          cancelled: number;
+          pending: number;
+          tokens: number;
+          avgDuration: number | null;
+        };
+      }
+    >();
+
+    // Initialize groups for all test cases from database
+    cases.forEach((testCase) => {
+      groups.set(testCase._id, {
+        testCase,
+        iterations: [],
+        summary: {
+          runs: 0,
+          passed: 0,
+          failed: 0,
+          cancelled: 0,
+          pending: 0,
+          tokens: 0,
+          avgDuration: null,
+        },
+      });
+    });
+
+    const unassigned: {
+      testCase: EvalCase | null;
+      iterations: EvalIteration[];
+      summary: {
+        runs: number;
+        passed: number;
+        failed: number;
+        cancelled: number;
+        pending: number;
+        tokens: number;
+        avgDuration: number | null;
+      };
+    } = {
+      testCase: null,
+      iterations: [],
+      summary: {
+        runs: 0,
+        passed: 0,
+        failed: 0,
+        cancelled: 0,
+        pending: 0,
+        tokens: 0,
+        avgDuration: null,
+      },
+    };
+
+    // Group iterations
+    // Priority: testCaseId first, then fall back to snapshot grouping
+    iterations.forEach((iteration) => {
+      if (iteration.testCaseId) {
+        // First, try to match by testCaseId (most reliable)
+        const group = groups.get(iteration.testCaseId);
+        if (group) {
+          group.iterations.push(iteration);
+        } else {
+          unassigned.iterations.push(iteration);
+        }
+      } else if (iteration.testCaseSnapshot) {
+        // Fall back to snapshot grouping for legacy iterations without testCaseId
+        const snapshotKey = `snapshot-${iteration.testCaseSnapshot.title}-${iteration.testCaseSnapshot.query}`;
+        if (!groups.has(snapshotKey)) {
+          const virtualTestCase: EvalCase = {
+            _id: snapshotKey,
+            testSuiteId: suite._id,
+            createdBy: iteration.createdBy || "",
+            title: iteration.testCaseSnapshot.title,
+            query: iteration.testCaseSnapshot.query,
+            models: [
+              {
+                model: iteration.testCaseSnapshot.model,
+                provider: iteration.testCaseSnapshot.provider,
+              },
+            ],
+            runs: 1,
+            expectedToolCalls: iteration.testCaseSnapshot.expectedToolCalls,
+          };
+          groups.set(snapshotKey, {
+            testCase: virtualTestCase,
+            iterations: [],
+            summary: {
+              runs: 0,
+              passed: 0,
+              failed: 0,
+              cancelled: 0,
+              pending: 0,
+              tokens: 0,
+              avgDuration: null,
+            },
+          });
+        }
+        groups.get(snapshotKey)!.iterations.push(iteration);
+      } else {
+        unassigned.iterations.push(iteration);
+      }
+    });
+
+    const orderedGroups = Array.from(groups.values())
+      .filter((group) => group.iterations.length > 0)
+      .map((group) => {
+        const sortedIterations = [...group.iterations].sort((a, b) => {
+          if (a.iterationNumber != null && b.iterationNumber != null) {
+            return a.iterationNumber - b.iterationNumber;
+          }
+          return (a.createdAt ?? 0) - (b.createdAt ?? 0);
+        });
+        return {
+          ...group,
+          iterations: sortedIterations,
+          summary: computeIterationSummary(sortedIterations),
+        };
+      });
+
+    if (unassigned.iterations.length > 0) {
+      const sortedUnassigned = [...unassigned.iterations].sort((a, b) => {
+        if (a.iterationNumber != null && b.iterationNumber != null) {
+          return a.iterationNumber - b.iterationNumber;
+        }
+        return (a.createdAt ?? 0) - (b.createdAt ?? 0);
+      });
+      orderedGroups.push({
+        ...unassigned,
+        iterations: sortedUnassigned,
+        summary: computeIterationSummary(sortedUnassigned),
+      });
+    }
+
+    return orderedGroups;
+  }, [cases, iterations, suite._id]);
+
+  // Template groups - group test cases by testTemplateKey
+  const templateGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      {
+        title: string;
+        query: string;
+        testCaseIds: string[];
+        iterations: EvalIteration[];
+        summary: {
+          runs: number;
+          passed: number;
+          failed: number;
+          cancelled: number;
+          pending: number;
+          tokens: number;
+          avgDuration: number | null;
+        };
+      }
+    >();
+
+    caseGroups.forEach((group) => {
+      if (!group.testCase) return;
+
+      const templateKey = getTemplateKey(group.testCase);
+      const templateTitle = group.testCase.title
+        .replace(/\s*\[.*?\]\s*$/, "")
+        .trim();
+
+      if (!groups.has(templateKey)) {
+        groups.set(templateKey, {
+          title: templateTitle,
+          query: group.testCase.query,
+          testCaseIds: [],
+          iterations: [],
+          summary: {
+            runs: 0,
+            passed: 0,
+            failed: 0,
+            cancelled: 0,
+            pending: 0,
+            tokens: 0,
+            avgDuration: null,
+          },
+        });
+      }
+
+      const templateGroup = groups.get(templateKey)!;
+      if (!templateGroup.testCaseIds.includes(group.testCase._id)) {
+        templateGroup.testCaseIds.push(group.testCase._id);
+      }
+      templateGroup.iterations.push(...group.iterations);
+    });
+
+    return Array.from(groups.values()).map((group) => ({
+      ...group,
+      summary: computeIterationSummary(group.iterations),
+    }));
+  }, [caseGroups]);
+
+  return {
+    activeRunIds,
+    generalSummary,
+    runTrendData,
+    modelStats,
+    caseGroups,
+    templateGroups,
+  };
+}
+
+/**
+ * `useSuiteData`'s trend and per-model rows for the Evaluate suite page, read
+ * from per-run metrics (`run-metrics.ts`) instead of the whole suite's
+ * iterations. Same row shapes and the same counting rules; quick runs (no
+ * `suiteRunId`) and iterations with no model are not in any run's metrics, so
+ * they no longer appear in the model breakdown.
+ */
+export function useSuiteDataFromMetrics(
+  runs: EvalSuiteRun[],
+  metricsByRun: RunMetricsByRun,
+) {
+  const runTrendData = useMemo(() => {
+    const data = [...runs]
+      .slice()
+      .reverse()
+      .map((run) => {
+        // Policy-2 inconclusive runs deliberately have no pass/fail verdict.
+        if (run.result === "inconclusive") return null;
+        const metrics = metricsByRun.get(run._id);
+        // Only decided iterations count - exclude pending/cancelled/timeouts.
+        const realTimePassed = metrics?.results.passed ?? 0;
+        const realTimeTotal = realTimePassed + (metrics?.results.failed ?? 0);
+
+        let passRate: number;
+        if (realTimeTotal > 0) {
+          passRate = Math.round((realTimePassed / realTimeTotal) * 100);
+        } else if (run.summary) {
+          passRate = Math.round(run.summary.passRate * 100);
+        } else {
+          return null;
+        }
+
+        return {
+          runId: run._id,
+          runIdDisplay: formatRunId(run._id),
+          passRate,
+          passed: realTimeTotal > 0 ? realTimePassed : (run.summary?.passed ?? 0),
+          total: realTimeTotal > 0 ? realTimeTotal : (run.summary?.total ?? 0),
+          label: formatTime(run.completedAt ?? run.createdAt),
+          runNumber: run.runNumber,
+          judgeScore: computeRunJudgeScore(run),
+          judgeOffConfig: run.judgeConfigOverride !== undefined,
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is {
+          runId: string;
+          runIdDisplay: string;
+          passRate: number;
+          passed: number;
+          total: number;
+          label: string;
+          runNumber: number;
+          judgeScore: number | null;
+          judgeOffConfig: boolean;
+        } => item !== null,
+      );
+    return data;
+  }, [runs, metricsByRun]);
+
+  const modelStats = useMemo(() => {
+    const modelMap = new Map<
+      string,
+      { passed: number; failed: number; total: number }
+    >();
+    for (const run of runs) {
+      for (const row of metricsByRun.get(run._id)?.models ?? []) {
+        // Terminal pass/fail only; a timeout counts as a failure.
+        const failed = row.failed + row.timedOut;
+        const total = row.passed + failed;
+        if (total === 0) continue;
+        const stats = modelMap.get(row.model) ?? {
+          passed: 0,
+          failed: 0,
+          total: 0,
+        };
+        stats.passed += row.passed;
+        stats.failed += failed;
+        stats.total += total;
+        modelMap.set(row.model, stats);
+      }
+    }
+    return Array.from(modelMap.entries())
+      .map(([model, stats]) => ({
+        model,
+        passRate:
+          stats.total > 0 ? Math.round((stats.passed / stats.total) * 100) : 0,
+        passed: stats.passed,
+        failed: stats.failed,
+        total: stats.total,
+      }))
+      .sort((a, b) => a.model.localeCompare(b.model));
+  }, [runs, metricsByRun]);
+
+  return { runTrendData, modelStats };
+}
+
+export function useRunDetailData(
+  selectedRunId: string | null,
+  rawAllIterations: EvalIteration[],
+  runDetailSortBy: "model" | "test" | "result",
+) {
+  const allIterations = useMemo(
+    () => rawAllIterations.map(desanitizeEvalIteration),
+    [rawAllIterations],
+  );
+
+  // Iterations for selected run
+  const iterationsForSelectedRun = useMemo(() => {
+    if (!selectedRunId) return [];
+    return allIterations.filter(
+      (iteration) => iteration.suiteRunId === selectedRunId,
+    );
+  }, [selectedRunId, allIterations]);
+
+  // Flat list of iterations for selected run with sorting
+  const caseGroupsForSelectedRun = useMemo(() => {
+    if (!selectedRunId) return [];
+
+    const iterationsWithModel = iterationsForSelectedRun.map((iteration) => {
+      const snapshot = iteration.testCaseSnapshot;
+      return {
+        iteration,
+        model: snapshot?.model || "",
+        provider: snapshot?.provider || "",
+        title: snapshot?.title || "",
+        query: snapshot?.query || "",
+        result: iteration.result,
+      };
+    });
+
+    const sorted = [...iterationsWithModel].sort((a, b) => {
+      if (runDetailSortBy === "model") {
+        const modelA = `${a.provider}/${a.model}`;
+        const modelB = `${b.provider}/${b.model}`;
+        if (modelA !== modelB) return modelA.localeCompare(modelB);
+        if (a.title !== b.title) return a.title.localeCompare(b.title);
+        const numA = a.iteration.iterationNumber ?? 0;
+        const numB = b.iteration.iterationNumber ?? 0;
+        return numA - numB;
+      } else if (runDetailSortBy === "test") {
+        if (a.title !== b.title) return a.title.localeCompare(b.title);
+        const modelA = `${a.provider}/${a.model}`;
+        const modelB = `${b.provider}/${b.model}`;
+        if (modelA !== modelB) return modelA.localeCompare(modelB);
+        const numA = a.iteration.iterationNumber ?? 0;
+        const numB = b.iteration.iterationNumber ?? 0;
+        return numA - numB;
+      } else {
+        const resultOrder = { passed: 0, failed: 1, cancelled: 2, pending: 3 };
+        const orderA = resultOrder[a.result as keyof typeof resultOrder] ?? 4;
+        const orderB = resultOrder[b.result as keyof typeof resultOrder] ?? 4;
+        if (orderA !== orderB) return orderA - orderB;
+        if (a.title !== b.title) return a.title.localeCompare(b.title);
+        const modelA = `${a.provider}/${a.model}`;
+        const modelB = `${b.provider}/${b.model}`;
+        return modelA.localeCompare(modelB);
+      }
+    });
+
+    return sorted.map((item) => item.iteration);
+  }, [selectedRunId, iterationsForSelectedRun, runDetailSortBy]);
+
+  return {
+    iterationsForSelectedRun,
+    caseGroupsForSelectedRun,
+  };
+}

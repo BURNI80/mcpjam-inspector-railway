@@ -1,0 +1,430 @@
+import { listBaseServers } from "../../utils/mcp-connections.js";
+import { Hono } from "hono";
+import type {
+  ElicitRequest,
+  ElicitResult,
+  ListToolsResult,
+} from "@modelcontextprotocol/client";
+import "../../types/hono"; // Type extensions
+import { listTools as listToolsShared } from "../../utils/route-handlers.js";
+import {
+  extractInsufficientScopeChallenge,
+  serializeMcpError,
+  jsonError,
+  type InsufficientScopeChallenge,
+} from "../../utils/mcp-error-serialize.js";
+
+// Re-exported so existing importers (and
+// `__tests__/tools.serialize-error.test.ts`) keep resolving these from
+// `mcp/tools`; the implementations now live in the shared serializer used by
+// every route surface that can receive a `403 insufficient_scope` (SEP-2350).
+export {
+  extractInsufficientScopeChallenge,
+  serializeMcpError,
+  jsonError,
+  type InsufficientScopeChallenge,
+};
+import {
+  toServedFromCache,
+  withCacheEventCapture,
+} from "../../utils/cache-events.js";
+
+const tools = new Hono();
+
+type ElicitationPayload = {
+  executionId: string;
+  requestId: string;
+  request: ElicitRequest["params"];
+  issuedAt: string;
+  serverId: string;
+};
+
+type ExecutionContext = {
+  id: string;
+  serverId: string;
+  toolName: string;
+  startedAtMs: number;
+  execPromise: Promise<ListToolsResult>;
+  queue: ElicitationPayload[];
+  waiter?: (payload: ElicitationPayload) => void;
+};
+
+const activeExecutions = new Map<string, ExecutionContext>();
+
+const pendingResponses = new Map<
+  string,
+  {
+    serverId: string;
+    resolve: (value: ElicitResult) => void;
+    reject: (error: unknown) => void;
+  }
+>();
+
+function makeExecutionId() {
+  return `exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeRequestId() {
+  return `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function takeNextRequest(
+  context: ExecutionContext,
+): Promise<ElicitationPayload> {
+  if (context.queue.length > 0) {
+    return Promise.resolve(context.queue.shift()!);
+  }
+  return new Promise((resolve) => {
+    context.waiter = resolve;
+  });
+}
+
+function enqueueRequest(
+  context: ExecutionContext,
+  payload: ElicitationPayload,
+) {
+  if (context.waiter) {
+    const resolve = context.waiter;
+    context.waiter = undefined;
+    resolve(payload);
+    return;
+  }
+  context.queue.push(payload);
+}
+
+function resetExecution(context: ExecutionContext, clear: () => void) {
+  clear();
+  activeExecutions.delete(context.id);
+  if (context.queue.length > 0) {
+    context.queue.length = 0;
+  }
+  context.waiter = undefined;
+  for (const [requestId, pending] of Array.from(pendingResponses.entries())) {
+    if (pending.serverId !== context.serverId) continue;
+    pendingResponses.delete(requestId);
+    pending.reject(new Error("Execution finished"));
+  }
+}
+
+function getExecutionDurationMs(context: ExecutionContext): number {
+  return Math.max(0, Date.now() - context.startedAtMs);
+}
+
+tools.post("/list", async (c) => {
+  try {
+    const { serverId, modelId, cursor, refresh } = (await c.req.json()) as {
+      serverId?: string;
+      modelId?: string;
+      cursor?: string;
+      refresh?: boolean;
+    };
+    if (!serverId) {
+      return c.json({ error: "serverId is required" }, 400);
+    }
+
+    // Normalize serverId - try to find a case-insensitive match if exact match
+    // fails. Match against all registered servers (not just live-clients) so
+    // a server that's still mid-connect can still be resolved.
+    let normalizedServerId = serverId;
+    const registeredServers = listBaseServers(c.mcpClientManager);
+
+    if (!registeredServers.includes(serverId)) {
+      const match = registeredServers.find(
+        (name: string) => name.toLowerCase() === serverId.toLowerCase(),
+      );
+      if (match) {
+        normalizedServerId = match;
+      }
+    }
+
+    // Only bail out for truly unknown ids (e.g. stale scenario refs) so we
+    // don't 500 the metadata fetch. Registered-but-still-connecting ids fall
+    // through to the SDK path, which awaits the in-flight connectPromise and
+    // returns the real tools.
+    if (!registeredServers.includes(normalizedServerId)) {
+      return c.json({ tools: [], toolsMetadata: {}, tokenCount: undefined });
+    }
+
+    const { result, events } = await withCacheEventCapture(() =>
+      listToolsShared(c.mcpClientManager, {
+        serverId: normalizedServerId,
+        modelId,
+        cursor,
+        cacheMode: refresh === true ? "refresh" : undefined,
+      }),
+    );
+    const servedFromCache = toServedFromCache(events);
+    return c.json({
+      ...result,
+      ...(servedFromCache ? { servedFromCache } : {}),
+    });
+  } catch (error) {
+    return jsonError(c, error, 500);
+  }
+});
+
+tools.post("/execute", async (c) => {
+  const {
+    serverId,
+    toolName,
+    parameters = {},
+    taskOptions,
+    allowTaskResult,
+  } = (await c.req.json()) as {
+    serverId?: string;
+    toolName?: string;
+    parameters?: Record<string, unknown>;
+    taskOptions?: { ttl?: number };
+    allowTaskResult?: boolean;
+  };
+
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+  if (!toolName) return c.json({ error: "toolName is required" }, 400);
+
+  const manager = c.mcpClientManager;
+  // `getClient()` is legacy-only — it returns the unwrapped upstream
+  // `Client` (or `undefined` for stateless preview connections, which
+  // wrap their own fetch instead of an upstream Client). Use
+  // `getManagedClient()` here so the guard works for both adapters; the
+  // actual execution at `manager.executeTool` already goes through
+  // `getClientOrThrow` which reads from the same managed-client map.
+  const managedClient = manager.getManagedClient(serverId);
+  if (!managedClient) {
+    return c.json({ error: `Server '${serverId}' is not connected` }, 400);
+  }
+
+  const executionId = makeExecutionId();
+  const startedAtMs = Date.now();
+
+  const context: ExecutionContext = {
+    id: executionId,
+    serverId,
+    toolName,
+    startedAtMs,
+    execPromise: (allowTaskResult
+      ? manager.executeTool(serverId, toolName, parameters, {
+          allowTaskResult: true,
+        })
+      : manager.executeTool(
+          serverId,
+          toolName,
+          parameters,
+          undefined, // options
+          taskOptions, // task options for background task creation
+        )) as unknown as Promise<ListToolsResult>,
+    queue: [],
+  };
+
+  activeExecutions.set(executionId, context);
+
+  manager.setElicitationHandler(serverId, async (params) => {
+    const payload: ElicitationPayload = {
+      executionId,
+      requestId: makeRequestId(),
+      request: params,
+      issuedAt: new Date().toISOString(),
+      serverId,
+    };
+
+    enqueueRequest(context, payload);
+
+    return new Promise<ElicitResult>((resolve, reject) => {
+      pendingResponses.set(payload.requestId, {
+        serverId,
+        resolve: (value) => {
+          pendingResponses.delete(payload.requestId);
+          resolve(value);
+        },
+        reject: (err) => {
+          pendingResponses.delete(payload.requestId);
+          reject(err);
+        },
+      });
+    });
+  });
+
+  try {
+    const next = await Promise.race([
+      context.execPromise.then((result: ListToolsResult) => ({
+        kind: "done" as const,
+        result,
+      })),
+      takeNextRequest(context).then((payload) => ({
+        kind: "elicitation" as const,
+        payload,
+      })),
+    ]);
+
+    if (next.kind === "done") {
+      resetExecution(context, () => manager.clearElicitationHandler(serverId));
+
+      // Check if result is a CreateTaskResult (MCP Tasks spec 2025-11-25)
+      // When task augmentation is used, server returns { task: { taskId, status, ... } }
+      const result = next.result as any;
+
+      // Extract model-immediate-response from _meta (MCP Tasks spec 2025-11-25)
+      // This optional field allows LLM hosts to return control to the model while task executes
+      const modelImmediateResponse =
+        result?._meta?.["io.modelcontextprotocol/model-immediate-response"];
+
+      // No wire dispatch available (older embedder, test double) means no
+      // tasks wire — never assume one on the create path.
+      const wire =
+        typeof manager.getTasksWire === "function"
+          ? manager.getTasksWire(serverId)
+          : "none";
+
+      // Extension wire: the CreateTaskResult is flat (`resultType: "task"`).
+      if (wire === "extension" && result?.resultType === "task") {
+        return c.json({
+          status: "task_created",
+          wire,
+          task: result,
+          durationMs: getExecutionDurationMs(context),
+          modelImmediateResponse,
+        });
+      }
+
+      // Legacy (2025-11-25) format: nested top-level `task` property. On the
+      // extension wire this shape is nonconforming, so it must not be
+      // classified as a creation.
+      if (wire === "legacy" && result?.task?.taskId && result?.task?.status) {
+        return c.json({
+          status: "task_created",
+          wire,
+          task: result.task,
+          durationMs: getExecutionDurationMs(context),
+          // Include model-immediate-response if provided by server
+          modelImmediateResponse,
+        });
+      }
+
+      // Heuristic _meta fallback for legacy servers only: on the extension
+      // wire a related-task pointer is not a creation signal.
+      const metaTask =
+        wire === "legacy"
+          ? result?._meta?.["modelcontextprotocol.io/task"] ||
+            result?._meta?.["io.modelcontextprotocol/related-task"]
+          : undefined;
+      if (metaTask?.taskId && metaTask?.status) {
+        return c.json({
+          status: "task_created",
+          wire,
+          task: {
+            taskId: metaTask.taskId,
+            status: metaTask.status,
+            statusMessage: metaTask.statusMessage,
+            createdAt: metaTask.createdAt || new Date().toISOString(),
+            lastUpdatedAt: metaTask.lastUpdatedAt || new Date().toISOString(),
+            ttl: metaTask.ttl ?? null,
+            pollInterval: metaTask.pollInterval,
+          },
+          durationMs: getExecutionDurationMs(context),
+          // Include model-immediate-response if provided by server
+          modelImmediateResponse,
+        });
+      }
+
+      return c.json({
+        status: "completed",
+        result: next.result,
+        durationMs: getExecutionDurationMs(context),
+      });
+    }
+
+    return c.json(
+      {
+        status: "elicitation_required",
+        executionId,
+        requestId: next.payload.requestId,
+        request: next.payload.request,
+        timestamp: next.payload.issuedAt,
+        durationMs: getExecutionDurationMs(context),
+      },
+      202,
+    );
+  } catch (error) {
+    resetExecution(context, () => manager.clearElicitationHandler(serverId));
+    return jsonError(c, error, 500);
+  }
+});
+
+tools.post("/respond", async (c) => {
+  const { executionId, requestId, response } = (await c.req.json()) as {
+    executionId?: string;
+    requestId?: string;
+    response?: ElicitResult;
+  };
+
+  if (!executionId) {
+    return c.json({ error: "executionId is required" }, 400);
+  }
+
+  const context = activeExecutions.get(executionId);
+  if (!context) {
+    return c.json({ error: "No active execution for executionId" }, 404);
+  }
+
+  if (!requestId) {
+    return c.json({ error: "requestId is required" }, 400);
+  }
+
+  const pending = pendingResponses.get(requestId);
+  if (!pending) {
+    return c.json({ error: "No pending elicitation for requestId" }, 404);
+  }
+
+  pending.resolve(response as ElicitResult);
+
+  try {
+    const next = await Promise.race([
+      context.execPromise.then((result: ListToolsResult) => ({
+        kind: "done" as const,
+        result,
+      })),
+      takeNextRequest(context).then((payload) => ({
+        kind: "elicitation" as const,
+        payload,
+      })),
+    ]);
+
+    if (next.kind === "done") {
+      resetExecution(context, () =>
+        c.mcpClientManager.clearElicitationHandler(context.serverId),
+      );
+      return c.json({
+        status: "completed",
+        result: next.result,
+        durationMs: getExecutionDurationMs(context),
+      });
+    }
+
+    return c.json(
+      {
+        status: "elicitation_required",
+        executionId: context.id,
+        requestId: next.payload.requestId,
+        request: next.payload.request,
+        timestamp: next.payload.issuedAt,
+        durationMs: getExecutionDurationMs(context),
+      },
+      202,
+    );
+  } catch (error) {
+    resetExecution(context, () =>
+      c.mcpClientManager.clearElicitationHandler(context.serverId),
+    );
+    return jsonError(c, error, 500);
+  }
+});
+
+tools.post("/", async () => {
+  return new Response(
+    JSON.stringify({
+      error: "Endpoint migrated. Use /list, /execute, or /respond.",
+    }),
+    { status: 410, headers: { "Content-Type": "application/json" } },
+  );
+});
+
+export default tools;

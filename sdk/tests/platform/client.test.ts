@@ -1,0 +1,880 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  DEFAULT_PLATFORM_API_BASE_URL,
+  DEFAULT_PLATFORM_USER_AGENT,
+  PlatformApiClient,
+  PlatformApiError,
+} from "../../src/platform/index.js";
+
+type FetchMock = ReturnType<typeof vi.fn>;
+
+function jsonResponse(
+  body: unknown,
+  init: { status?: number; headers?: Record<string, string> } = {}
+): Response {
+  return new Response(JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function makeClient(
+  fetchMock: FetchMock,
+  options: Partial<ConstructorParameters<typeof PlatformApiClient>[0]> = {}
+): PlatformApiClient {
+  return new PlatformApiClient({
+    baseUrl: "https://api.example.com/api/v1",
+    getAuth: () => "sk_test_token",
+    fetch: fetchMock as unknown as typeof fetch,
+    ...options,
+  });
+}
+
+function requestOf(fetchMock: FetchMock, call = 0): { url: URL; init: RequestInit } {
+  const [target, init] = fetchMock.mock.calls[call]!;
+  return { url: new URL(String(target)), init: init as RequestInit };
+}
+
+describe("PlatformApiClient", () => {
+  it("defaults to the hosted production base URL", () => {
+    expect(DEFAULT_PLATFORM_API_BASE_URL).toBe("https://app.mcpjam.com/api/v1");
+  });
+
+  it("resolves a relative baseUrl against the current origin (browser/worker)", async () => {
+    // The directory-readiness client passes baseUrl "/api/v1" so the request
+    // rides the current origin's session. `new URL("/api/v1/...")` throws
+    // "Invalid URL" on its own, so the origin must be supplied as the base.
+    vi.stubGlobal("location", { origin: "https://staging.mcpjam.com" });
+    try {
+      const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+      const client = makeClient(fetchMock, { baseUrl: "/api/v1" });
+
+      await client.listReadinessRuns({
+        projectId: "p1",
+        readinessKind: "claude",
+        serverId: "s1",
+        limit: 1,
+      });
+
+      const { url } = requestOf(fetchMock);
+      expect(url.origin).toBe("https://staging.mcpjam.com");
+      expect(url.pathname).toBe("/api/v1/projects/p1/readiness-runs");
+      expect(url.searchParams.get("readinessKind")).toBe("claude");
+      expect(url.searchParams.get("serverId")).toBe("s1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("starts a Claude readiness run through a relative baseUrl", async () => {
+    // Regression: the /conformance page's "Directory Readiness" run threw
+    // "Failed to construct 'URL': Invalid URL" because the relative baseUrl
+    // reached `new URL` with no base.
+    vi.stubGlobal("location", { origin: "https://staging.mcpjam.com" });
+    try {
+      const fetchMock = vi.fn(async () =>
+        jsonResponse({ runId: "run-1", status: "running" }, { status: 202 })
+      );
+      const client = makeClient(fetchMock, { baseUrl: "/api/v1" });
+
+      const receipt = await client.startClaudeReadinessRun({
+        projectId: "p1",
+        serverId: "s1",
+      });
+
+      const { url, init } = requestOf(fetchMock);
+      expect(url.href).toBe(
+        "https://staging.mcpjam.com/api/v1/projects/p1/servers/s1/readiness-runs/claude"
+      );
+      expect(init.method).toBe("POST");
+      expect(receipt.runId).toBe("run-1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("starts a conformance run through a relative baseUrl", async () => {
+    vi.stubGlobal("location", { origin: "https://staging.mcpjam.com" });
+    try {
+      const fetchMock = vi.fn(async () =>
+        jsonResponse({ runId: "run-1", status: "queued" }, { status: 202 })
+      );
+      const client = makeClient(fetchMock, { baseUrl: "/api/v1" });
+
+      const receipt = await client.startConformanceRun({
+        projectId: "p1",
+        serverId: "s1",
+        suites: ["protocol"],
+      });
+
+      const { url, init } = requestOf(fetchMock);
+      expect(url.href).toBe(
+        "https://staging.mcpjam.com/api/v1/projects/p1/servers/s1/conformance-runs"
+      );
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(String(init.body))).toEqual({ suites: ["protocol"] });
+      expect(receipt.runId).toBe("run-1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("lists conformance runs with optional server and cursor", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock);
+
+    await client.listConformanceRuns({
+      projectId: "p1",
+      serverId: "s1",
+      limit: 10,
+      cursor: "c1",
+    });
+
+    const { url } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p1/conformance-runs");
+    expect(url.searchParams.get("serverId")).toBe("s1");
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.get("cursor")).toBe("c1");
+  });
+
+  it("sends GET requests with bearer auth and skips undefined query params", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock);
+
+    await client.listProjects({ organizationId: undefined });
+    await client.listProjects({ organizationId: "org-1" });
+
+    const first = requestOf(fetchMock, 0);
+    expect(first.url.href).toBe("https://api.example.com/api/v1/projects");
+    expect(first.init.method).toBe("GET");
+    expect(first.init.body).toBeUndefined();
+    expect(
+      new Headers(first.init.headers as HeadersInit).get("authorization")
+    ).toBe("Bearer sk_test_token");
+
+    const second = requestOf(fetchMock, 1);
+    expect(second.url.searchParams.get("organizationId")).toBe("org-1");
+  });
+
+  it("reads organizations from the bare collection route", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ items: [{ id: "org-1", name: "Alpha" }] })
+    );
+    const client = makeClient(fetchMock);
+
+    const page = await client.listOrganizations();
+
+    const { url, init } = requestOf(fetchMock);
+    // No query params and no body: the scope of the answer is the credential's,
+    // never the caller's to widen.
+    expect(url.href).toBe("https://api.example.com/api/v1/organizations");
+    expect(init.method).toBe("GET");
+    expect(init.body).toBeUndefined();
+    expect(page.items[0]?.id).toBe("org-1");
+  });
+
+  it("resolves auth lazily per request", async () => {
+    const tokens = ["token-a", "token-b"];
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock, {
+      getAuth: async () => tokens.shift()!,
+    });
+
+    await client.getMe();
+    await client.getMe();
+
+    expect(
+      new Headers(requestOf(fetchMock, 0).init.headers as HeadersInit).get(
+        "authorization"
+      )
+    ).toBe("Bearer token-a");
+    expect(
+      new Headers(requestOf(fetchMock, 1).init.headers as HeadersInit).get(
+        "authorization"
+      )
+    ).toBe("Bearer token-b");
+  });
+
+  it("encodes path params and posts a default empty JSON body for server ops", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ status: "ready" }));
+    const client = makeClient(fetchMock);
+
+    await client.doctorServer({ projectId: "p/1", serverId: "s 2" });
+
+    const { url, init } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p%2F1/servers/s%202/doctor");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe("{}");
+    expect(
+      new Headers(init.headers as HeadersInit).get("content-type")
+    ).toBe("application/json");
+  });
+
+  it("forwards explicit server-op bodies and chat-session filters", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock);
+
+    await client.listServerTools({
+      projectId: "p1",
+      serverId: "s1",
+      body: { cursor: "abc" },
+    });
+    await client.listChatSessions({ projectId: "p1", limit: 5 });
+
+    expect(requestOf(fetchMock, 0).init.body).toBe(JSON.stringify({ cursor: "abc" }));
+    const sessions = requestOf(fetchMock, 1).url;
+    expect(sessions.pathname).toBe("/api/v1/chat-sessions");
+    expect(sessions.searchParams.get("projectId")).toBe("p1");
+    expect(sessions.searchParams.get("limit")).toBe("5");
+  });
+
+  it("posts tunnel creates with the name body and encoded project id", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ serverId: "srv_1", slug: "calm-otter" })
+    );
+    const client = makeClient(fetchMock);
+
+    await client.createTunnel({ projectId: "p/1", name: "my server" });
+
+    const { url, init } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p%2F1/tunnels");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe(JSON.stringify({ name: "my server" }));
+  });
+
+  it("posts tunnel closes with encoded path params and no body", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ serverId: "s 2", status: "closed" })
+    );
+    const client = makeClient(fetchMock);
+
+    const result = await client.closeTunnel({
+      projectId: "p/1",
+      serverId: "s 2",
+    });
+
+    const { url, init } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p%2F1/tunnels/s%202/close");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+    expect(result.status).toBe("closed");
+  });
+
+  it("builds scenario read URLs with encoded path params", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock);
+
+    await client.listScenarios({ projectId: "p1" });
+    await client.getScenario({ projectId: "p1", scenarioId: "box/1" });
+
+    expect(requestOf(fetchMock, 0).url.pathname).toBe(
+      "/api/v1/projects/p1/scenarios"
+    );
+    const detail = requestOf(fetchMock, 1);
+    expect(detail.url.pathname).toBe("/api/v1/projects/p1/scenarios/box%2F1");
+    expect(detail.init.method).toBe("GET");
+  });
+
+  it("posts eval-run creation bodies and parses the 202 envelope", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          runId: "run-1",
+          suiteId: "suite-1",
+          status: "running",
+          caseUpsert: { committed: [], failed: [] },
+        },
+        { status: 202 }
+      )
+    );
+    const client = makeClient(fetchMock);
+
+    const created = await client.createEvalRun({
+      projectId: "p1",
+      body: { suiteId: "suite-1", serverIds: ["s1", "s2"] },
+    });
+
+    const { url, init } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p1/eval-runs");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      suiteId: "suite-1",
+      serverIds: ["s1", "s2"],
+    });
+    expect(created.runId).toBe("run-1");
+    expect(created.status).toBe("running");
+  });
+
+  it("posts eval-suite creation bodies and parses the 201 envelope", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          suiteId: "suite-9",
+          name: "Authored",
+          servers: [{ id: "s1" }],
+          caseUpsert: { committed: [{ name: "c1" }], failed: [] },
+        },
+        { status: 201 }
+      )
+    );
+    const client = makeClient(fetchMock);
+
+    const created = await client.createEvalSuite({
+      projectId: "p1",
+      body: {
+        name: "Authored",
+        serverIds: ["s1"],
+        model: "anthropic/claude-haiku-4.5",
+        tests: [{ title: "t", query: "q" }],
+      },
+    });
+
+    const { url, init } = requestOf(fetchMock);
+    expect(url.pathname).toBe("/api/v1/projects/p1/eval-suites");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: "Authored",
+      serverIds: ["s1"],
+      model: "anthropic/claude-haiku-4.5",
+      tests: [{ title: "t", query: "q" }],
+    });
+    expect(created.suiteId).toBe("suite-9");
+    expect(created.name).toBe("Authored");
+  });
+
+  it("builds eval polling URLs and forwards cursor/limit query params", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    const client = makeClient(fetchMock);
+
+    await client.getEvalRun({ projectId: "p1", runId: "run-1" });
+    await client.listEvalRunIterations({
+      projectId: "p1",
+      runId: "run-1",
+      cursor: "abc",
+      limit: 25,
+    });
+    await client.getEvalIterationTrace({
+      projectId: "p1",
+      runId: "run-1",
+      iterationId: "iter-1",
+    });
+    await client.listEvalSuiteRuns({
+      projectId: "p1",
+      suiteId: "suite-1",
+      limit: 10,
+    });
+
+    expect(requestOf(fetchMock, 0).url.pathname).toBe(
+      "/api/v1/projects/p1/eval-runs/run-1"
+    );
+    const iterations = requestOf(fetchMock, 1).url;
+    expect(iterations.pathname).toBe(
+      "/api/v1/projects/p1/eval-runs/run-1/iterations"
+    );
+    expect(iterations.searchParams.get("cursor")).toBe("abc");
+    expect(iterations.searchParams.get("limit")).toBe("25");
+    expect(requestOf(fetchMock, 2).url.pathname).toBe(
+      "/api/v1/projects/p1/eval-runs/run-1/iterations/iter-1/trace"
+    );
+    const suiteRuns = requestOf(fetchMock, 3).url;
+    expect(suiteRuns.pathname).toBe(
+      "/api/v1/projects/p1/eval-suites/suite-1/runs"
+    );
+    expect(suiteRuns.searchParams.get("limit")).toBe("10");
+  });
+
+  it("identifies the SDK by default, and keeps the caller's own token", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({}));
+    await makeClient(fetchMock).getMe();
+    await makeClient(fetchMock, { userAgent: "mcpjam-cli/1.0" }).getMe();
+
+    const header = (index: number) =>
+      new Headers(requestOf(fetchMock, index).init.headers as HeadersInit).get(
+        "user-agent"
+      );
+
+    // It used to send nothing here, which is why "who is on the SDK, and on
+    // which version?" had no answer in the request logs.
+    expect(header(0)).toBe(DEFAULT_PLATFORM_USER_AGENT);
+    // Prefixed, not replaced: which program is calling AND which SDK it links.
+    expect(header(1)).toBe(`mcpjam-cli/1.0 ${DEFAULT_PLATFORM_USER_AGENT}`);
+  });
+
+  describe("in a browser", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const header = (fetchMock: FetchMock) =>
+      new Headers(requestOf(fetchMock, 0).init.headers as HeadersInit).get(
+        "user-agent"
+      );
+
+    it("sets no default user-agent where a page could send it", async () => {
+      // Firefox lets a script set `User-Agent` (the Fetch spec no longer
+      // forbids it), and the inspector bundles the SDK from source, where the
+      // version is `unknown` — so a default here would log every Firefox user
+      // as `mcpjam-sdk/unknown`.
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("document", {});
+      const fetchMock = vi.fn(async () => jsonResponse({}));
+      await makeClient(fetchMock).getMe();
+
+      expect(header(fetchMock)).toBeNull();
+    });
+
+    it("still sends a caller's own user-agent unchanged", async () => {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("document", {});
+      const fetchMock = vi.fn(async () => jsonResponse({}));
+      await makeClient(fetchMock, { userAgent: "mcpjam-cli/1.0" }).getMe();
+
+      expect(header(fetchMock)).toBe("mcpjam-cli/1.0");
+    });
+
+    it("does not mistake a Workers runtime, which has only `navigator`, for one", async () => {
+      vi.stubGlobal("window", undefined);
+      vi.stubGlobal("document", undefined);
+      vi.stubGlobal("navigator", { userAgent: "Cloudflare-Workers" });
+      const fetchMock = vi.fn(async () => jsonResponse({}));
+      await makeClient(fetchMock).getMe();
+
+      expect(header(fetchMock)).toBe(DEFAULT_PLATFORM_USER_AGENT);
+    });
+
+    it("sends the default in Node", async () => {
+      expect(typeof (globalThis as { window?: unknown }).window).toBe(
+        "undefined"
+      );
+      const fetchMock = vi.fn(async () => jsonResponse({}));
+      await makeClient(fetchMock).getMe();
+
+      expect(header(fetchMock)).toBe(DEFAULT_PLATFORM_USER_AGENT);
+    });
+  });
+
+  it("names a version rather than claiming one it was not given", () => {
+    // `unknown` is the honest answer when a consumer bundles the SDK from
+    // source with no `define` — a stamp asserting a version nobody injected
+    // would be worse than one admitting it does not know.
+    expect(DEFAULT_PLATFORM_USER_AGENT).toMatch(
+      /^mcpjam-sdk\/(unknown|\d+\.\d+\.\d+.*)$/
+    );
+  });
+
+  it("maps wire error envelopes onto PlatformApiError", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          code: "OAUTH_REQUIRED",
+          message: "Server requires OAuth",
+          details: { oauthRequired: true, serverId: "s1" },
+        },
+        { status: 401 }
+      )
+    );
+
+    const error = await makeClient(fetchMock)
+      .doctorServer({ projectId: "p1", serverId: "s1" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    const apiError = error as PlatformApiError;
+    expect(apiError.code).toBe("OAUTH_REQUIRED");
+    expect(apiError.status).toBe(401);
+    expect(apiError.message).toBe("Server requires OAuth");
+    expect(apiError.details).toEqual({ oauthRequired: true, serverId: "s1" });
+    expect(apiError.endpoint).toBe("/projects/p1/servers/s1/doctor");
+  });
+
+  it("captures Retry-After on 429 responses", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        { code: "RATE_LIMITED", message: "Slow down" },
+        { status: 429, headers: { "retry-after": "7" } }
+      )
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("RATE_LIMITED");
+    expect((error as PlatformApiError).retryAfter).toBe(7);
+  });
+
+  it("parses HTTP-date Retry-After values into seconds", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        { code: "RATE_LIMITED", message: "Slow down" },
+        {
+          status: 429,
+          headers: { "retry-after": new Date(Date.now() + 30_000).toUTCString() },
+        }
+      )
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    const retryAfter = (error as PlatformApiError).retryAfter;
+    expect(retryAfter).toBeGreaterThanOrEqual(28);
+    expect(retryAfter).toBeLessThanOrEqual(31);
+  });
+
+  it("falls back to INTERNAL_ERROR for malformed error envelopes", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("upstream exploded", { status: 502 })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+    expect((error as PlatformApiError).status).toBe(502);
+  });
+
+  it("carries the failing response's x-request-id on the error", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        { code: "INTERNAL_ERROR", message: "Something broke" },
+        { status: 500, headers: { "x-request-id": "req_0123456789abcdef" } }
+      )
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+    expect((error as PlatformApiError).requestId).toBe("req_0123456789abcdef");
+  });
+
+  it("carries the request id on envelope-less error bodies too", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response("upstream exploded", {
+          status: 502,
+          headers: { "x-request-id": "3f1c1d7e-5b8a-4c7e-9d51-0f6e2a9b8c41" },
+        })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect((error as PlatformApiError).requestId).toBe(
+      "3f1c1d7e-5b8a-4c7e-9d51-0f6e2a9b8c41"
+    );
+  });
+
+  it("carries the request id on a non-JSON success body", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response("<html>not json</html>", {
+          status: 200,
+          headers: { "x-request-id": "req_0123456789abcdef" },
+        })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+    expect((error as PlatformApiError).requestId).toBe("req_0123456789abcdef");
+  });
+
+  it("carries the request id when the body read fails", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "x-request-id": "req_0123456789abcdef" }),
+        text: () => Promise.reject(new Error("connection reset")),
+      } as unknown as Response)
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+    expect((error as PlatformApiError).requestId).toBe("req_0123456789abcdef");
+  });
+
+  it("leaves requestId unset when the response has none", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ code: "FORBIDDEN", message: "Denied" }, { status: 403 })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect((error as PlatformApiError).requestId).toBeUndefined();
+  });
+
+  it("drops a request id that is not in the shape the API mints", async () => {
+    // Too short, and a value with spaces: neither is an id the API would
+    // have minted or reflected, so neither is repeated.
+    for (const header of ["abc", "not an id at all"]) {
+      const fetchMock = vi.fn(async () =>
+        jsonResponse(
+          { code: "INTERNAL_ERROR", message: "Something broke" },
+          { status: 500, headers: { "x-request-id": header } }
+        )
+      );
+
+      const error = await makeClient(fetchMock)
+        .getMe()
+        .catch((caught: unknown) => caught);
+
+      expect((error as PlatformApiError).requestId).toBeUndefined();
+    }
+  });
+
+  it("sends a defined idempotency key even when it is empty", async () => {
+    // `/feedback` refuses an empty key with a 400. Dropping it here would turn
+    // a caller's broken retry key into a silently keyless report.
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ id: "fb_1", receivedAt: 1, duplicate: false }, { status: 201 })
+    );
+
+    await makeClient(fetchMock).sendFeedback(
+      { body: { kind: "bug", summary: "Broke" } },
+      { idempotencyKey: "" }
+    );
+
+    const headers = requestOf(fetchMock).init.headers as Record<string, string>;
+    expect(headers["idempotency-key"]).toBe("");
+  });
+
+  it("sends no idempotency key when none is given", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ id: "fb_1", receivedAt: 1, duplicate: false }, { status: 201 })
+    );
+
+    await makeClient(fetchMock).sendFeedback({
+      body: { kind: "bug", summary: "Broke" },
+    });
+
+    const headers = requestOf(fetchMock).init.headers as Record<string, string>;
+    expect(headers).not.toHaveProperty("idempotency-key");
+  });
+
+  it("resolves empty success bodies to undefined", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+
+    await expect(makeClient(fetchMock).getMe()).resolves.toBeUndefined();
+  });
+
+  it("keeps non-JSON success bodies as INTERNAL_ERROR", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("<html>not json</html>", { status: 200 })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+    expect((error as PlatformApiError).status).toBe(200);
+  });
+
+  it("derives status-based codes for envelope-less error bodies", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(null, { status: 429, headers: { "retry-after": "12" } })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("RATE_LIMITED");
+    expect((error as PlatformApiError).status).toBe(429);
+    expect((error as PlatformApiError).retryAfter).toBe(12);
+  });
+
+  it("derives UNAUTHORIZED from a bare 401 with a non-JSON body", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("Unauthorized", { status: 401 })
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("UNAUTHORIZED");
+    expect((error as PlatformApiError).message).toBe(
+      "Request to /me failed (401)"
+    );
+  });
+
+  it("synthesizes NETWORK_ERROR for fetch-level failures", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("getaddrinfo ENOTFOUND");
+    });
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("NETWORK_ERROR");
+    expect((error as PlatformApiError).status).toBe(0);
+    expect((error as PlatformApiError).message).toContain("ENOTFOUND");
+    // Never reached a server, so there is no request id to report.
+    expect((error as PlatformApiError).requestId).toBeUndefined();
+  });
+
+  it("synthesizes TIMEOUT when the client-side deadline aborts the request", async () => {
+    const fetchMock = vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError"))
+          );
+        })
+    );
+
+    const error = await makeClient(fetchMock, { timeoutMs: 10 })
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("TIMEOUT");
+    expect((error as PlatformApiError).status).toBe(0);
+  });
+
+  it("propagates caller-initiated aborts untouched", async () => {
+    const fetchMock = vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const fail = () =>
+            reject(new DOMException("caller aborted", "AbortError"));
+          if (init?.signal?.aborted) {
+            fail();
+            return;
+          }
+          init?.signal?.addEventListener("abort", fail);
+        })
+    );
+    const controller = new AbortController();
+    const pending = makeClient(fetchMock)
+      .getMe({ signal: controller.signal })
+      .catch((caught: unknown) => caught);
+    controller.abort();
+
+    const error = await pending;
+    expect(error).not.toBeInstanceOf(PlatformApiError);
+    expect((error as DOMException).name).toBe("AbortError");
+  });
+
+  // The three cases below are about the SECOND half of a request. `fetch`
+  // resolving means headers arrived, not that the request is over — a server
+  // can send headers and then stall the body forever. An earlier revision
+  // cleared the deadline and detached the caller's signal as soon as headers
+  // landed, which left the body read bounded by nothing at all.
+
+  /** Headers now, body never. `signal` is the only way out. */
+  function stallingBodyFetch() {
+    return vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              const fail = () =>
+                reject(new DOMException("aborted", "AbortError"));
+              if (init?.signal?.aborted) {
+                fail();
+                return;
+              }
+              init?.signal?.addEventListener("abort", fail);
+            }),
+        } as unknown as Response)
+    );
+  }
+
+  it("synthesizes TIMEOUT when the deadline expires during the body read", async () => {
+    const error = await makeClient(stallingBodyFetch(), { timeoutMs: 10 })
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    // Not INTERNAL_ERROR. A stalled body is the server being slow, and calling
+    // it an internal failure sends someone hunting a bug on our side.
+    expect((error as PlatformApiError).code).toBe("TIMEOUT");
+  });
+
+  it("lets a caller abort a body that never arrives", async () => {
+    const controller = new AbortController();
+    // The abort has to land AFTER the body read has begun, or the test proves
+    // nothing: aborting before the fetch await resumes fires while the listener
+    // is still attached no matter how this is written, and passes either way.
+    let bodyReadStarted!: () => void;
+    const readingBody = new Promise<void>((resolve) => {
+      bodyReadStarted = resolve;
+    });
+    const fetchMock = vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () =>
+                reject(new DOMException("aborted", "AbortError"))
+              );
+              bodyReadStarted();
+            }),
+        } as unknown as Response)
+    );
+
+    // Far above any time this should take, so finishing at all proves the
+    // caller's signal — not the deadline — is what ended it.
+    const pending = makeClient(fetchMock, { timeoutMs: 60_000 })
+      .getMe({ signal: controller.signal })
+      .catch((caught: unknown) => caught);
+    await readingBody;
+    controller.abort();
+
+    const error = await pending;
+    expect(error).not.toBeInstanceOf(PlatformApiError);
+    expect((error as DOMException).name).toBe("AbortError");
+  });
+
+  it("still reports an ordinary body-read failure as an internal error", async () => {
+    // The arm that must survive the two above: a body that fails for its own
+    // reasons, with nothing aborted, is still ours to report.
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        text: () => Promise.reject(new Error("connection reset")),
+      } as unknown as Response)
+    );
+
+    const error = await makeClient(fetchMock)
+      .getMe()
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).code).toBe("INTERNAL_ERROR");
+  });
+});

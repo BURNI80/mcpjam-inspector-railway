@@ -1,0 +1,4354 @@
+import { shouldUseLocalHarness } from "../../utils/harness/local/run-resources.js";
+import { casesAssertingWidgetRender, failRunBeforeExecution } from "../../services/evals/harness-admission.js";
+import { listBaseServers } from "../../utils/mcp-connections.js";
+import { suppressedSuiteStandardCheckIdsSchema } from "@mcpjam/sdk/contract";
+import { githubExecutionPolicy } from "../../services/github-checks/credential-policy.js";
+import { ConvexHttpClient } from "convex/browser";
+import type { MCPClientManager, MCPServerReplayConfig } from "@mcpjam/sdk";
+import { readTasksPolicy } from "@mcpjam/sdk";
+import {
+  caseIntentSchema,
+  evalSuiteFileToolPolicySchema,
+} from "@mcpjam/sdk/contract";
+import { resolveToolTaskSeam } from "../../utils/task-seam.js";
+import { mcpToolOptionsFor } from "../../utils/mcp-tool-options.js";
+import { z } from "zod";
+import { generateTestCases } from "../../services/eval-agent";
+import {
+  convertToEvalTestCases,
+  generateNegativeTestCases,
+} from "../../services/negative-test-agent";
+import { resolveFrozenRunGradingMode } from "../../services/evals/grading-mode.js";
+import {
+  startSuiteRunWithRecorder,
+  type EvalRunProvenance,
+  type SuiteRunRecorder,
+} from "../../services/evals/recorder";
+import {
+  captureToolSnapshotForEvalAuthoring,
+  storeReplayConfig,
+} from "../../services/evals/route-helpers";
+import { loadSuiteHostConfig } from "../../services/evals/compat-runtime";
+import { isRunPastExecution } from "../../services/evals/run-status.js";
+import {
+  checkEvalExecutionAdmission,
+  checkEvalHarnessAdmission,
+  harnessOfHostConfig,
+} from "../../services/evals/harness-admission";
+import {
+  applyVisibilityPolicyAndCountSignals,
+  extractHostExecutionPolicy,
+  resolveOpenAiCompatForHostConfig,
+} from "@mcpjam/sdk/host-config/internal";
+import {
+  buildQuickRunCommitSnapshot,
+  defaultEvalExecutionBudgets,
+  resolveSteps,
+  runEvalSuiteWithAiSdk,
+  runFrozenSkillOptions,
+  streamTestCase,
+  type EvalPinnedSkillSource,
+  type EvalTestCase,
+} from "../../services/evals-runner";
+import {
+  assertCommittedExecutionMatchesPreflight,
+  assertEnvironmentQuickRunAdmissible,
+  assertEnvironmentQuickRunModel,
+  assertNoConflictingEnvironmentOverrides,
+  commitEnvironmentQuickRun,
+  failCommittedQuickRun,
+  loadCommittedQuickRunSkills,
+  type CommittedQuickRun,
+} from "../../services/evals/quick-run-environment.js";
+import { providerForModelId } from "@/shared/model-provider";
+import { randomUUID } from "node:crypto";
+import type { EvalStreamEvent } from "@/shared/eval-stream-events";
+import {
+  probeConfigSchema,
+  TEST_CASE_TYPES,
+  type ProbeConfig,
+  type TestCaseType,
+} from "@/shared/probe-config";
+import { deriveItemIdempotencyKey } from "../../utils/idempotency.js";
+import type { LaunchContext } from "../../utils/launch-context.js";
+import {
+  createEvalCasesInBatches,
+  partialResultOf,
+  withMintedCaseIds,
+  type EvalCaseBatchItem,
+} from "./eval-case-batch.js";
+import { logger } from "../../utils/logger";
+import { ErrorCode, WebRouteError } from "../web/errors.js";
+import {
+  resolveOrgModelConfig,
+  type ResolvedOrgModelConfig,
+} from "../../utils/org-model-config";
+import {
+  flattenServerToolSnapshotTools,
+  type ServerToolSnapshot,
+} from "../../utils/export-helpers.js";
+import { sanitizeForConvexTransport } from "../../services/evals/convex-sanitize.js";
+import type { BenchmarkWriteGuard } from "../../services/evals/artifact-ledger.js";
+import {
+  environmentEffectiveServerIds,
+  environmentServerIds,
+  environmentServerNames,
+  environmentServerRefsForManager,
+  resolveEnvironmentForLaunch,
+  EVAL_LAUNCH_SERVER_SOURCE,
+  translateEnvironmentResolveError,
+  type ResolvedEnvironmentForLaunch,
+} from "../../services/environments/resolve.js";
+import {
+  resolveSuiteRunPluginServers,
+  type RunPluginServer,
+} from "../../services/plugins/run-plugin-servers.js";
+import { withPluginExecutionServers } from "../../services/evals/plugin-execution-servers.js";
+import { logLegacyEvalRequest } from "../../services/evals/legacy-eval-telemetry.js";
+import { type RunPinnedSkill } from "../../services/evals/run-plugin-snapshot.js";
+import {
+  buildPinnedSkillSource,
+  type BuiltPinnedSkillSource,
+} from "../../services/evals/pinned-skill-source.js";
+import { harnessToolPolicyLaunchRefusal } from "../../utils/harness/harness-proxy-policy-enforcement.js";
+import type { PinnedSkillArtifact } from "@/shared/skill-types";
+import type { ModelSelection } from "@mcpjam/sdk";
+import { readStoredModelSelection } from "../../utils/model-resolution-local.js";
+import {
+  countModelSteps,
+  isModelFree,
+  normalizePromptTurns,
+  normalizeSteps,
+  probeConfigToToolCallStep,
+  promptTurnsToSteps,
+  stepsSchema,
+  type PromptTurn,
+  type TestStep,
+} from "@/shared/steps";
+import {
+  matchOptionsSchema,
+  resolveMatchOptions,
+  resolveCaseSuccessPredicates,
+  casePredicatesSchema,
+  type MatchOptionsDTO,
+} from "@/shared/eval-matching";
+
+const toolChoiceSchema = z.union([
+  z.enum(["auto", "none", "required"]),
+  z.object({
+    type: z.literal("tool"),
+    toolName: z.string().min(1),
+  }),
+]);
+
+/**
+ * Resolve legacy multi-turn data from BOTH the top-level `promptTurns` and the
+ * historical `advancedConfig.promptTurns` storage location (pre-migration cases
+ * stored turns there). Returns [] when neither carries turns, so callers keep
+ * their own single-turn / placeholder fallbacks. Mirrors the source precedence
+ * of `resolvePromptTurns` without its query-synthesis tail.
+ */
+function resolveLegacyPromptTurns(src: {
+  promptTurns?: unknown;
+  advancedConfig?: unknown;
+}): PromptTurn[] {
+  const topLevel = normalizePromptTurns(src.promptTurns);
+  if (topLevel.length > 0) return topLevel;
+  return normalizePromptTurns(
+    (src.advancedConfig as { promptTurns?: unknown } | undefined)?.promptTurns,
+  );
+}
+
+/**
+ * Boundary compat: project a wire test's legacy fields onto the steps-first
+ * `TestStep[]` contract. Precedence mirrors `internalCaseToSteps` in
+ * routes/v1/evals.ts so every surface converges on the same shape:
+ *   1. explicit `steps` (or `widget_probe` + `probeConfig`) win;
+ *   2. multi-turn `promptTurns` (top-level OR `advancedConfig`) → `promptTurnsToSteps`;
+ *   3. single-turn `query`/`expectedToolCalls` → one `prompt` step + asserts.
+ * `query` is required on the wire, so this always returns ≥1 step.
+ */
+function wireTestToSteps(test: {
+  steps?: unknown;
+  caseType?: TestCaseType;
+  probeConfig?: ProbeConfig;
+  promptTurns?: unknown;
+  advancedConfig?: unknown;
+  query?: string;
+  expectedToolCalls?: any[];
+}): TestStep[] {
+  const explicit = resolveAuthoringSteps(test);
+  if (explicit && explicit.length > 0) return explicit;
+
+  const turns = resolveLegacyPromptTurns(test);
+  if (turns.length > 0) return promptTurnsToSteps(turns);
+
+  const steps: TestStep[] = [
+    {
+      id: "step-1-prompt",
+      kind: "prompt",
+      prompt: typeof test.query === "string" ? test.query : "",
+    },
+  ];
+  const expected = Array.isArray(test.expectedToolCalls)
+    ? test.expectedToolCalls
+    : [];
+  expected.forEach((call: any, i: number) => {
+    steps.push({
+      id: `step-1-expect-${i}`,
+      kind: "assert",
+      assertion: {
+        type: "toolCalledWith",
+        toolName: String(call?.toolName ?? ""),
+        args: { args: call?.arguments ?? {} },
+      },
+    });
+  });
+  return steps;
+}
+
+/**
+ * Quick-run compat: a PERSISTED case that predates the `steps` field but still
+ * carries legacy `promptTurns` converts to steps so a single-case quick/compare
+ * run executes every turn — without this it falls back to the top-level
+ * `query`/`expectedToolCalls` and silently drops later turns/assertions.
+ */
+function legacyCaseStepsFallback(testCase: {
+  promptTurns?: unknown;
+  advancedConfig?: unknown;
+}): TestStep[] | undefined {
+  const turns = resolveLegacyPromptTurns(testCase);
+  return turns.length > 0 ? promptTurnsToSteps(turns) : undefined;
+}
+
+/**
+ * A suite's or run's pass floor, as a PERCENT in [0, 100].
+ *
+ * BOUNDED, and that is the whole point. Unbounded, this was
+ * `z.object({ minimumPassRate: z.number() })` at four sites, while every
+ * consumer compares it as a percent — the backend against an UNROUNDED
+ * `passRate * 100` (`convex/testSuites.ts`, `convex/sdkEvals.ts`), the GitHub
+ * check against a rounded one (`github-checks-worker.ts`).
+ *
+ * So `minimumPassRate: 0.8` — the natural thing to send for someone who wrote
+ * `passThreshold: 0.8` as a FRACTION two fields earlier — was accepted, meant
+ * 0.8%, and produced a CI gate that could never fail. `8000` was accepted just
+ * as happily and could never pass. A gate that cannot fail is worse than no
+ * gate: it reports a verdict nobody measured.
+ *
+ * `minimumPassRatePercent` is the canonical name, following the SDK's own rule
+ * (`sdk/src/gates.ts`): every percent-valued field is named `*Percent` so a
+ * bare `100` cannot be read as "100%" when it means "10000%".
+ * `minimumPassRate` stays as the deprecated alias, because it is the name
+ * every stored policy and existing caller already uses.
+ *
+ * THE NAME IS THE DISAMBIGUATOR, which is what makes the `*Percent` convention
+ * load-bearing here rather than decorative:
+ *
+ *   - on `minimumPassRatePercent`, the unit is in the field name and nothing is
+ *     ambiguous, so the FULL range is accepted — `0.5` there is 0.5% and the
+ *     backend's unrounded comparison can genuinely act on it (1 passing case in
+ *     200 is exactly 0.5%);
+ *   - on the bare `minimumPassRate`, a value in (0, 1) is refused. That is the
+ *     spelling the bug arrives through, and this schema cannot tell a caller
+ *     who meant 80% from one who meant 0.8%. It says so, and names the field
+ *     that can say either without guessing.
+ *
+ * A fraction-looking value is never REINTERPRETED on either field: reading
+ * `0.8` as 80% would silently move the bar on every policy already stored
+ * under the old unbounded schema. `0` is a real floor ("any run clears it")
+ * and is accepted on both.
+ *
+ * ONE CAVEAT ON SUB-1% FLOORS, and it applies to every threshold to some
+ * degree. The platform verdict compares an UNROUNDED `passRate * 100`, while
+ * `github-checks-worker.ts` rounds the measured rate to an integer first (to
+ * stay in step with the eval UI's badge — see the comment there). So the
+ * GitHub check quantizes: a floor below 0.5 behaves there as if it were 0.5,
+ * exactly as a floor of 80 already passes the check at a measured 79.6%.
+ * Nothing here can fix that asymmetry — moving the check off `Math.round`
+ * would change the verdict of every existing gate at a rounding boundary,
+ * which is a decision of its own, not a side effect of bounding this field.
+ */
+const passRatePercentBoundsSchema = z
+  .number()
+  .min(0, "must be a percent in [0, 100]")
+  .max(100, "must be a percent in [0, 100] — 80 means 80%, not 8000%");
+
+/** The canonical field: unambiguous by name, so the whole range is usable. */
+const canonicalPassRatePercentSchema = passRatePercentBoundsSchema;
+
+/** The deprecated field: same unit, minus the band that reads as a fraction. */
+const aliasPassRatePercentSchema = passRatePercentBoundsSchema.refine(
+  (value) => value === 0 || value >= 1,
+  {
+    message:
+      "must be a PERCENT in [0, 100], and a value below 1 on this field is almost always a fraction sent by mistake — send 80 for 80%, not 0.8. If you really mean a sub-1% floor, send it as minimumPassRatePercent, whose name carries the unit. (A per-case passThreshold IS a fraction; this suite/run floor is not.)",
+  },
+);
+
+export const passCriteriaSchema = z
+  .strictObject({
+    /** Canonical: the unit is in the name. */
+    minimumPassRatePercent: canonicalPassRatePercentSchema.optional(),
+    /** Deprecated alias for `minimumPassRatePercent`. */
+    minimumPassRate: aliasPassRatePercentSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    const canonical = value.minimumPassRatePercent !== undefined;
+    const alias = value.minimumPassRate !== undefined;
+    if (canonical && alias) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["minimumPassRatePercent"],
+        message:
+          "Send minimumPassRatePercent or minimumPassRate, not both — they are two spellings of one percent.",
+      });
+    } else if (!canonical && !alias) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["minimumPassRatePercent"],
+        message:
+          "passCriteria needs minimumPassRatePercent (a percent in [0, 100]).",
+      });
+    }
+  })
+  // Normalized to the STORED name, so nothing downstream learns there were
+  // two spellings and no stored row changes shape.
+  .transform((value) => ({
+    minimumPassRate: (value.minimumPassRatePercent ??
+      value.minimumPassRate) as number,
+  }));
+
+export const RunEvalsRequestSchema = z.object({
+  projectId: z.string().optional(),
+  suiteId: z.string().optional(),
+  suiteName: z.string().optional(),
+  suiteDescription: z.string().optional(),
+  toolPolicy: evalSuiteFileToolPolicySchema.optional(),
+  tests: z.array(
+    z
+      .object({
+        title: z.string(),
+        query: z.string(),
+        runs: z.number().int().positive().max(10),
+        model: z.string(),
+        provider: z.string(),
+        expectedToolCalls: z.array(
+          z.object({
+            toolName: z.string(),
+            arguments: z.record(z.string(), z.any()),
+          }),
+        ),
+        isNegativeTest: z.boolean().optional(),
+        scenario: z.string().optional(),
+        expectedOutput: z.string().optional(),
+        // Optional analytics label. This authoring/run shape only creates or
+        // updates from a complete test definition, so it carries the stored
+        // string form; only the authoritative PATCH wire accepts `null`.
+        intent: caseIntentSchema.optional(),
+        // Unified `TestStep[]` model — the source of truth for execution.
+        // Declared explicitly so Zod does not silently strip it off the wire
+        // (feedback_zod_strips_unthreaded_fields). Optional on the wire so
+        // pre-migration callers (UI run path, MCP/hosted, scheduled worker)
+        // that still send `query`/`expectedToolCalls`/`promptTurns` are
+        // accepted; the `.transform` below projects those legacy fields onto
+        // `steps` so everything downstream sees the steps-first contract.
+        steps: stepsSchema.optional(),
+        // Legacy multi-turn shape. Accepted (not stripped) purely so the
+        // transform can convert it to `steps`; never persisted as-is.
+        promptTurns: z.array(z.any()).optional(),
+        advancedConfig: z
+          .object({
+            system: z.string().optional(),
+            temperature: z.number().optional(),
+            toolChoice: toolChoiceSchema.optional(),
+          })
+          .passthrough()
+          .optional(),
+        matchOptions: matchOptionsSchema.optional(),
+        // Case-level predicate gate override; threaded through every Zod
+        // boundary on the wire so it doesn't get silently stripped
+        // (feedback_zod_strips_unthreaded_fields).
+        predicates: casePredicatesSchema.optional(),
+        suppressedSuiteStandardCheckIds:
+          suppressedSuiteStandardCheckIdsSchema.optional(),
+        // Widget-probe discriminant + pinned tool call. Same silent-strip
+        // rationale as `predicates` above. Probe entries carry display-only
+        // model/provider sentinels to satisfy the required fields; the
+        // runner forks off the LLM path before any model resolution and
+        // `assertSuiteRunWithinCap` excludes them from LLM-call math.
+        caseType: z.enum(TEST_CASE_TYPES).optional(),
+        probeConfig: probeConfigSchema.optional(),
+      })
+      .superRefine((test, ctx) => {
+        // Compatibility-field invariant: `steps` are the execution source of
+        // truth, but when callers also send legacy widget-probe metadata, the
+        // discriminant and payload must agree so later layers never see a
+        // malformed mixed contract.
+        if (test.caseType === "widget_probe" && !test.probeConfig) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["probeConfig"],
+            message: "probeConfig is required when caseType is widget_probe",
+          });
+        }
+        if (test.caseType !== "widget_probe" && test.probeConfig) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["probeConfig"],
+            message: "probeConfig is only allowed on widget_probe cases",
+          });
+        }
+      })
+      // Project legacy fields onto `steps` so the rest of the pipeline only
+      // ever deals with the steps-first contract. Steps-first callers pass
+      // through UNCHANGED (no normalization churn); only legacy bodies are
+      // converted. `query` is always present (required above), so the
+      // single-turn fallback guarantees ≥1 step.
+      .transform((test) => {
+        if (Array.isArray(test.steps) && test.steps.length > 0) return test;
+        return { ...test, steps: wireTestToSteps(test) };
+      }),
+  ),
+  // Non-empty for legacy launches; environment launches (environmentId set)
+  // send NO server ids — the browser never knows an environment's closed
+  // execution set, `prepareEvalRun` resolves it authoritatively (P0.1) and
+  // enforces the ≥1-server rule for legacy requests at runtime (a `.min(1)`
+  // here would reject every env launch; a `.superRefine` would break the
+  // hosted variant's `.omit`).
+  serverIds: z.array(z.string()),
+  serverNames: z.array(z.string()).optional(),
+  scenarioId: z.string().optional(),
+  accessVersion: z.number().int().nonnegative().optional(),
+  storageServerIds: z.array(z.string()).optional(),
+  modelApiKeys: z.record(z.string(), z.string()).optional(),
+  convexAuthToken: z.string(),
+  notes: z.string().optional(),
+  passCriteria: passCriteriaSchema.optional(),
+  /**
+   * When true, the request is a rerun of an already-persisted suite — skip
+   * the per-test-case upsert. Without this, derived wire fields (suite
+   * default model substituted in for model-less cases, merged advancedConfig)
+   * get baked into per-case overrides on first rerun, breaking later edits
+   * to the suite default.
+   */
+  suiteRerun: z.boolean().optional(),
+  /**
+   * Transient per-run iteration count (1-10). Overlays `runs` on every
+   * test case in the run snapshot without mutating the persisted
+   * `EvalCase.runs` default. Cap-math counts this against
+   * MAX_TOTAL_LLM_CALLS.
+   */
+  iterationOverride: z.number().int().min(1).max(10).optional(),
+  /**
+   * Run-only case subset (Convex testCase ids). When set, the run is scoped
+   * to just these suite cases instead of every case — a single filter on the
+   * run snapshot, with precreate + the runner unchanged. Used by single-case
+   * runs from the public /api/v1 surface; the persisted suite is untouched.
+   */
+  caseIds: z.array(z.string().min(1)).min(1).optional(),
+  /**
+   * One-off match-option override for this run only. Resolved on top of
+   * suite defaults + case overrides into each iteration's snapshot;
+   * does NOT mutate persisted suite/case records.
+   */
+  matchOptionsOverride: matchOptionsSchema.optional(),
+  /**
+   * Scope this run to a single host attached to the suite. The Convex
+   * `startTestSuiteRun` mutation snapshots the host's current config and
+   * derives the run's server environment from it. When the suite has
+   * multiple host attachments, the client makes one request per host.
+   */
+  namedHostId: z.string().optional(),
+  /**
+   * When true on a suiteRerun, explicitly re-derives suite.hostConfigId
+   * from the request's server list and persists it. Without this flag,
+   * plain reruns leave suite.hostConfigId (and suite.environment) frozen
+   * so connecting new servers cannot silently contaminate existing suites.
+   */
+  refreshSnapshot: z.boolean().optional(),
+  /**
+   * Client-generated UUID set on every per-host POST when a multi-host
+   * eval launch fans out (N > 1). Threaded into Convex `startTestSuiteRun`
+   * so the resulting `testSuiteRun` rows share a group id, which the UI
+   * uses to collapse them into a single parent row. Absent on single-host
+   * launches and on legacy runs — those render ungrouped.
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently.
+   */
+  runGroupId: z.string().optional(),
+  /**
+   * Caller-supplied write idempotency key, forwarded to Convex
+   * `startTestSuiteRun.idempotencyKey`. A repeat call with the same key (and
+   * the same actor + suite) returns the EXISTING run instead of creating and
+   * billing a second one.
+   *
+   * DECLARED ON THE WIRE, not just server-internal: unattended callers are
+   * exactly the ones that retry. The Slack bot derives it from the triggering
+   * event so a redelivered event or a double-clicked button lands on one run,
+   * and the scheduled worker passes its trigger id. Zod strips unknown keys
+   * silently, so leaving this undeclared meant a caller could send the key,
+   * get a 202, and still be billed twice — with nothing to indicate the key
+   * had been dropped.
+   */
+  idempotencyKey: z.string().min(1).max(256).optional(),
+  /**
+   * SHA-256 hex of the suite-file bytes that launched this run. Lowercase,
+   * 64 characters. Forwarded to Convex `startTestSuiteRun.sourceHash` so a
+   * file-owned run records the exact bytes it ran. Absent on UI / API
+   * launches that did not come from a file.
+   */
+  sourceHash: z
+    .string()
+    .regex(
+      /^[a-f0-9]{64}$/,
+      "sourceHash must be a 64-character lowercase SHA-256 hex digest",
+    )
+    .optional(),
+  /**
+   * Project-environment launch (one per attached env on a Run-all fan-out;
+   * always sent explicitly, even single-env). `prepareEvalRun` resolves the
+   * environment's closed server set via
+   * `projectEnvironments:resolveEnvironmentForLaunch` BEFORE server
+   * connection/tool capture, uses it INSTEAD of browser-supplied
+   * `serverIds`, and forwards the resolved revision to `startTestSuiteRun`
+   * as `expectedEnvironmentRevision` (stale ⇒ structured 409, no run row).
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently.
+   */
+  environmentId: z.string().optional(),
+  /**
+   * Compose-and-run opt-in: accept a project-scoped, non-archived environment
+   * that is NOT a suite member. Never mutates the suite. Absent / false keeps
+   * today's membership check. Older backends reject the unknown arg; clients
+   * probe `ephemeralEnvironmentLaunch` before sending it.
+   */
+  ephemeralEnvironment: z.boolean().optional(),
+  /**
+   * The "without skills" arm of an A/B compare (INS-5). `'exclude'` runs this
+   * suite with skills DELIBERATELY off: the backend pins nothing from ANY of
+   * the three channels — host `skillSelection`, the environment's standalone
+   * selection, and the PLUGIN channel — and marks the run `skillsExcluded`, so
+   * the comparison arm is honestly labelled rather than just quietly skill-free.
+   *
+   * KNOWN AND DELIBERATE ASYMMETRY, inherited verbatim from the backend
+   * (`convex/testSuites.ts`, `resolveEnvironmentPinnedSkills`): this drops
+   * plugin SKILLS, not plugin SERVERS. The flag is scoped to skill delivery, so
+   * a pinned plugin's MCP servers stay connected and stay in the run's
+   * `environmentPluginVersions` provenance. Dropping them too would change
+   * which servers the arm connects, which is the one variable a skills A/B has
+   * to hold fixed. A genuinely plugin-free comparison arm needs a backend
+   * override that does not exist yet — see the INS-5 notes.
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently.
+   */
+  skillsOverride: z.literal("exclude").optional(),
+  /**
+   * The REWRITE arm of a description-experiment (PR-E3). `{ experimentId }`
+   * only — the backend loads the experiment and copies its proposal onto the
+   * run's `configSnapshot.toolDescriptionOverride`. Caller-supplied
+   * description text is not representable here; a silently-stripped body
+   * would launch an ORIGINAL arm while the caller believed they launched a
+   * rewrite.
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently.
+   */
+  toolDescriptionOverride: z
+    .object({ experimentId: z.string().min(1) })
+    .strict()
+    .optional(),
+  /**
+   * Snapshot replay of an existing run. Threaded into Convex
+   * `startTestSuiteRun.replayedFromRunId` so the new run copies the source
+   * snapshot rather than the live suite. Used by the description-experiment
+   * two-arm launch (identical args except the rewrite arm's override).
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently.
+   */
+  replayedFromRunId: z.string().min(1).optional(),
+  /**
+   * When true with `replayedFromRunId`, re-resolve the suite's current
+   * config instead of copying the source snapshot. Description-experiment
+   * arms pass `false` so both arms replay the same frozen source.
+   */
+  useCurrentSuiteConfig: z.boolean().optional(),
+  /**
+   * Per-run approval of `approximated` imported cases, by HOSTED test-case id.
+   *
+   * Claim-only in both directions: the caller supplies an id and a reason, and
+   * the backend derives the approver from the authenticated launcher, stamps
+   * the time, and FREEZES the resulting decision into the run's own case
+   * snapshot. A caller-supplied approver would file one person's approval
+   * under another's name and a caller-supplied timestamp could be backdated
+   * past the edit that invalidated the claim, so neither is representable
+   * here.
+   *
+   * Nothing about this persists on the case. The next run of the same
+   * approximation needs a new approval — that is the difference between
+   * approving a RUN and accepting a CASE, and the whole reason there is no
+   * second concept.
+   *
+   * Must be declared explicitly on every Zod boundary in the wire path;
+   * unknown keys are stripped silently, and a silently-stripped approval
+   * would be reported to the caller as a backend policy refusal.
+   */
+  importApprovals: z
+    .array(
+      z
+        .object({
+          testCaseId: z.string().min(1),
+          reason: z.string().trim().min(1).max(500),
+        })
+        .strict(),
+    )
+    .min(1)
+    .optional(),
+});
+
+export type RunEvalsRequest = z.infer<typeof RunEvalsRequestSchema>;
+/**
+ * Run origin persisted on `testSuiteRun.source`; /api/v1 passes 'api', the
+ * scheduled-evals worker passes 'schedule', the GitHub-checks worker passes
+ * 'github_check', and the bench worker passes 'benchmark' — which, alone among
+ * them, must also carry the `benchmarkRunId` of its live parent run.
+ *
+ * Server-internal on purpose: neither field is on `RunEvalsRequestSchema`, so
+ * API callers cannot spoof run provenance. The pairing rule lives in
+ * {@link EvalRunProvenance} beside the mutation call that has to honour it.
+ */
+type RunEvalsWithManagerRequest = RunEvalsRequest & {
+  runtimeVenue?: "local" | "hosted";
+  /** Already resolved by the public inline-suite boundary. */
+  hostAttachments?: Array<{
+    namedHostId: string;
+    selectedServerIds?: string[];
+  }>;
+  orgModelConfig?: ResolvedOrgModelConfig;
+  /**
+   * Extra headers stamped on every per-step Convex request this run makes.
+   *
+   * The bench worker's channel for `x-mcpjam-benchmark-grant`: a benchmark
+   * cell's model calls are billed against the run's budget, and the grant is
+   * what tells `/stream` which run to charge. It rides the request headers
+   * rather than the run row because it is a short-lived credential — a run
+   * snapshot is member-readable and would make it forgeable.
+   *
+   * Passed by REFERENCE all the way to `processOneStep`, which reads it per
+   * step, so a caller holding the same object can rotate a credential inside
+   * it mid-run without restarting anything.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * The benchmark's write-manifest enforcement for this cell.
+   *
+   * Server-internal like `source`: it is NOT on `RunEvalsRequestSchema`, so an
+   * API caller cannot hand itself permission to write to a target. The
+   * manifests inside are pinned in the definition and verified against the
+   * claim BEFORE the cell launches; the artifact ledger inside is the run's,
+   * shared by reference so every iteration writes into the one the run's
+   * cleanup will read.
+   */
+  benchmarkWriteGuard?: BenchmarkWriteGuard;
+  /**
+   * Pre-resolved environment from the caller's manager-priming preflight (the
+   * hosted `/run` route and the scheduled worker resolve the environment ONCE
+   * to connect its closed set). When present — and for the same
+   * `environmentId` — `prepareEvalRun` reuses THIS resolution, including its
+   * revision, instead of re-resolving. That makes `expectedEnvironmentRevision`
+   * describe the exact set the manager was connected with, so an environment
+   * edit after the preflight fails the run-start revision check (clean 409 /
+   * retry) rather than pairing a stale manager with a newer run snapshot.
+   */
+  resolvedEnvironment?: ResolvedEnvironmentForLaunch;
+  /**
+   * WHO SAYS IT LAUNCHED THIS RUN, and from which CI job.
+   *
+   * Server-internal like `source`: it is NOT on `RunEvalsRequestSchema`, so an
+   * API caller cannot put it in the body. It arrives on
+   * `x-mcpjam-launcher` / `x-mcpjam-ci` and is parsed at the `/v1` boundary
+   * (`utils/launch-context.ts`), which is also where a malformed or
+   * out-of-allowlist value is dropped — a label must never fail a launch.
+   *
+   * A LABEL. `source` is still stamped `"api"` and the verified attribution is
+   * still what the audit reads; this is what lets the Runs table stop showing
+   * a CLI run, an Actions job and an MCP agent as one indistinguishable `API`.
+   */
+  launchContext?: LaunchContext;
+} & EvalRunProvenance;
+
+export type GithubCheckServerOverride = Array<{
+  serverName: string;
+  projectServerId: string;
+}>;
+
+/** Pair the temporary PR server's display name with its project server row. */
+export function buildGithubCheckServerOverride(args: {
+  source: RunEvalsWithManagerRequest["source"];
+  persistedServerRefs: string[];
+  serverNames?: string[];
+}): GithubCheckServerOverride | undefined {
+  if (args.source !== "github_check") return undefined;
+  if (
+    !args.serverNames?.length ||
+    args.serverNames.length !== args.persistedServerRefs.length
+  ) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "GitHub checks require one name for each temporary PR server",
+    );
+  }
+  const names = new Set(args.serverNames.map((name) => name.toLowerCase()));
+  const ids = new Set(args.persistedServerRefs);
+  if (
+    names.size !== args.serverNames.length ||
+    ids.size !== args.persistedServerRefs.length
+  ) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "GitHub checks require unique temporary PR server names and ids",
+    );
+  }
+  return args.serverNames.map((serverName, index) => ({
+    serverName,
+    projectServerId: args.persistedServerRefs[index],
+  }));
+}
+
+/**
+ * The saved selection of the case's `models[]` entry this run executes (the
+ * entry whose `model` is the requested id). Invalid or absent ⇒ `undefined`
+ * and the run reads the id as legacy (hosted-first).
+ */
+export function storedSelectionForCaseModel(
+  testCase: unknown,
+  model: string,
+  provider: string,
+): ModelSelection | undefined {
+  const models = (testCase as { models?: unknown } | null)?.models;
+  if (!Array.isArray(models)) return undefined;
+  // A case can list one model id under two providers (`gpt-5.1` under
+  // `openai` and under `azure`); the run must take the entry of the
+  // provider it was asked for. An entry saved without a provider matches on
+  // the model alone.
+  const entry = models.find((candidate) => {
+    if (candidate === null || typeof candidate !== "object") return false;
+    const row = candidate as { model?: unknown; provider?: unknown };
+    return (
+      row.model === model &&
+      (row.provider === undefined || row.provider === provider)
+    );
+  }) as { selection?: unknown } | undefined;
+  return readStoredModelSelection(entry?.selection);
+}
+
+export const RunTestCaseRequestSchema = z.object({
+  testCaseId: z.string(),
+  /**
+   * ENVIRONMENT quick run: execute the case in this project environment. The
+   * environment decides the model, the client (and its configuration) and the
+   * servers, so a request naming one sends no `model`/`provider`, no
+   * `namedHostId` or `hostConfigOverride`, and no servers of its own; a
+   * conflicting value is refused (see `assertNoConflictingEnvironmentOverrides`).
+   * Case CONTENT (`testCaseOverrides`) and repetitions stay editable.
+   */
+  environmentId: z.string().optional(),
+  /** Required with `environmentId`: the project the environment belongs to. */
+  projectId: z.string().optional(),
+  /**
+   * Makes the environment commit retry-safe: a retried request with the same
+   * key gets the SAME committed iterations back and does not execute them
+   * again. One key per Run click.
+   */
+  idempotencyKey: z.string().min(8).max(200).optional(),
+  /** Legacy runs: the model to execute. Ignored (or refused, if it differs)
+   *  on an environment run. */
+  model: z.string().optional(),
+  provider: z.string().optional(),
+  compareRunId: z.string().optional(),
+  skipLastMessageRunUpdate: z.boolean().optional(),
+  /**
+   * Legacy runs: the servers to connect (at least one, enforced at
+   * preparation). An environment run connects its own closed set instead.
+   */
+  serverIds: z.array(z.string()).optional(),
+  scenarioId: z.string().optional(),
+  accessVersion: z.number().int().nonnegative().optional(),
+  modelApiKeys: z.record(z.string(), z.string()).optional(),
+  convexAuthToken: z.string(),
+  testCaseOverrides: z
+    .object({
+      query: z.string().optional(),
+      expectedToolCalls: z.array(z.any()).optional(),
+      isNegativeTest: z.boolean().optional(),
+      runs: z.number().int().positive().max(10).optional(),
+      expectedOutput: z.string().optional(),
+      // Unified `TestStep[]` override for a single-case quick run. Declared so
+      // Zod doesn't strip it off the wire.
+      steps: stepsSchema.min(1).optional(),
+      // Legacy multi-turn override still sent by the test-template editor's
+      // quick-run path. Accepted (not stripped) so the transform below can
+      // convert it to `steps`; otherwise unsaved multi-turn/pinned edits are
+      // silently dropped and the run falls back to the persisted case.
+      promptTurns: z.array(z.any()).optional(),
+      advancedConfig: z
+        .object({
+          system: z.string().optional(),
+          temperature: z.number().optional(),
+          toolChoice: toolChoiceSchema.optional(),
+        })
+        .passthrough()
+        .optional(),
+      matchOptions: matchOptionsSchema.optional(),
+      // State-based predicate gate (see shared/predicates). Accepted as a
+      // per-run override so SDK / corpus cases can gate on predicates without
+      // the deferred Convex `testCase` schema change. Loosely typed like
+      // `expectedToolCalls` above; predicate shape is validated by the corpus
+      // validator at authoring time and evaluated deterministically by the
+      // runner (unknown types fail closed).
+      successPredicates: z.array(z.any()).optional(),
+      // Case-level predicate override envelope ({ mode, list }). Threaded
+      // through every Zod boundary; the runner resolves it against the
+      // suite's `defaultPredicates` per the case mode.
+      predicates: casePredicatesSchema.optional(),
+      suppressedSuiteStandardCheckIds:
+        suppressedSuiteStandardCheckIdsSchema.optional(),
+    })
+    // Convert a legacy `promptTurns` override (top-level OR `advancedConfig`)
+    // to `steps` when the caller didn't send `steps` directly, so the runner's
+    // `overrides.steps ?? case.steps` precedence picks up unsaved multi-turn
+    // edits.
+    .transform((overrides) => {
+      if (!overrides.steps || overrides.steps.length === 0) {
+        const turns = resolveLegacyPromptTurns(overrides);
+        if (turns.length > 0) {
+          return { ...overrides, steps: promptTurnsToSteps(turns) };
+        }
+      }
+      return overrides;
+    })
+    .optional(),
+  /**
+   * One-off match-option override for this single-case run only. Does
+   * NOT mutate the persisted case's `matchOptions`.
+   */
+  matchOptionsOverride: matchOptionsSchema.optional(),
+  toolPolicy: evalSuiteFileToolPolicySchema.optional(),
+  /**
+   * Scope this single-case run to a single host attached to the suite. Mirrors
+   * suite-run host selection and reuses `loadSuiteHostConfig`.
+   */
+  namedHostId: z.string().optional(),
+  /**
+   * One-off hostConfig override for this single-case run. Subset of
+   * `HostConfigInputV2`; recorded on the iteration snapshot so the trace
+   * shows which config the run actually used. Does NOT mutate the suite
+   * hostConfig.
+   */
+  hostConfigOverride: z
+    .object({
+      hostStyle: z.string().optional(),
+      hostContext: z.record(z.string(), z.unknown()).optional(),
+      clientCapabilities: z.record(z.string(), z.unknown()).optional(),
+      hostCapabilitiesOverride: z.record(z.string(), z.unknown()).optional(),
+      chatUiOverride: z.record(z.string(), z.unknown()).optional(),
+      mcpProfile: z.record(z.string(), z.unknown()).optional(),
+      connectionDefaults: z
+        .object({
+          headers: z.record(z.string(), z.string()).optional(),
+          requestTimeout: z.number().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
+
+export type RunTestCaseRequest = z.infer<typeof RunTestCaseRequestSchema>;
+type RunTestCaseWithManagerRequest = RunTestCaseRequest & {
+  runtimeVenue?: "local" | "hosted";
+  orgModelConfig?: ResolvedOrgModelConfig;
+};
+
+export const MAX_TOTAL_LLM_CALLS = 300;
+
+export function assertSuiteRunWithinCap(
+  request: RunEvalsRequest,
+  configCount = 1,
+) {
+  const override = request.iterationOverride;
+  // Each iteration issues one model call per prompt turn; counting only `runs`
+  // lets a multi-turn save-from-chat case bypass the cap. Widget probes issue
+  // zero model calls and are excluded entirely.
+  const totalCalls =
+    request.tests.reduce((sum, t) => {
+      const iterations = override ?? t.runs ?? 0;
+      // Every wire case carries `steps`: count only `prompt` steps (each issues
+      // one model call; `toolCall`/`interact`/`assert` issue none). A model-free
+      // (no-prompt) case contributes nothing to the LLM budget.
+      return sum + iterations * countModelSteps(t.steps ?? []);
+    }, 0) * Math.max(configCount, 1);
+  if (totalCalls > MAX_TOTAL_LLM_CALLS) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      `Suite run would issue ${totalCalls} LLM calls, above the cap of ${MAX_TOTAL_LLM_CALLS}. Reduce iterations or test count.`,
+      { totalCalls, cap: MAX_TOTAL_LLM_CALLS },
+    );
+  }
+}
+
+/**
+ * Synthesize cap-math entries from PERSISTED suite cases for bare suite
+ * reruns (`suiteId` + empty wire `tests`: the scheduled-evals worker and the
+ * /api/v1 suiteId-only rerun). Without this, `assertSuiteRunWithinCap` sums
+ * an empty list and unattended runs bypass the cap interactive launches
+ * enforce. One entry per (case × model) mirrors the interactive fan-out;
+ * model-less prompt cases count once (they are rejected up front by
+ * {@link assertBareRerunCasesRunnable}, but still counted here so cap math
+ * never under-reports); widget probes carry `caseType` so the cap reducer
+ * excludes them.
+ */
+export function buildCapEntriesFromPersistedCases(
+  cases: Array<{
+    title?: string;
+    runs?: number;
+    models?: Array<{ model: string; provider: string }>;
+    steps?: unknown;
+    promptTurns?: unknown;
+    advancedConfig?: unknown;
+    caseType?: TestCaseType;
+    probeConfig?: ProbeConfig;
+  }>,
+  options?: { environmentBacked?: boolean },
+): RunEvalsRequest["tests"] {
+  const entries: RunEvalsRequest["tests"] = [];
+  for (const testCase of cases ?? []) {
+    const steps =
+      // Resolve real steps for cap math so the count matches what executes:
+      //  - explicit `steps` (or legacy `widget_probe`+`probeConfig`, which is
+      //    MODEL-FREE → 0 LLM calls) via resolveAuthoringSteps;
+      //  - legacy multi-turn `promptTurns` (top-level/advancedConfig) so every
+      //    model turn is counted;
+      //  - else an empty `prompt` placeholder (counts once).
+      // Without the probe branch, a legacy widget probe would synthesize a
+      // `prompt` placeholder and be over-counted as a model call, so big/iterated
+      // probe suites could be wrongly rejected over MAX_TOTAL_LLM_CALLS.
+      (resolveAuthoringSteps(testCase) ??
+        legacyCaseStepsFallback(testCase) ?? [
+          { id: "legacy-cap-prompt", kind: "prompt", prompt: "" },
+        ]) as RunEvalsRequest["tests"][number]["steps"];
+    // Model-free cases (no `prompt` step) need one cap entry; model cases fan
+    // out per model. The cap reducer counts `prompt` steps, so a model-free
+    // case contributes 0 LLM calls regardless of fanout — the entry carries
+    // `steps` so the reducer sees the real count.
+    const modelFree = isModelFree(steps ?? []);
+    const fanout =
+      modelFree || options?.environmentBacked
+        ? 1
+        : Math.max(testCase.models?.length ?? 0, 1);
+    for (let i = 0; i < fanout; i++) {
+      entries.push({
+        title: testCase.title ?? "",
+        query: "",
+        runs: Math.max(1, Math.floor(testCase.runs ?? 1)),
+        model: "cap-check",
+        provider: "none",
+        expectedToolCalls: [],
+        steps,
+      });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Reject a bare suite rerun (scheduled worker, /api/v1 suiteId-only) whose
+ * persisted snapshot contains a prompt case that cannot contribute a single
+ * runnable entry.
+ *
+ * The bare-rerun path builds the runner's `config.tests` straight from the
+ * persisted cases (see `startSuiteRunWithRecorder`). A prompt case with an
+ * empty `models` array and no legacy `model`/`provider` relies on
+ * `suite.defaultConfig.modelId` — but that substitution only ever runs
+ * client-side (it needs the model catalog to resolve the provider) and is
+ * absent here, so the recorder's config builder silently drops the case
+ * (`return []`). The run would then execute fewer cases than the cap reserved
+ * for — or, for a model-default-only suite, zero — while reporting success.
+ * For an unattended monitor that silent under-run is the dangerous failure
+ * mode, so surface it loudly instead: a 400 on the /api/v1 surface, and on the
+ * scheduled path a failed claim the backend's failure accounting can pause and
+ * notify on.
+ *
+ * (Honest scope: full suite-default support for bare reruns needs the backend
+ * snapshot + `precreateIterationsForRun` to carry the substituted model so the
+ * recorder has a precreated row to pair against — substituting only in the
+ * inspector's config builder would execute the case with nowhere to record it.
+ * Tracked as a follow-up.)
+ */
+export function assertBareRerunCasesRunnable(
+  cases: Array<{
+    title?: string;
+    models?: Array<{ model: string; provider: string }>;
+    model?: string;
+    provider?: string;
+    steps?: unknown;
+    caseType?: TestCaseType;
+    probeConfig?: ProbeConfig;
+  }> | null,
+): void {
+  const unrunnable = (cases ?? [])
+    .filter(
+      (c) =>
+        // Model-free cases (every step is a `toolCall`/no `prompt`) need no
+        // model and ARE runnable — don't flag them as unrunnable prompt cases.
+        // Derive steps through `resolveAuthoringSteps` so PRE-MIGRATION
+        // `widget_probe` rows (no `steps`, only `caseType`/`probeConfig`) are
+        // recognized as model-free instead of mistaken for prompt cases.
+        !isModelFree(resolveAuthoringSteps(c) ?? []) &&
+        !(c.models && c.models.length > 0) &&
+        !(c.model && c.provider),
+    )
+    .map((c) => c.title?.trim() || "(untitled)");
+  if (unrunnable.length > 0) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      `Cannot run this suite unattended: ${unrunnable.length} prompt case(s) ` +
+        `have no model of their own and rely on the suite default model, ` +
+        `which is only applied for interactive launches. Add a per-case ` +
+        `model to run on a schedule or via the API: ${unrunnable.join(", ")}.`,
+      { unrunnableCases: unrunnable },
+    );
+  }
+}
+
+/**
+ * Counts override prompt-turns when present, then falls back to the
+ * persisted case's prompt-turns count. Callers that have already loaded
+ * the persisted test case should pass it via `resolved` — without it, a
+ * multi-turn saved case can slip past the cap because we'd count it as a
+ * single-turn run.
+ */
+export function assertTestCaseRunWithinCap(
+  request: RunTestCaseRequest,
+  configCount = 1,
+  resolved?: { modelStepCount?: number },
+) {
+  const iterations = request.testCaseOverrides?.runs ?? 1;
+  const overrideCalls = request.testCaseOverrides?.steps
+    ? countModelSteps(request.testCaseOverrides.steps)
+    : undefined;
+  const resolvedCalls = resolved?.modelStepCount;
+  const turns = Math.max(overrideCalls ?? resolvedCalls ?? 0, 1);
+  const totalCalls = iterations * turns * Math.max(configCount, 1);
+  if (totalCalls > MAX_TOTAL_LLM_CALLS) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      `Test case run would issue ${totalCalls} LLM calls, above the cap of ${MAX_TOTAL_LLM_CALLS}.`,
+      { totalCalls, cap: MAX_TOTAL_LLM_CALLS },
+    );
+  }
+}
+
+// Optional attachment metadata threaded into the backend eval-generation
+// endpoint so the LLM can scope the cases by the suite's saved server
+// attachment (per-server tests + at least one explicit cross-server test
+// when the attachment spans ≥2 servers). `resolvedServerNames` carries
+// runtime server identifiers — NOT Convex serverAttachment document ids —
+// to avoid ambiguity at the wire boundary.
+export const ServerAttachmentInputSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().optional(),
+  resolvedServerNames: z.array(z.string().min(1)).min(1),
+});
+
+export type ServerAttachmentInput = z.infer<typeof ServerAttachmentInputSchema>;
+
+// Per-bucket case counts for configurable generation. Field names mirror the
+// backend `CaseMix`. Each bucket is bounded; the backend additionally caps the
+// total. Omitted buckets inherit the backend's mode default.
+export const CaseMixSchema = z.object({
+  simple: z.number().int().min(0).max(10).optional(),
+  multiTool: z.number().int().min(0).max(10).optional(),
+  multiTurn: z.number().int().min(0).max(10).optional(),
+  complex: z.number().int().min(0).max(10).optional(),
+  negative: z.number().int().min(0).max(10).optional(),
+});
+
+// Optional generation knobs forwarded to the backend generate endpoint.
+export const GenerationOptionsSchema = z.object({
+  testSet: z.enum(["quick", "comprehensive"]).optional(),
+  toolCoverage: z.enum(["read-only", "read-write"]).optional(),
+  caseMix: CaseMixSchema.optional(),
+  varyUserStyles: z.boolean().optional(),
+  refinement: z.string().trim().min(1).max(2_000).optional(),
+});
+
+export type GenerationOptions = z.infer<typeof GenerationOptionsSchema>;
+
+// `serverNames` is the optional parallel array that pairs each `serverIds[i]`
+// (the manager key — Convex Id in hosted mode, display name in standalone)
+// with its runtime display name. The backend snapshot/attachment check is
+// keyed by display name (see `applyAttachmentScope` in
+// `convex/evalGeneration/routes.ts`), so generators must rewrite the snapshot's
+// `serverId` to the display name before forwarding. Without the parallel
+// array the rewrite is a no-op and standalone callers (where manager key ==
+// display name) continue to work unchanged.
+export const GenerateTestsRequestSchema = z.object({
+  /**
+   * Legacy: the servers to generate against (at least one, enforced when the
+   * request names no environment). An environment request resolves its own.
+   */
+  serverIds: z.array(z.string()),
+  serverNames: z.array(z.string()).optional(),
+  convexAuthToken: z.string(),
+  projectId: z.string().min(1).optional(),
+  /**
+   * Generate against this environment's eval server set — its server group
+   * plus the servers its pinned plugins contribute — resolved the way a run
+   * resolves it, so cases are authored against the tools the run will have.
+   */
+  environmentId: z.string().min(1).optional(),
+  serverAttachment: ServerAttachmentInputSchema.optional(),
+  generationOptions: GenerationOptionsSchema.optional(),
+});
+
+export type GenerateTestsRequest = z.infer<typeof GenerateTestsRequestSchema>;
+
+export const GenerateNegativeTestsRequestSchema = z.object({
+  /** See {@link GenerateTestsRequestSchema}. */
+  serverIds: z.array(z.string()),
+  serverNames: z.array(z.string()).optional(),
+  convexAuthToken: z.string(),
+  projectId: z.string().min(1).optional(),
+  environmentId: z.string().min(1).optional(),
+  serverAttachment: ServerAttachmentInputSchema.optional(),
+});
+
+export type GenerateNegativeTestsRequest = z.infer<
+  typeof GenerateNegativeTestsRequestSchema
+>;
+
+/**
+ * Best-effort fetch of a suite's `defaultMatchOptions` so single-case
+ * runs resolve the same suite → case → override precedence chain that
+ * `precreateIterationsForRun` applies for suite-level runs.
+ * Returns undefined on any error; defaults still apply downstream.
+ */
+async function loadSuiteDefaultMatchOptions(
+  convexClient: ConvexHttpClient,
+  suiteId?: string,
+): Promise<MatchOptionsDTO | undefined> {
+  if (!suiteId) return undefined;
+  try {
+    const suite = await convexClient.query("testSuites:getTestSuite" as any, {
+      suiteId,
+    });
+    return (
+      (suite?.defaultMatchOptions as MatchOptionsDTO | undefined) ?? undefined
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Best-effort fetch of a suite's `defaultPredicates` so single-case runs
+ * resolve the same suite → case predicate precedence chain that the suite
+ * run path applies via `precreateIterationsForRun` once the backend ships
+ * the resolved field. Returns undefined on any error; runner treats that
+ * as no suite default.
+ */
+async function loadSuiteDefaultPredicates(
+  convexClient: ConvexHttpClient,
+  suiteId?: string,
+): Promise<import("@/shared/eval-matching").Predicate[] | undefined> {
+  if (!suiteId) return undefined;
+  try {
+    const suite = await convexClient.query("testSuites:getTestSuite" as any, {
+      suiteId,
+    });
+    const defaults = (suite as { defaultPredicates?: unknown } | undefined)
+      ?.defaultPredicates;
+    if (!Array.isArray(defaults) || defaults.length === 0) return undefined;
+    return defaults as import("@/shared/eval-matching").Predicate[];
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadSuiteEnvironment(
+  convexClient: ConvexHttpClient,
+  suiteId?: string,
+): Promise<unknown> {
+  if (!suiteId) return undefined;
+  try {
+    const suite = await convexClient.query("testSuites:getTestSuite" as any, {
+      suiteId,
+    });
+    return (suite as { environment?: unknown } | undefined)?.environment;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildRuntimeEnvironmentWithBindings(args: {
+  resolvedServerIds: string[];
+  suiteEnvironment: unknown;
+}) {
+  const rawBindings = (
+    args.suiteEnvironment as
+      | {
+          serverBindings?: Array<{
+            serverName?: unknown;
+            projectServerId?: unknown;
+          }>;
+        }
+      | undefined
+  )?.serverBindings;
+  const serverBindings = Array.isArray(rawBindings)
+    ? rawBindings.flatMap((binding) =>
+        typeof binding.serverName === "string" &&
+        typeof binding.projectServerId === "string"
+          ? [
+              {
+                serverName: binding.serverName,
+                projectServerId: binding.projectServerId,
+              },
+            ]
+          : [],
+      )
+    : [];
+  return {
+    servers: args.resolvedServerIds,
+    ...(serverBindings.length > 0 ? { serverBindings } : {}),
+  };
+}
+
+export function createConvexClients(convexAuthToken: string) {
+  const convexUrl = process.env.CONVEX_URL;
+  if (!convexUrl) {
+    throw new Error("CONVEX_URL is not set");
+  }
+
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) {
+    throw new Error("CONVEX_HTTP_URL is not set");
+  }
+
+  const convexClient = new ConvexHttpClient(convexUrl);
+  convexClient.setAuth(convexAuthToken);
+
+  return { convexClient, convexHttpUrl };
+}
+
+export function resolveServerIdsOrThrow(
+  requestedIds: string[],
+  clientManager: MCPClientManager,
+): string[] {
+  const available = listBaseServers(clientManager);
+  const resolved: string[] = [];
+
+  for (const requestedId of requestedIds) {
+    const match =
+      available.find((id) => id === requestedId) ??
+      available.find((id) => id.toLowerCase() === requestedId.toLowerCase());
+
+    if (!match) {
+      throw new WebRouteError(
+        404,
+        ErrorCode.NOT_FOUND,
+        `Could not start eval because "${requestedId}" is not connected. Reconnect the server and try again.`,
+        { serverId: requestedId },
+      );
+    }
+
+    if (!resolved.includes(match)) {
+      resolved.push(match);
+    }
+  }
+
+  return resolved;
+}
+
+function normalizeForComparison(obj: any): any {
+  if (obj === null || obj === undefined) return null;
+  if (typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(normalizeForComparison);
+
+  const sorted: Record<string, unknown> = {};
+  Object.keys(obj)
+    .sort()
+    .forEach((key) => {
+      sorted[key] = normalizeForComparison(obj[key]);
+    });
+  return sorted;
+}
+
+export function filterAndRemapReplayConfigs(
+  replayConfigs: MCPServerReplayConfig[],
+  resolvedServerIds: string[],
+  persistedServerIds: string[],
+): MCPServerReplayConfig[] {
+  const persistedIdByResolvedId = new Map<string, string>();
+
+  for (const [index, resolvedServerId] of resolvedServerIds.entries()) {
+    const persistedServerId = persistedServerIds[index] ?? resolvedServerId;
+    if (!resolvedServerId || !persistedServerId) {
+      continue;
+    }
+    persistedIdByResolvedId.set(resolvedServerId, persistedServerId);
+  }
+
+  return replayConfigs.flatMap((config) => {
+    const persistedServerId = persistedIdByResolvedId.get(config.serverId);
+    if (!persistedServerId) {
+      return [];
+    }
+
+    return [
+      {
+        ...config,
+        serverId: persistedServerId,
+      },
+    ];
+  });
+}
+
+function buildPersistedSuiteEnvironment(args: {
+  resolvedServerIds: string[];
+  persistedServerRefs: string[];
+  serverNames?: string[];
+}) {
+  const serverNames =
+    args.serverNames &&
+    args.serverNames.length > 0 &&
+    args.serverNames.length === args.resolvedServerIds.length
+      ? args.serverNames
+      : args.persistedServerRefs;
+
+  const serverBindings =
+    args.serverNames &&
+    args.serverNames.length > 0 &&
+    args.serverNames.length === args.resolvedServerIds.length
+      ? args.serverNames.map((serverName, index) => ({
+          serverName,
+          projectServerId: args.resolvedServerIds[index],
+        }))
+      : undefined;
+
+  return {
+    servers: serverNames,
+    ...(serverBindings ? { serverBindings } : {}),
+  };
+}
+
+export type PreparedEvalRun = {
+  suiteId: string;
+  runId: string;
+  caseUpsert: {
+    committed: Array<{ id?: string; name: string }>;
+    failed: Array<{ id?: string; name: string; error: string }>;
+  };
+  recorder: SuiteRunRecorder;
+  /**
+   * This "start" REPLAYED an existing run rather than creating one — an
+   * idempotency-key hit, or the keyless fingerprint window. Undefined against a
+   * backend that predates the signal.
+   *
+   * Read it through {@link shouldSkipExecution}; a bare truthiness check here
+   * is the wrong question, because a replay of a run still in flight is not the
+   * same as a replay of one that finished.
+   */
+  deduped?: boolean;
+  /** The run's status as the platform holds it. `running` for a fresh start;
+   *  on a replay, whatever the existing run actually is. */
+  status?: string;
+  /**
+   * Execute the prepared run to completion. `runEvalSuiteWithAiSdk` owns
+   * terminal run status (completed/failed/cancelled); callers that detach
+   * this (the async /api/v1 route) should still catch and defensively
+   * finalize via `recorder` for errors thrown outside the runner's own
+   * try.
+   *
+   * DO NOT call this unconditionally on a prepared run — see
+   * {@link shouldSkipExecution}. A replay of a finished run must not execute:
+   * the suite would run a second time and bill a second time, against a run
+   * whose results are already recorded.
+   */
+  execute: () => Promise<void>;
+};
+
+/**
+ * Whether a prepared run has already been run and must NOT be executed again.
+ *
+ * TRUE for exactly one case: the platform replayed an existing run AND that run
+ * is terminal. Executing then would re-run every case and bill for it, writing
+ * over results that are already final — which is the double-spend an
+ * idempotency key is sent to prevent.
+ *
+ * FALSE for a replay of a NON-terminal run, deliberately. Two situations are
+ * indistinguishable from here — a run genuinely in flight, and one abandoned
+ * when its process died mid-execution — and they want opposite treatments. The
+ * conservative answer preserves the behaviour that predates this check, so a
+ * crashed run can still be driven to completion by a retry the way it always
+ * has been. Deciding that case needs a liveness signal (a lease or heartbeat on
+ * the run), not a guess made here.
+ *
+ * FALSE against a backend with no `deduped` field, for the same reason: unknown
+ * is not a licence to change behaviour.
+ *
+ * TRUE for a replay of a run held in `grading`, which is why this reads
+ * `isRunPastExecution` rather than `isTerminalRunStatus`. Such a run has run
+ * every trial and is waiting only for its judge; a redelivered claim that
+ * executed it would run the whole suite a second time and bill for it, against
+ * a run whose trials are already recorded — the exact double-spend above, in a
+ * status that is deliberately not terminal.
+ */
+export function shouldSkipExecution(prepared: {
+  deduped?: boolean;
+  status?: string;
+}): boolean {
+  return prepared.deduped === true && isRunPastExecution(prepared.status);
+}
+
+/**
+ * A probe's identity is title + server + tool: every probe shares query ""
+ * and arrives as exactly one wire row (no model fan-out to reassemble).
+ * Used both as the upsert dedupe key for probe rows and to pair a probe
+ * wire entry with its persisted case. NUL-joined so a title containing the
+ * other segments can't forge a collision.
+ */
+export function probeIdentityKey(entry: {
+  title: string;
+  probeConfig?: ProbeConfig;
+}): string {
+  return [
+    "widget_probe",
+    entry.title,
+    entry.probeConfig?.serverId ?? entry.probeConfig?.serverName ?? "",
+    entry.probeConfig?.toolName ?? "",
+  ].join("\u0000");
+}
+
+/**
+ * Dedupe key for `prepareEvalRun`'s per-case upsert map. Prompt rows keep
+ * the historical title+query key (the per-model fan-out sends one row per
+ * model of the same case and must reassemble). Step-native rows key by
+ * normalized steps so distinct same-titled render checks do not collide and
+ * prompt models are not pushed into a model-free entry.
+ */
+export function buildUpsertCaseKey(test: {
+  title: string;
+  query: string;
+  steps?: TestStep[];
+  caseType?: TestCaseType;
+  probeConfig?: ProbeConfig;
+}): string {
+  const steps = resolveAuthoringSteps(test);
+  if (steps && steps.length > 0) {
+    return `${test.title}-${test.query}-${JSON.stringify(
+      normalizeForComparison(steps),
+    )}`;
+  }
+  return test.caseType === "widget_probe"
+    ? probeIdentityKey(test)
+    : `${test.title}-${test.query}`;
+}
+
+function legacyProbeConfigToSteps(probeConfig: ProbeConfig): TestStep[] {
+  const call = probeConfigToToolCallStep("step-1", probeConfig);
+  return [
+    call,
+    {
+      id: "step-2",
+      kind: "assert",
+      assertion: { type: "widgetRendered", toolName: call.toolName },
+    },
+  ];
+}
+
+function resolveAuthoringSteps(test: {
+  steps?: unknown;
+  caseType?: TestCaseType;
+  probeConfig?: ProbeConfig;
+}): TestStep[] | undefined {
+  const steps = normalizeSteps(test.steps);
+  if (steps.length > 0) return steps;
+  if (test.caseType === "widget_probe" && test.probeConfig) {
+    return legacyProbeConfigToSteps(test.probeConfig);
+  }
+  return undefined;
+}
+
+/**
+ * Project one entry of the upsert map onto a `createTestCases` batch item.
+ *
+ * `judgeRequirement` is deliberately absent. The map type declares it but
+ * nothing ever assigns it, so every create so far has sent `undefined` — which
+ * Convex drops — and the backend's case validators have no such field. The
+ * batch item validator is CLOSED, so forwarding the dead key would turn every
+ * case into a rejected item rather than a silent no-op.
+ */
+function toCaseBatchItem(
+  testCaseData: {
+    title: string;
+    query: string;
+    runs: number;
+    models: Array<{ model: string; provider: string }>;
+    expectedToolCalls: any[];
+    isNegativeTest?: boolean;
+    scenario?: string;
+    expectedOutput?: string;
+    intent?: string;
+    steps?: TestStep[];
+    advancedConfig?: any;
+    matchOptions?: import("@/shared/eval-matching").MatchOptionsDTO;
+    predicates?: import("@/shared/eval-matching").CasePredicates;
+    suppressedSuiteStandardCheckIds?: string[];
+  },
+  opts: { idempotencyKey?: string },
+): EvalCaseBatchItem {
+  return {
+    title: testCaseData.title,
+    query: testCaseData.query,
+    models: testCaseData.models,
+    runs: testCaseData.runs,
+    expectedToolCalls: sanitizeForConvexTransport(
+      testCaseData.expectedToolCalls,
+    ),
+    isNegativeTest: testCaseData.isNegativeTest,
+    scenario: testCaseData.scenario,
+    expectedOutput: testCaseData.expectedOutput,
+    ...(testCaseData.intent !== undefined
+      ? { intent: testCaseData.intent }
+      : {}),
+    steps: sanitizeForConvexTransport(testCaseData.steps),
+    advancedConfig: sanitizeForConvexTransport(testCaseData.advancedConfig),
+    matchOptions: testCaseData.matchOptions,
+    predicates: testCaseData.predicates,
+    ...(testCaseData.suppressedSuiteStandardCheckIds !== undefined
+      ? {
+          suppressedSuiteStandardCheckIds:
+            testCaseData.suppressedSuiteStandardCheckIds,
+        }
+      : {}),
+    ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+  };
+}
+
+/**
+ * One case's upsert outcome, held in its ORIGINAL position.
+ *
+ * Creates are now deferred to a batch that runs after the whole map has been
+ * walked, so appending outcomes as they happen would reorder the response —
+ * every updated case ahead of every created one. Callers render these lists to
+ * a human next to the tests they submitted, so the slot is kept and filled.
+ */
+type CaseUpsertOutcome =
+  | { kind: "committed"; id?: string; name: string }
+  | { kind: "failed"; id?: string; name: string; error: string };
+
+/**
+ * Author the deferred creates through `createTestCases` and fill their slots.
+ *
+ * A whole-call throw is turned back into one failure per pending case. The
+ * batch mutation rejects an entire call for a caller-level mistake — an
+ * unauthorized actor, a suite that vanished — and before batching, that same
+ * condition threw once per `createTestCase` and filed every case as failed.
+ * Preserving that is what keeps this function's partial-failure contract (and
+ * the empty-new-suite rollback below, which reads "nothing committed") true.
+ */
+async function commitPendingCaseCreates(args: {
+  convexClient: ReturnType<typeof createConvexClients>["convexClient"];
+  suiteId: string;
+  pending: Array<{ slot: number; title: string; item: EvalCaseBatchItem }>;
+  outcomes: Array<CaseUpsertOutcome | undefined>;
+}): Promise<void> {
+  const { convexClient, suiteId, pending, outcomes } = args;
+  if (pending.length === 0) return;
+
+  // Mint here rather than at the map walk: an id is only meaningful for a row
+  // that is actually being created, and an update keeps whatever identity the
+  // stored case already has.
+  const cases = withMintedCaseIds(pending.map((p) => p.item));
+
+  let result: Awaited<ReturnType<typeof createEvalCasesInBatches>>;
+  let rejection: string | undefined;
+  try {
+    result = await createEvalCasesInBatches(convexClient, { suiteId, cases });
+  } catch (error) {
+    // A rejection carries whatever earlier chunks committed. Those rows exist;
+    // reporting them as failures would send the caller into a retry that
+    // authors them twice.
+    result = partialResultOf(error);
+    rejection = error instanceof Error ? error.message : String(error);
+    logger.warn("[evals] Batch case create rejected the whole call", {
+      suiteId,
+      cases: pending.length,
+      committedBeforeRejection: result.committed.length,
+      error: rejection,
+    });
+  }
+
+  for (const entry of result.committed) {
+    const slotted = pending[entry.index];
+    if (!slotted) {
+      logger.warn("[evals] Batch result named a case index we never sent", {
+        suiteId,
+        index: entry.index,
+        sent: pending.length,
+      });
+      continue;
+    }
+    outcomes[slotted.slot] = {
+      kind: "committed",
+      id: String(entry.testCaseId),
+      name: slotted.title,
+    };
+  }
+  for (const entry of result.failed) {
+    const slotted = pending[entry.index];
+    if (!slotted) {
+      logger.warn("[evals] Batch result named a case index we never sent", {
+        suiteId,
+        index: entry.index,
+        sent: pending.length,
+      });
+      continue;
+    }
+    outcomes[slotted.slot] = {
+      kind: "failed",
+      name: slotted.title,
+      // The code is the stable half; the message is what a human reads.
+      error: `${entry.code}: ${entry.message}`,
+    };
+    logger.warn("[evals] Failed to create test case", {
+      suiteId,
+      title: slotted.title,
+      code: entry.code,
+      error: entry.message,
+    });
+  }
+
+  // Warnings are the audit half of the batch contract — a policy coercion, a
+  // replay that kept a different id. This surface renders `{id?, name}` and has
+  // nowhere to put them, so they are logged rather than dropped.
+  // Everything the rejected call never reached. Filled last so a case the
+  // partial result already accounted for keeps its real outcome.
+  if (rejection !== undefined) {
+    for (const { slot, title } of pending) {
+      if (outcomes[slot] === undefined) {
+        outcomes[slot] = { kind: "failed", name: title, error: rejection };
+      }
+    }
+  }
+
+  const entryWarnings = result.committed.flatMap((entry) =>
+    (entry.warnings ?? []).map((w) => ({ title: entry.title, ...w })),
+  );
+  if (result.warnings.length > 0 || entryWarnings.length > 0) {
+    logger.info("[evals] Batch case create returned warnings", {
+      suiteId,
+      warnings: [...result.warnings, ...entryWarnings],
+    });
+  }
+}
+
+/** Drain positional outcomes into the response's two flat lists, in order. */
+function flushCaseOutcomes(
+  outcomes: Array<CaseUpsertOutcome | undefined>,
+  committedCases: Array<{ id?: string; name: string }>,
+  failedCases: Array<{ id?: string; name: string; error: string }>,
+): void {
+  for (const outcome of outcomes) {
+    if (!outcome) continue;
+    if (outcome.kind === "committed") {
+      committedCases.push({
+        ...(outcome.id ? { id: outcome.id } : {}),
+        name: outcome.name,
+      });
+    } else {
+      failedCases.push({
+        ...(outcome.id ? { id: outcome.id } : {}),
+        name: outcome.name,
+        error: outcome.error,
+      });
+    }
+  }
+}
+
+/**
+ * The environment a new suite should be created with, or `null` to keep the
+ * legacy create: only on a backend that advertises
+ * `createSuiteWithEnvironments`, and only when the request pins exactly one
+ * environment (server ids known through bindings, at most one client, at
+ * most one model), so the run that follows needs no environment choice.
+ */
+async function composableEnvironmentTargets(args: {
+  convexClient: ReturnType<typeof createConvexClients>["convexClient"];
+  projectId: string | undefined;
+  environmentLaunch: boolean;
+  persistedEnvironment: {
+    servers: string[];
+    serverBindings?: Array<{ serverName: string; projectServerId: string }>;
+  };
+  hostAttachments?: Array<{
+    namedHostId: string;
+    selectedServerIds?: string[];
+  }>;
+  models: string[];
+}): Promise<Array<{
+  hostId?: string;
+  serverIds: string[];
+  modelId?: string;
+}> | null> {
+  if (!args.projectId || args.environmentLaunch) return null;
+  const serverIds = (args.persistedEnvironment.serverBindings ?? []).map(
+    (binding) => binding.projectServerId,
+  );
+  if (serverIds.length === 0) return null;
+  const models = [...new Set(args.models.map((model) => model.trim()))].filter(
+    Boolean,
+  );
+  if (models.length > 1) return null;
+  const hosts = args.hostAttachments ?? [];
+  if (hosts.length > 1) return null;
+  // Any failure to probe (older backend, a client without the query) keeps
+  // the legacy create.
+  const capabilities = (await Promise.resolve()
+    .then(() =>
+      args.convexClient.query("projectEnvironments:getCapabilities" as any, {
+        projectId: args.projectId,
+      }),
+    )
+    .catch(() => null)) as { createSuiteWithEnvironments?: boolean } | null;
+  if (capabilities?.createSuiteWithEnvironments !== true) return null;
+  const host = hosts[0];
+  return [
+    {
+      ...(host ? { hostId: host.namedHostId } : {}),
+      serverIds:
+        host?.selectedServerIds && host.selectedServerIds.length > 0
+          ? host.selectedServerIds
+          : serverIds,
+      ...(models[0] ? { modelId: models[0] } : {}),
+    },
+  ];
+}
+
+/**
+ * Author phase of a suite run: persist the suite + its test cases (create or
+ * upsert), WITHOUT creating a run record or executing anything. Extracted from
+ * `prepareEvalRun` so the author-only public surface
+ * (`POST /api/v1/projects/:projectId/eval-suites`) can reuse the exact same
+ * suite/case persistence the run path uses — same probe/widget handling,
+ * partial-failure visibility, and rerun snapshot rules — and `prepareEvalRun`
+ * stays the single run engine that calls this then starts the recorder.
+ */
+export async function authorEvalSuite(args: {
+  hostAttachments?: Array<{
+    namedHostId: string;
+    selectedServerIds?: string[];
+  }>;
+  /**
+   * Clients a NEW environment suite would run on, when the caller attaches
+   * its legacy clients separately after authoring (so they are not passed to
+   * a legacy create as `hostAttachments`).
+   */
+  environmentHostAttachments?: Array<{
+    namedHostId: string;
+    selectedServerIds?: string[];
+  }>;
+  convexClient: ReturnType<typeof createConvexClients>["convexClient"];
+  tests: RunEvalsRequest["tests"];
+  resolvedServerIds: string[];
+  persistedServerRefs: string[];
+  serverNames: string[] | undefined;
+  projectId: string | undefined;
+  suiteId: string | null;
+  suiteName: string | undefined;
+  suiteDescription: string | undefined;
+  passCriteria: RunEvalsRequest["passCriteria"];
+  suiteRerun: boolean | undefined;
+  refreshSnapshot: boolean | undefined;
+  /**
+   * The run executes an ENVIRONMENT. Its servers come from the environment
+   * at launch, so they are not the suite's to snapshot: writing them back
+   * into the suite's legacy `environment` would change nothing a run reads
+   * (and the backend would carry a server change onto the environments).
+   */
+  environmentLaunch?: boolean;
+  /**
+   * Caller-supplied write idempotency key (see utils/idempotency.ts). When
+   * set, the suite create and EACH case create derive a stable per-row key, so
+   * a retry lands on the same suite and only re-creates the cases that did not
+   * commit. Per-case keys are derived from the case discriminator rather than
+   * its index: a retry whose case ORDER differs must still match.
+   */
+  idempotencyKey?: string;
+}): Promise<{
+  suiteId: string;
+  suiteName: string | undefined;
+  caseUpsert: {
+    committed: Array<{ id?: string; name: string }>;
+    failed: Array<{ id?: string; name: string; error: string }>;
+  };
+}> {
+  const {
+    convexClient,
+    tests,
+    resolvedServerIds,
+    persistedServerRefs,
+    serverNames,
+    projectId,
+    suiteId,
+    suiteName,
+    suiteDescription,
+    passCriteria,
+    suiteRerun,
+    refreshSnapshot,
+    idempotencyKey,
+  } = args;
+
+  const persistedEnvironment = buildPersistedSuiteEnvironment({
+    resolvedServerIds,
+    persistedServerRefs,
+    serverNames,
+  });
+
+  let resolvedSuiteId = suiteId ?? null;
+
+  // Per-case upsert outcomes. We don't rollback on partial failure; the point
+  // is visibility — surface which cases were committed vs. which failed so
+  // the UI can show a partial-state banner instead of just a generic error.
+  const committedCases: Array<{ id?: string; name: string }> = [];
+  const failedCases: Array<{ id?: string; name: string; error: string }> = [];
+
+  const testCaseMap = new Map<
+    string,
+    {
+      title: string;
+      query: string;
+      runs: number;
+      models: Array<{ model: string; provider: string }>;
+      expectedToolCalls: any[];
+      isNegativeTest?: boolean;
+      scenario?: string;
+      expectedOutput?: string;
+      intent?: string;
+      steps?: TestStep[];
+      judgeRequirement?: string;
+      advancedConfig?: any;
+      matchOptions?: import("@/shared/eval-matching").MatchOptionsDTO;
+      predicates?: import("@/shared/eval-matching").CasePredicates;
+      suppressedSuiteStandardCheckIds?: string[];
+    }
+  >();
+
+  for (const test of tests) {
+    const authoringSteps = resolveAuthoringSteps(test);
+    const key = buildUpsertCaseKey(test);
+    if (!testCaseMap.has(key)) {
+      testCaseMap.set(key, {
+        title: test.title,
+        query: test.query,
+        runs: test.runs,
+        models: [],
+        expectedToolCalls: test.expectedToolCalls,
+        isNegativeTest: test.isNegativeTest,
+        scenario: test.scenario,
+        expectedOutput: test.expectedOutput,
+        intent: test.intent,
+        steps: authoringSteps,
+        advancedConfig: test.advancedConfig,
+        matchOptions: test.matchOptions,
+        predicates: test.predicates,
+        suppressedSuiteStandardCheckIds: test.suppressedSuiteStandardCheckIds,
+      });
+    }
+    // Probe entries carry display-only model sentinels — never collect them
+    // into the case's persisted model list.
+    if (!isModelFree(authoringSteps)) {
+      testCaseMap.get(key)!.models.push({
+        model: test.model,
+        provider: test.provider,
+      });
+    }
+  }
+
+  if (resolvedSuiteId) {
+    // On a plain rerun do NOT overwrite the suite's persisted environment or
+    // hostConfigId — new connected servers would silently contaminate the
+    // frozen execution snapshot. Only update when explicitly refreshing or
+    // on first-run (non-rerun) writes.
+    const shouldUpdateSnapshot =
+      !args.environmentLaunch && (!suiteRerun || refreshSnapshot === true);
+    // …and when there is nothing to update, DON'T CALL AT ALL.
+    //
+    // A plain rerun carries no snapshot (above) and no name or description of
+    // its own — a bare `{ suiteId }` rerun has neither on the wire — so this
+    // was a mutation whose whole argument list was `undefined`. Harmless while
+    // every suite was writable; not harmless now that a CI-owned suite refuses
+    // suite edits, because it would make EVERY rerun of a suite managed by CI
+    // fail on a write it never needed to make. Running a CI-owned suite is
+    // exactly what the lock is meant to keep working.
+    //
+    // What still refuses, on purpose: `refreshSnapshot`, and a non-rerun
+    // inline-test launch. Both really do rewrite the suite's persisted
+    // configuration, and that is the drift the lock exists to stop.
+    //
+    // Name and description are NOT exempt from that. A rerun echoes back the
+    // suite's OWN name and description — the web client reads them off the
+    // suite row it is looking at and sends them straight back — so writing
+    // them stores what is already stored, and the only thing that write can
+    // do is fail. Renaming a suite has its own route (`PATCH
+    // /eval-suites/:suiteId`); a rerun is not it.
+    const suiteWriteFields = {
+      ...(!suiteRerun && suiteName !== undefined ? { name: suiteName } : {}),
+      ...(!suiteRerun && suiteDescription !== undefined
+        ? { description: suiteDescription }
+        : {}),
+      ...(shouldUpdateSnapshot ? { environment: persistedEnvironment } : {}),
+      ...(shouldUpdateSnapshot && refreshSnapshot === true
+        ? { refreshHostConfigFromEnvironment: true }
+        : {}),
+    };
+    if (Object.keys(suiteWriteFields).length > 0) {
+      await convexClient.mutation("testSuites:updateTestSuite" as any, {
+        suiteId: resolvedSuiteId,
+        ...suiteWriteFields,
+      });
+    }
+
+    // On a suite rerun, do NOT upsert per-case fields. The wire payload
+    // contains values derived from suite.defaultConfig (model substituted in
+    // for model-less cases, etc.); writing them back would bake the current
+    // suite default into per-case overrides and stop later default changes
+    // from propagating. Cases are already persisted; rerun just runs them.
+    if (suiteRerun) {
+      // skip upsert
+    } else {
+      const existingTestCases = await convexClient.query(
+        "testSuites:listTestCases" as any,
+        { suiteId: resolvedSuiteId },
+      );
+
+      // Updates still go one at a time — `updateTestCase` is a different
+      // mutation with no batch form, and a rerun-time edit is not the bulk
+      // authoring path W0.3 exists for. Only the CREATES are deferred.
+      const outcomes: Array<CaseUpsertOutcome | undefined> = [];
+      const pendingCreates: Array<{
+        slot: number;
+        title: string;
+        item: EvalCaseBatchItem;
+      }> = [];
+
+      for (const [caseDedupeKey, testCaseData] of testCaseMap.entries()) {
+        const slot = outcomes.length;
+        outcomes.push(undefined);
+        const testCaseStepsKey = JSON.stringify(
+          normalizeForComparison(testCaseData.steps || []),
+        );
+        const hasStepKey = (testCaseData.steps?.length ?? 0) > 0;
+        const existingTestCase = existingTestCases?.find((tc: any) => {
+          if (tc.title !== testCaseData.title) return false;
+          // Match on `steps` only when BOTH sides carry them. A pre-migration
+          // row persisted with only `query` (no `steps`) must still match a
+          // steps-bearing wire payload by its legacy title+query identity —
+          // otherwise the upsert creates a duplicate instead of migrating the
+          // existing row forward.
+          const storedHasSteps = Array.isArray(tc.steps) && tc.steps.length > 0;
+          if (hasStepKey && storedHasSteps) {
+            return (
+              JSON.stringify(normalizeForComparison(tc.steps)) ===
+              testCaseStepsKey
+            );
+          }
+          return tc.query === testCaseData.query;
+        });
+
+        try {
+          if (existingTestCase) {
+            const normalize = (val: any) =>
+              val === undefined || val === null ? null : val;
+
+            const modelsChanged =
+              JSON.stringify(
+                normalizeForComparison(existingTestCase.models || []),
+              ) !==
+              JSON.stringify(normalizeForComparison(testCaseData.models || []));
+            const runsChanged =
+              normalize(existingTestCase.runs) !== normalize(testCaseData.runs);
+            const expectedToolCallsChanged =
+              JSON.stringify(
+                normalizeForComparison(
+                  existingTestCase.expectedToolCalls || [],
+                ),
+              ) !==
+              JSON.stringify(
+                normalizeForComparison(testCaseData.expectedToolCalls || []),
+              );
+            const isNegativeTestChanged =
+              normalize(existingTestCase.isNegativeTest) !==
+              normalize(testCaseData.isNegativeTest);
+            const scenarioChanged =
+              normalize(existingTestCase.scenario) !==
+              normalize(testCaseData.scenario);
+            const expectedOutputChanged =
+              normalize(existingTestCase.expectedOutput) !==
+              normalize(testCaseData.expectedOutput);
+            // Omitted intent is a preserve, not an implicit clear. Only a
+            // caller that supplied the label may make an existing row differ.
+            const intentChanged =
+              testCaseData.intent !== undefined &&
+              normalize(existingTestCase.intent) !==
+                normalize(testCaseData.intent);
+            const stepsChanged =
+              JSON.stringify(
+                normalizeForComparison(existingTestCase.steps || []),
+              ) !==
+              JSON.stringify(normalizeForComparison(testCaseData.steps || []));
+            const judgeRequirementChanged =
+              normalize(existingTestCase.judgeRequirement) !==
+              normalize(testCaseData.judgeRequirement);
+            const advancedConfigChanged =
+              JSON.stringify(
+                normalizeForComparison(existingTestCase.advancedConfig),
+              ) !==
+              JSON.stringify(
+                normalizeForComparison(testCaseData.advancedConfig),
+              );
+            const matchOptionsChanged =
+              JSON.stringify(
+                normalizeForComparison(existingTestCase.matchOptions),
+              ) !==
+              JSON.stringify(normalizeForComparison(testCaseData.matchOptions));
+            const predicatesChanged =
+              JSON.stringify(
+                normalizeForComparison(existingTestCase.predicates),
+              ) !==
+              JSON.stringify(normalizeForComparison(testCaseData.predicates));
+            const hasChanges =
+              modelsChanged ||
+              runsChanged ||
+              expectedToolCallsChanged ||
+              isNegativeTestChanged ||
+              scenarioChanged ||
+              expectedOutputChanged ||
+              intentChanged ||
+              stepsChanged ||
+              judgeRequirementChanged ||
+              advancedConfigChanged ||
+              matchOptionsChanged ||
+              predicatesChanged ||
+              (testCaseData.suppressedSuiteStandardCheckIds !== undefined &&
+                JSON.stringify(testCaseData.suppressedSuiteStandardCheckIds) !==
+                  JSON.stringify(
+                    existingTestCase.suppressedSuiteStandardCheckIds ?? [],
+                  ));
+
+            if (hasChanges) {
+              await convexClient.mutation("testSuites:updateTestCase" as any, {
+                testCaseId: existingTestCase._id,
+                models: testCaseData.models,
+                runs: testCaseData.runs,
+                expectedToolCalls: sanitizeForConvexTransport(
+                  testCaseData.expectedToolCalls,
+                ),
+                isNegativeTest: testCaseData.isNegativeTest,
+                scenario: testCaseData.scenario,
+                expectedOutput: testCaseData.expectedOutput,
+                ...(testCaseData.intent !== undefined
+                  ? { intent: testCaseData.intent }
+                  : {}),
+                steps: sanitizeForConvexTransport(testCaseData.steps),
+                advancedConfig: sanitizeForConvexTransport(
+                  testCaseData.advancedConfig,
+                ),
+                matchOptions: testCaseData.matchOptions,
+                predicates: testCaseData.predicates,
+                ...(testCaseData.suppressedSuiteStandardCheckIds !== undefined
+                  ? {
+                      suppressedSuiteStandardCheckIds:
+                        testCaseData.suppressedSuiteStandardCheckIds,
+                    }
+                  : {}),
+              });
+            }
+            outcomes[slot] = {
+              kind: "committed",
+              id: String(existingTestCase._id),
+              name: testCaseData.title,
+            };
+          } else {
+            pendingCreates.push({
+              slot,
+              title: testCaseData.title,
+              item: toCaseBatchItem(testCaseData, {
+                // Discriminated by the case's dedupe key, not its index: a
+                // retry whose case ORDER differs must still match.
+                idempotencyKey: idempotencyKey
+                  ? deriveItemIdempotencyKey(idempotencyKey, caseDedupeKey)
+                  : undefined,
+              }),
+            });
+          }
+        } catch (error) {
+          outcomes[slot] = {
+            kind: "failed",
+            id: existingTestCase ? String(existingTestCase._id) : undefined,
+            name: testCaseData.title,
+            error: error instanceof Error ? error.message : String(error),
+          };
+          logger.warn("[evals] Failed to upsert test case", {
+            suiteId: resolvedSuiteId,
+            title: testCaseData.title,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      await commitPendingCaseCreates({
+        convexClient,
+        suiteId: resolvedSuiteId,
+        pending: pendingCreates,
+        outcomes,
+      });
+      flushCaseOutcomes(outcomes, committedCases, failedCases);
+    }
+  } else {
+    // A NEW suite is born an environment suite when the backend can make one
+    // in the same call and the request says exactly what one environment
+    // runs: its servers by id, at most one client, at most one model. The run
+    // that follows then executes that environment. Anything else keeps the
+    // legacy shape (counted by the legacy telemetry).
+    const environmentTargets = await composableEnvironmentTargets({
+      convexClient,
+      projectId,
+      environmentLaunch: Boolean(args.environmentLaunch),
+      persistedEnvironment,
+      hostAttachments: args.hostAttachments ?? args.environmentHostAttachments,
+      models: [...testCaseMap.values()].flatMap((entry) =>
+        entry.models.map((model) => model.model),
+      ),
+    });
+    const createdSuite = await convexClient.mutation(
+      "testSuites:createTestSuite" as any,
+      environmentTargets
+        ? {
+            projectId,
+            name: suiteName!,
+            description: suiteDescription,
+            defaultPassCriteria: passCriteria,
+            environmentTargets,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          }
+        : {
+            projectId,
+            name: suiteName!,
+            description: suiteDescription,
+            environment: persistedEnvironment,
+            defaultPassCriteria: passCriteria,
+            ...(args.hostAttachments
+              ? { hostAttachments: args.hostAttachments }
+              : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          },
+    );
+
+    if (!createdSuite?._id) {
+      throw new Error("Failed to create suite");
+    }
+
+    resolvedSuiteId = createdSuite._id as string;
+
+    const outcomes: Array<CaseUpsertOutcome | undefined> = [];
+    const pendingCreates: Array<{
+      slot: number;
+      title: string;
+      item: EvalCaseBatchItem;
+    }> = [];
+    for (const [caseDedupeKey, testCaseData] of testCaseMap.entries()) {
+      pendingCreates.push({
+        slot: outcomes.length,
+        title: testCaseData.title,
+        item: toCaseBatchItem(testCaseData, {
+          idempotencyKey: idempotencyKey
+            ? deriveItemIdempotencyKey(idempotencyKey, caseDedupeKey)
+            : undefined,
+        }),
+      });
+      outcomes.push(undefined);
+    }
+    await commitPendingCaseCreates({
+      convexClient,
+      suiteId: resolvedSuiteId,
+      pending: pendingCreates,
+      outcomes,
+    });
+    flushCaseOutcomes(outcomes, committedCases, failedCases);
+
+    // New-suite path only: if every case create failed, the freshly-made
+    // suite has zero cases. Leaving it would orphan an empty suite and (on the
+    // run path) snapshot nothing into an opaque "No tests supplied" failure.
+    // Roll the suite back (best-effort) and surface the structured breakdown
+    // as a client error — this is a bad request, not an internal fault.
+    if (committedCases.length === 0 && failedCases.length > 0) {
+      const firstError = failedCases[0]?.error ?? "unknown error";
+      try {
+        await convexClient.mutation("testSuites:deleteTestSuite" as any, {
+          suiteId: resolvedSuiteId,
+        });
+      } catch (rollbackError) {
+        logger.warn(
+          "[evals] Failed to roll back empty suite after all cases failed",
+          {
+            suiteId: resolvedSuiteId,
+            error:
+              rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError),
+          },
+        );
+      }
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        `Failed to save any of ${failedCases.length} test case(s) to the new suite. ` +
+          `First failure: ${firstError}. ` +
+          `Suite creation aborted because it would have zero cases.`,
+        { caseUpsert: { committed: committedCases, failed: failedCases } },
+      );
+    }
+  }
+
+  return {
+    suiteId: resolvedSuiteId,
+    suiteName,
+    caseUpsert: {
+      committed: committedCases,
+      failed: failedCases,
+    },
+  };
+}
+
+/** Backoff schedule for {@link fetchRunPinnedSkillsWithRetry} (2 retries). */
+const RUN_PINNED_SKILLS_RETRY_DELAYS_MS = [250, 1_000] as const;
+
+/**
+ * Fetch a suite run's pinned skills, retrying transient Convex failures with a
+ * short backoff. A persistent failure THROWS — failing run preparation — because
+ * the run record's configSnapshot and the judge both assert the pinned skills
+ * were in play; silently executing without them would grade a run against
+ * skills it never had. Returns `undefined` when the run has no pins.
+ * `sleep` is injectable for tests.
+ *
+ * INS-5: the rows are returned WHOLE. This used to project each pin down to
+ * `{name, description, content, contentHash}`, which was lossless while every
+ * pinnable skill was SKILL.md-only — and became a silent truncation the moment
+ * BE-5 started pinning folder skills. `modelRef` is how a plugin skill is
+ * ADDRESSED (two plugins may declare the same `name`), `aggregateHash`
+ * identifies the complete artifact rather than just the markdown envelope, and
+ * `files` is the frozen `scripts/`/`references/` the run is supposed to
+ * reproduce. Dropping them at the boundary meant a plugin run delivered a
+ * script-less skill under an ambiguous name and reported success.
+ */
+export async function fetchRunPinnedSkillsWithRetry(
+  // Structural: satisfied by ConvexHttpClient (whose `query` takes a typed
+  // FunctionReference) and by a plain fake in tests.
+  convexClient: {
+    query: (name: any, ...args: any[]) => Promise<any>;
+  },
+  runId: string,
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<RunPinnedSkill[] | undefined> {
+  const attempts = RUN_PINNED_SKILLS_RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const res = (await convexClient.query(
+        "testSuites:getRunPinnedSkills" as any,
+        { runId },
+      )) as {
+        pinnedSkills?: RunPinnedSkill[];
+      };
+      const list = res?.pinnedSkills ?? [];
+      if (list.length === 0) return undefined;
+      return list;
+    } catch (error) {
+      logger.warn("[evals] getRunPinnedSkills failed", {
+        runId,
+        attempt: attempt + 1,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (attempt < RUN_PINNED_SKILLS_RETRY_DELAYS_MS.length) {
+        await sleep(RUN_PINNED_SKILLS_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+  }
+  throw new Error(
+    `Failed to load this run's pinned skills after ${attempts} attempts — ` +
+      "aborting so the run doesn't silently execute without its skills. " +
+      "Retry the run.",
+  );
+}
+
+/**
+ * Titles of the run's cases that assert `widgetRendered`.
+ *
+ * Only relevant to a harness run, where the inspector's widget manager never
+ * sees the tool call — the harness reaches MCP through the signed proxy — so
+ * the assertion has nothing to observe. Collected here rather than inside the
+ * gate because the gate is deliberately shape-agnostic about cases; this is the
+ * one place that already knows the run's own step model.
+ */
+
+/**
+ * Prepare phase of a suite run: validate, upsert suite + cases, create the
+ * run record (status 'running'), store replay configs, and resolve model
+ * credentials. Returns an `execute` closure over `runEvalSuiteWithAiSdk` so
+ * callers choose whether to await execution inline (`runEvalsWithManager`,
+ * the /api/web path) or detach it and respond immediately with the runId
+ * (the async public /api/v1 path). All request/quota validation errors
+ * surface here, synchronously, before any caller responds.
+ */
+export async function prepareEvalRun(
+  clientManager: MCPClientManager,
+  request: RunEvalsWithManagerRequest,
+): Promise<PreparedEvalRun> {
+  const {
+    suiteId,
+    projectId,
+    suiteName,
+    suiteDescription,
+    tests,
+    serverIds,
+    serverNames,
+    scenarioId,
+    accessVersion,
+    storageServerIds,
+    modelApiKeys,
+    orgModelConfig,
+    convexAuthToken,
+    notes,
+    passCriteria,
+    suiteRerun,
+    iterationOverride,
+    caseIds,
+    matchOptionsOverride,
+    namedHostId,
+    refreshSnapshot,
+    runGroupId,
+    environmentId,
+    resolvedEnvironment,
+    idempotencyKey,
+    sourceHash,
+    skillsOverride,
+    toolDescriptionOverride,
+    replayedFromRunId,
+    useCurrentSuiteConfig,
+    ephemeralEnvironment,
+    toolPolicy,
+    importApprovals,
+    extraHeaders,
+    benchmarkWriteGuard,
+    launchContext,
+  } = request;
+
+  /**
+   * `source` and its licence are ONE fact (see {@link EvalRunProvenance}), so
+   * they travel as one value instead of being destructured apart. Two variables
+   * pulled out of a discriminated union are no longer correlated, and re-pairing
+   * them at the recorder call would take a cast — which is exactly the escape
+   * hatch that let `source: 'benchmark'` ship with no `benchmarkRunId`.
+   */
+  const provenance: EvalRunProvenance =
+    request.source === "benchmark"
+      ? { source: "benchmark", benchmarkRunId: request.benchmarkRunId }
+      : { source: request.source };
+
+  if (!suiteId && (!suiteName || suiteName.trim().length === 0)) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "Provide suiteId or suiteName",
+    );
+  }
+  if (!suiteId && !projectId) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "projectId is required when creating a new eval suite",
+    );
+  }
+
+  // Bare suite reruns (scheduled worker, /api/v1 suiteId-only) carry no wire
+  // tests — cap-math over the empty list would let unattended runs bypass
+  // MAX_TOTAL_LLM_CALLS. Assert over the persisted cases instead; the wired
+  // path below re-derives the same cases for execution.
+  if (suiteId && tests.length === 0) {
+    const { convexClient: capClient } = createConvexClients(convexAuthToken);
+    const allPersistedCases = (await capClient.query(
+      "testSuites:listTestCases" as any,
+      { suiteId },
+    )) as Parameters<typeof buildCapEntriesFromPersistedCases>[0] | null;
+    // Single-case runs narrow cap-math (and the runnable check) to the chosen
+    // case(s) so a one-case run of a large suite isn't rejected by the suite's
+    // total cap. Mirrors the backend snapshot filter; same caseIds.
+    const persistedCases =
+      caseIds && caseIds.length
+        ? ((allPersistedCases ?? []).filter((c: any) =>
+            caseIds.includes(String(c._id)),
+          ) as typeof allPersistedCases)
+        : allPersistedCases;
+    if (caseIds && caseIds.length && (persistedCases?.length ?? 0) === 0) {
+      throw new WebRouteError(
+        404,
+        ErrorCode.NOT_FOUND,
+        "None of the requested caseIds belong to this suite",
+      );
+    }
+    // No client substituted the suite default model onto these cases, so a
+    // model-less prompt case would be silently dropped from execution. Reject
+    // before cap-math so the error names the real cause, not the cap.
+    //
+    // NOT for an environment-backed run. The premise of this check — "nothing
+    // supplies a model, so the recorder drops the case" — stops holding the
+    // moment an environment is in play: `startTestSuiteRun` projects every
+    // prompt case onto the environment's effective model, writes that into
+    // `configSnapshot.tests`, and `precreateIterationsForRun` creates rows
+    // from the projection, so the case has both a model AND somewhere to
+    // record. (An environment that resolves to NO model never gets this far —
+    // the backend refuses the launch with `ENV_MODEL_REQUIRED`.) Keeping the
+    // check here would make an unattended env-backed rerun the one launch
+    // shape that cannot run a suite the interactive UI runs fine.
+    if (!environmentId) {
+      assertBareRerunCasesRunnable(
+        persistedCases as Parameters<typeof assertBareRerunCasesRunnable>[0],
+      );
+    }
+    assertSuiteRunWithinCap({
+      ...request,
+      tests: buildCapEntriesFromPersistedCases(persistedCases ?? [], {
+        environmentBacked: Boolean(environmentId),
+      }),
+    });
+  } else {
+    assertSuiteRunWithinCap(request);
+  }
+
+  const { convexClient, convexHttpUrl } = createConvexClients(convexAuthToken);
+  // Resolve project authorization once before any environment or run is stamped.
+  const venueProjectId = projectId ?? (suiteId
+    ? (await convexClient.query("testSuites:getTestSuite" as any, { suiteId }))?.projectId
+    : undefined);
+  // Environment secret delivery needs the venue before resolution. Load only
+  // its client first, then use the same availability decision throughout.
+  const venueHostId = environmentId && venueProjectId
+    ? resolvedEnvironment?.hostId ?? (await convexClient.query(
+        "projectEnvironments:getEnvironment" as any,
+        { projectId: venueProjectId, environmentId },
+      ))?.hostId
+    : undefined;
+  const environmentHostConfig = environmentId && venueHostId
+    ? await loadSuiteHostConfig(convexClient, suiteId, venueHostId)
+    : undefined;
+  let localAvailable = environmentHostConfig && venueProjectId
+    ? await shouldUseLocalHarness(harnessOfHostConfig(environmentHostConfig), convexAuthToken, venueProjectId)
+    : false;
+  const requestedVenue = localAvailable ? "local" as const : "hosted" as const;
+
+  // Environment launch (P0.1): resolve the environment's closed execution
+  // set BEFORE server resolution and tool capture, and use it INSTEAD of
+  // any browser-supplied serverIds. The resolved revision travels to the
+  // run-start mutation as `expectedEnvironmentRevision`, so a
+  // resolve-to-mutation edit rejects rather than pairing a tool snapshot
+  // from one environment revision with a run snapshot from another.
+  let environmentLaunch: ResolvedEnvironmentForLaunch | undefined;
+  if (environmentId) {
+    if (!projectId) {
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        "projectId is required for environment runs",
+      );
+    }
+    // Reuse the caller's preflight resolution when it is for THIS environment
+    // (the manager was primed from it) so the revision we assert equals the
+    // one we connected — a same-key edit after the preflight then loses the
+    // revision check instead of silently pairing a stale manager with a newer
+    // snapshot. Fall back to resolving here for callers that didn't preflight.
+    environmentLaunch =
+      resolvedEnvironment &&
+      resolvedEnvironment.environmentRef.environmentId === environmentId &&
+      resolvedEnvironment.runtimeVenue === requestedVenue
+        ? resolvedEnvironment
+        : await resolveEnvironmentForLaunch(convexClient, {
+            serverSource: EVAL_LAUNCH_SERVER_SOURCE,
+            runtimeVenue: requestedVenue,
+            projectId,
+            environmentId,
+          }).catch((error) => {
+            throw translateEnvironmentResolveError(error);
+          });
+  } else if (serverIds.length === 0) {
+    // Legacy launches keep the old ≥1-server contract; enforced here (not
+    // in Zod) because environment launches legitimately send none.
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "At least one server must be selected",
+    );
+  }
+  if (!environmentLaunch) {
+    logLegacyEvalRequest({
+      surface: "suite_run",
+      use: "servers_from_request",
+      suiteId: suiteId ?? null,
+      projectId: projectId ?? null,
+    });
+  }
+
+  // A GitHub check runs an environment against the PR's temporary server:
+  // the backend keeps the environment's client, model, skills and image and
+  // replaces only its servers (`githubCheckServerOverride`), so the manager
+  // holds that server, never the environment's own.
+  const githubCheckEnvironmentLaunch =
+    Boolean(environmentLaunch) && provenance.source === "github_check";
+  const resolvedServerIds = resolveServerIdsOrThrow(
+    environmentLaunch && !githubCheckEnvironmentLaunch
+      ? environmentServerRefsForManager(environmentLaunch, clientManager)
+      : serverIds,
+    clientManager,
+  );
+  const persistedServerRefs =
+    !environmentLaunch && storageServerIds && storageServerIds.length > 0
+      ? storageServerIds
+      : resolvedServerIds;
+  const { toolSnapshot, toolSnapshotDebug } =
+    await captureToolSnapshotForEvalAuthoring(
+      clientManager,
+      resolvedServerIds,
+      {
+        logPrefix: "evals",
+      },
+    );
+
+  // Persist suite + cases (create or upsert). The suite/case persistence is
+  // shared with the author-only public surface; `prepareEvalRun` then starts
+  // the recorder below. `resolvedSuiteId`/`committedCases`/`failedCases` keep
+  // their names so the run record + return below still reference them.
+  const { suiteId: resolvedSuiteId, caseUpsert: authoredCaseUpsert } =
+    await authorEvalSuite({
+      hostAttachments: request.hostAttachments,
+      convexClient,
+      tests,
+      resolvedServerIds,
+      persistedServerRefs,
+      serverNames,
+      projectId,
+      suiteId: suiteId ?? null,
+      suiteName,
+      suiteDescription,
+      passCriteria,
+      suiteRerun,
+      refreshSnapshot,
+      environmentLaunch: Boolean(environmentLaunch),
+      // The SAME key the run creation uses. Without it, a retried
+      // /eval-runs call authors a second suite and duplicates its cases
+      // BEFORE the run-level idempotency check runs — and the new suite id
+      // then prevents that check from finding the original run at all.
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
+  const committedCases = authoredCaseUpsert.committed;
+  const failedCases = authoredCaseUpsert.failed;
+
+  const githubCheckServerOverride = buildGithubCheckServerOverride({
+    source: request.source,
+    persistedServerRefs,
+    serverNames,
+  });
+
+  const launchHostConfig = environmentHostConfig ?? await loadSuiteHostConfig(
+    convexClient, resolvedSuiteId, environmentLaunch?.hostId ?? namedHostId,
+  );
+  if (!environmentId && venueProjectId) {
+    localAvailable = await shouldUseLocalHarness(harnessOfHostConfig(launchHostConfig), convexAuthToken, venueProjectId);
+  }
+  const launchVenue = localAvailable ? "local" as const : "hosted" as const;
+
+  const {
+    runId,
+    harnessRuntimeVenue,
+    config,
+    recorder,
+    deduped: runWasDeduped,
+    status: existingRunStatus,
+    executionBudgets: runExecutionBudgets,
+    githubCredentialPolicy,
+    hostConfig: runHostConfigSnapshot,
+    pluginVersions: runEnvironmentPluginVersions = [],
+    gradingEngine: runGradingEngine,
+    toolDescriptionOverride: runToolDescriptionOverride,
+  } = await startSuiteRunWithRecorder({
+    convexClient,
+    suiteId: resolvedSuiteId,
+    notes,
+    passCriteria,
+    serverIds: resolvedServerIds,
+    toolSnapshot,
+    toolSnapshotDebug,
+    iterationOverride,
+    caseIds,
+    matchOptionsOverride,
+    namedHostId,
+    runGroupId,
+    environmentId,
+    ...(githubCheckServerOverride ? { githubCheckServerOverride } : {}),
+    // All three preconditions come from the SAME resolution the tool snapshot
+    // was captured against. The revision alone is not enough: an environment
+    // pins a `hostId` and optionally an attachment, both dereferenced live, so
+    // a host-config rotation or a server-group edit changes what the
+    // environment resolves to at an unchanged revision. Echoing all three lets
+    // the mutation reject that drift instead of starting a run whose tool
+    // snapshot describes a different configuration than it executes.
+    runtimeVenue: launchVenue,
+    expectedEnvironmentRevision: environmentLaunch?.environmentRef.revision,
+    expectedEnvironmentHostConfigId: environmentLaunch?.hostConfigId,
+    expectedEnvironmentServerIds: environmentLaunch
+      ? environmentEffectiveServerIds(environmentLaunch)
+      : undefined,
+    // Spread as ONE value: `source: 'benchmark'` without its parent id is
+    // refused by `startTestSuiteRun`, so anything that can drop the id here
+    // turns a valid launch into a FORBIDDEN at the wire.
+    ...provenance,
+    idempotencyKey,
+    ...(sourceHash ? { sourceHash } : {}),
+    skillsOverride,
+    ...(toolDescriptionOverride ? { toolDescriptionOverride } : {}),
+    ...(replayedFromRunId ? { replayedFromRunId } : {}),
+    ...(useCurrentSuiteConfig !== undefined ? { useCurrentSuiteConfig } : {}),
+    ...(ephemeralEnvironment === true ? { ephemeralEnvironment: true } : {}),
+    // Named explicitly, like every other field in this call: `startSuiteRun-
+    // WithRecorder` reconstructs the mutation args from its own parameters,
+    // so a field nobody destructures here is a field the backend never sees —
+    // and an approval that never arrives is reported to the caller as the
+    // backend refusing a run they did approve.
+    ...(importApprovals?.length ? { importApprovals } : {}),
+    // Same rule, same reason. Spread apart rather than as one `launchContext`
+    // object because the recorder's parameter list is the mutation's argument
+    // list, and the backend takes the two as siblings of `source`.
+    ...(launchContext?.launcher ? { launcher: launchContext.launcher } : {}),
+    ...(launchContext?.ciMetadata
+      ? { ciMetadata: launchContext.ciMetadata }
+      : {}),
+  });
+  if (
+    githubExecutionPolicy() &&
+    githubCredentialPolicy !== githubExecutionPolicy()
+  ) {
+    await failRunBeforeExecution(convexClient, recorder, runId, {
+      reason: "credential_policy_blocked",
+    });
+    throw new Error("credential_policy_blocked");
+  }
+  // This policy comes from the authenticated backend run snapshot, never
+  // from MCP output or a client-supplied flag. A fork gets only MCP tools.
+  if (githubCredentialPolicy === "no_customer_credentials") {
+    const unsafe = (value: unknown, depth = 0): boolean => {
+      if (!value || typeof value !== "object") return false;
+      const row = value as Record<string, unknown>;
+      if (
+        depth > 20 ||
+        row.harness ||
+        row.computerEnvironmentId ||
+        (Array.isArray(row.builtInToolIds) && row.builtInToolIds.length) ||
+        (Array.isArray(row.pluginVersionIds) && row.pluginVersionIds.length)
+      )
+        return true;
+      return Object.values(row).some((v) => unsafe(v, depth + 1));
+    };
+    if (
+      unsafe(config) ||
+      unsafe(runHostConfigSnapshot) ||
+      modelApiKeys ||
+      orgModelConfig
+    ) {
+      await failRunBeforeExecution(convexClient, recorder, runId, {
+        reason: "credential_policy_blocked",
+      });
+      throw new Error("credential_policy_blocked");
+    }
+  }
+  const suiteHostConfig =
+    runHostConfigSnapshot ??
+    launchHostConfig;
+
+  // For reruns, projectId may not be in the request — derive it from the
+  // suite record so org BYOK keeps working.
+  let projectIdForOrgConfig: string | undefined = venueProjectId;
+  // "We asked and the suite has none" and "we could not ask" are different
+  // facts, and the harness gate below reads an absent project as the FORMER.
+  // Kept apart so a transient Convex failure is never reported as "this suite
+  // is org-level", which would send the author to change a setting that was
+  // never wrong.
+  let suiteProjectLookupFailed = false;
+  if (!projectIdForOrgConfig && resolvedSuiteId) {
+    try {
+      const suite = await convexClient.query("testSuites:getTestSuite" as any, {
+        suiteId: resolvedSuiteId,
+      });
+      if (suite?.projectId) {
+        projectIdForOrgConfig = String(suite.projectId);
+      }
+    } catch (error) {
+      suiteProjectLookupFailed = true;
+      logger.warn("[evals] Failed to load suite for projectId fallback", {
+        suiteId: resolvedSuiteId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Only a HARNESS run turns an unresolved project into a refusal — an
+  // emulated run merely loses its org-BYOK fallback, which is the behavior
+  // this lookup has always had on failure.
+  if (
+    !projectIdForOrgConfig &&
+    suiteProjectLookupFailed &&
+    harnessOfHostConfig(suiteHostConfig)
+  ) {
+    const reason =
+      "this run could not look up the suite's project, so the computer its " +
+      "harness iterations run on cannot be provisioned or billed. This is " +
+      "usually transient — retry the run.";
+    await failRunBeforeExecution(convexClient, recorder, runId, { reason });
+    throw new WebRouteError(400, ErrorCode.VALIDATION_ERROR, reason, {
+      reason: "HARNESS_UNAVAILABLE",
+    });
+  }
+
+  // GENERAL EXECUTION GATE — every eval run, harness or emulated.
+  //
+  // `resolveHostTools` warn-and-SKIPS a computer-backed built-in when no
+  // computer is attached, so a `bash` host with no pinned image runs with the
+  // tool silently absent: cases that needed a shell fail as if the model chose
+  // badly, and a suite that did not need one reports green for a host
+  // configuration that never existed. A server log is not a result.
+  //
+  // Deliberately NOT inside the harness checks below: those return admitted on
+  // their first line when no harness is selected, which is exactly the runs
+  // this rule is about.
+  const executionAdmission = checkEvalExecutionAdmission({
+    localExecution: harnessRuntimeVenue === "local",
+    hostConfig: suiteHostConfig ?? null,
+    pinnedComputerImageId:
+      (config.environment as { computerEnvironmentId?: string } | undefined)
+        ?.computerEnvironmentId ?? null,
+  });
+  if (!executionAdmission.ok) {
+    await failRunBeforeExecution(convexClient, recorder, runId, {
+      reason: executionAdmission.reason,
+    });
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      executionAdmission.reason,
+      { reason: "EVAL_EXECUTION_UNAVAILABLE" },
+    );
+  }
+
+  // HARNESS HONESTY GATE. A host config carrying `harness` runs the REAL
+  // runtime in chat and swarms; eval runs used to forward the selector into
+  // `prepareChatV2` and then quietly execute on the emulated engine, reporting
+  // green for a runtime that never ran. Decided HERE — after the run's host
+  // config is known, before the runner touches a model — so a refusal costs
+  // nothing and names the reason the shared gate gave.
+  //
+  // The run row already exists (`startSuiteRunWithRecorder` created it and
+  // precreated its iterations), so a refusal has to finalize it rather than
+  // throw and strand it running forever. Same cleanup the setup phase below
+  // performs, for the same reason.
+  const harnessAdmission = checkEvalHarnessAdmission({
+    localExecution: harnessRuntimeVenue === "local",
+    hostConfig: suiteHostConfig ?? null,
+    // Already includes the servers the environment's pinned plugin versions
+    // contribute (`environmentServerIds` projects the effective set), so the
+    // gate's plugin-servers-count rule is satisfied without a second read.
+    serverIds: resolvedServerIds,
+    // The run's OWN snapshotted cases (`config.tests`), not the request's
+    // inline tests: a bare rerun has none of the latter, and the snapshot is
+    // what actually executes.
+    cases: config.tests as Array<{
+      title?: string;
+      model?: string;
+      provider?: string;
+    }>,
+    widgetAssertingCaseTitles: casesAssertingWidgetRender(config.tests),
+    // Explicitly `null` when the suite is org-level. `runHarnessTurn` needs a
+    // project to resolve the box and throws without one — mid-iteration, after
+    // the box was booted and paid for. This makes it a pre-flight refusal.
+    projectId: projectIdForOrgConfig ?? null,
+    // NO pinned image is passed, and none is required: a harness run boots a
+    // box either way — the run's frozen image when it pins one, the
+    // deployment-default template when it doesn't. What it must never do is
+    // borrow the acting member's personal computer, and that is prevented by
+    // always provisioning, not by demanding an image.
+  });
+  if (!harnessAdmission.ok) {
+    await failRunBeforeExecution(convexClient, recorder, runId, {
+      reason: harnessAdmission.reason,
+    });
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      harnessAdmission.reason,
+      { reason: "HARNESS_UNAVAILABLE", harness: harnessAdmission.harness },
+    );
+  }
+  // A NATIVE-delivery harness makes its MCP calls out of process, so the policy
+  // is enforced at the MCP proxy the generated `.mcp.json` points at — sealed
+  // into the proxy token, so dropping the policy drops the credential. Refused
+  // only when this deployment cannot seal it. A host-executed adapter never
+  // mints that token (it enforces in-process), and the refusal reads its
+  // delivery off the adapter rather than off a bare "is a harness" boolean.
+  const harnessPolicyRefusal = harnessToolPolicyLaunchRefusal({
+    localExecution: harnessRuntimeVenue === "local",
+    hasToolPolicy: Boolean(toolPolicy),
+    harness: harnessAdmission.harness,
+  });
+  if (harnessPolicyRefusal) {
+    await failRunBeforeExecution(convexClient, recorder, runId, {
+      reason: harnessPolicyRefusal,
+    });
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      harnessPolicyRefusal,
+      {
+        reason: "TOOL_POLICY_UNSUPPORTED",
+        harness: harnessAdmission.harness,
+      },
+    );
+  }
+  // Benchmark write manifests currently enforce argument/prefix ownership in
+  // the in-process tool-policy gate. Native harnesses execute MCP calls in a
+  // separate process, where that gate cannot inspect arguments or harvest
+  // created ids. Refuse this combination until the proxy carries the full
+  // side-effect guard; running it would make a consented write benchmark
+  // unbounded on the target server.
+  if (
+    benchmarkWriteGuard?.requireManifest === true &&
+    harnessAdmission.harness
+  ) {
+    const reason =
+      "benchmark write cases are not supported on an out-of-process harness yet; " +
+      "run this benchmark with an emulated client so argument and cleanup guards apply";
+    await failRunBeforeExecution(convexClient, recorder, runId, { reason });
+    throw new WebRouteError(400, ErrorCode.VALIDATION_ERROR, reason, {
+      reason: "BENCHMARK_WRITE_UNSUPPORTED",
+      harness: harnessAdmission.harness,
+    });
+  }
+  // ATTRIBUTION is stamped by the platform, not here: `startTestSuiteRun`
+  // derives `configSnapshot.executionEngine` from the run's own
+  // `hostConfigId`, so the record cannot disagree with the config the run
+  // executed under and no client can claim an engine it did not use. This
+  // gate's job is to make sure the two agree in the first place — an admitted
+  // harness run reaches a harness, and a refused one reaches nothing.
+
+  const suiteInjectOpenAiCompat =
+    resolveOpenAiCompatForHostConfig(suiteHostConfig);
+  const suiteHostPolicy = extractHostExecutionPolicy(
+    suiteHostConfig,
+    namedHostId,
+  );
+
+  const replayConfigsToStore = filterAndRemapReplayConfigs(
+    clientManager.getServerReplayConfigs(),
+    resolvedServerIds,
+    persistedServerRefs,
+  );
+  if (replayConfigsToStore.length > 0) {
+    try {
+      await storeReplayConfig(runId, replayConfigsToStore, convexAuthToken);
+    } catch (error) {
+      logger.warn("[evals] Failed to store replay config for suite run", {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Resolve org model config: prefer client-sent keys, fall back to org config.
+  // Treat an empty client-provided map as "no keys" so org fallback still runs.
+  const hasClientKeys = !!modelApiKeys && Object.keys(modelApiKeys).length > 0;
+  const resolvedModelApiKeys = hasClientKeys ? modelApiKeys : undefined;
+  let resolvedOrgModelConfig =
+    githubCredentialPolicy === "no_customer_credentials"
+      ? { providers: [] }
+      : orgModelConfig;
+  let resolvedOrgModelConfigTarget: { projectId: string } | undefined;
+  // `projectIdForOrgConfig` is resolved ABOVE, before the admission gates —
+  // the harness gate needs it to refuse an org-level suite before a box is
+  // booted, and resolving it twice could disagree.
+  const orgConfigTarget =
+    githubCredentialPolicy !== "no_customer_credentials" &&
+    projectIdForOrgConfig
+      ? { projectId: projectIdForOrgConfig }
+      : undefined;
+  resolvedOrgModelConfigTarget = orgConfigTarget;
+
+  if (!resolvedModelApiKeys && !resolvedOrgModelConfig) {
+    if (orgConfigTarget) {
+      try {
+        const orgConfig = await resolveOrgModelConfig(orgConfigTarget, {
+          bearerToken: convexAuthToken,
+          scenarioId,
+          accessVersion,
+          serverIds: resolvedServerIds,
+        });
+        resolvedOrgModelConfig = orgConfig;
+      } catch (error) {
+        if (githubExecutionPolicy()) {
+          await failRunBeforeExecution(convexClient, recorder, runId, {
+            reason: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+        logger.warn("[evals] Failed to resolve org model config", {
+          projectId: projectIdForOrgConfig,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  // SETUP phase for this run's pinned capabilities (PR-E3, extended by INS-5).
+  // Suite runs only — quick-run (runId null) has no run row to carry pins, so
+  // it stays skill-free. STRICT throughout: the pin fetch is retried (250ms/1s
+  // backoff), plugin pins are re-gated against the live plugin lifecycle, and
+  // every pinned supporting file must be readable. Any of those failing FAILS
+  // run preparation. Silently degrading to "no skills" or "fewer servers" would
+  // let the run execute while the configSnapshot and the judge still claim the
+  // full pinned surface was available — a green run measuring a configuration
+  // that never existed.
+  //
+  // Everything here happens BEFORE `execute()`, which is the whole point: a
+  // setup failure must precede model execution and name the component that
+  // caused it.
+  let pinnedSkillSource: EvalPinnedSkillSource | undefined;
+  /**
+   * The run's frozen skills in HARNESS shape (materialized on box), built here
+   * rather than per iteration because the supporting-file download is I/O that
+   * belongs in run preparation — where a failure fails the run cleanly, before
+   * any model call, naming the skill and path.
+   *
+   * Set for EVERY runId-bearing run, empty included. The harness selects its
+   * pinned source by PRESENCE, so `[]` says "this run delivers no skills" while
+   * `undefined` falls through to a live project-wide fetch of whatever the
+   * project holds right now — which would unfreeze a frozen run, and would hand
+   * the `skillsOverride: "exclude"` arm every skill in the project.
+   */
+  let pinnedHarnessSkills: PinnedSkillArtifact[] | undefined;
+  /** The run's pinned plugin servers, re-gated just before execution. */
+  let executionPluginServers: RunPluginServer[] = [];
+  if (runId) {
+    // The run row already exists (startSuiteRunWithRecorder created it), so a
+    // persistent setup failure would otherwise strand the run as
+    // running/pending forever. Finalize it as failed before rethrowing.
+    try {
+      const runPinnedSkills = await fetchRunPinnedSkillsWithRetry(
+        convexClient,
+        runId,
+      );
+
+      // INS-5 — decision D2, at the last moment before execution.
+      //
+      // The run snapshot records which plugin VERSIONS the environment pinned.
+      // That is provenance, never a standing grant: the backend re-resolves the
+      // live plugin rows on every call, so a plugin disabled or uninstalled
+      // since the launch resolution (seconds ago, but a race is a race) reports
+      // here and stops the run. Failing NOW is the point — the run row exists,
+      // no model has been called, and the failure names the component.
+      //
+      // Called for every run with a runId, including plugin-free ones: the
+      // backend's all-clear for "pinned nothing" is the same empty envelope, so
+      // there is no snapshot read to do first. A LEGACY (non-environment) run
+      // cannot carry a pin at all — the environment is the only pin carrier —
+      // so it tolerates a backend that predates BE-5 rather than failing for a
+      // capability it structurally cannot have.
+      const runPluginServers = await resolveSuiteRunPluginServers(
+        () => convexClient,
+        {
+          runId,
+          allowUndeployedBackend: !environmentLaunch,
+        },
+      );
+      executionPluginServers = runPluginServers;
+
+      // The shared pin → skill-channel conversion (environment quick runs use
+      // the same one): unreachable supporting files fail HERE, before the
+      // model runs, and an empty pin set stays empty on both channels.
+      const pinServerNames = environmentLaunch
+        ? environmentServerNames(environmentLaunch)
+        : serverNames;
+      const built = await buildPinnedSkillSource({
+        pins: runPinnedSkills ?? [],
+        // Straight from `configSnapshot.environmentPluginVersions` — the run's
+        // own record. NOT re-resolved to the plugin's active version, which is
+        // what would let a mid-run re-import change an in-flight run.
+        pluginVersions: runEnvironmentPluginVersions,
+        pluginServers: runPluginServers,
+        effectiveServerIds: resolvedServerIds,
+        ...(pinServerNames ? { serverNames: pinServerNames } : {}),
+      });
+      pinnedHarnessSkills = built.pinnedHarnessSkills;
+      pinnedSkillSource = built.pinnedSkillSource;
+    } catch (error) {
+      await failRunBeforeExecution(convexClient, recorder, runId, {
+        reason: (error instanceof Error ? error.message : String(error)).slice(
+          0,
+          500,
+        ),
+      });
+      throw error;
+    }
+  }
+
+  // The model's tools come from the run's frozen selection PLUS its re-gated
+  // plugin servers; the snapshot keeps plugin ids out of the host config.
+  const executionConfig = withPluginExecutionServers(
+    config,
+    executionPluginServers,
+    clientManager,
+  );
+  const execute = async () => {
+    await runEvalSuiteWithAiSdk({
+      suiteId: resolvedSuiteId,
+      runId,
+      // The budgets the LAUNCH froze. Omitted when the backend predates the
+      // field, which the runner reads as "resolve the platform defaults" —
+      // same code path, differing only in which rung each field came from.
+      ...(runExecutionBudgets ? { executionBudgets: runExecutionBudgets } : {}),
+      config: executionConfig,
+      modelApiKeys: resolvedModelApiKeys ?? undefined,
+      orgModelConfig: resolvedOrgModelConfig,
+      orgModelConfigTarget: resolvedOrgModelConfigTarget,
+      convexClient,
+      convexHttpUrl,
+      convexAuthToken,
+      mcpClientManager: clientManager,
+      recorder,
+      suiteInjectOpenAiCompat,
+      hostExecutionPolicy: suiteHostPolicy,
+      // B3b: the run's FROZEN grading-engine position, resolved once by the
+      // backend at run creation and combined here with this process's env
+      // ceiling. Threading it makes a per-suite `off` authoritative on the
+      // FIRST pass — before, only the judge second pass (which reads the run
+      // row) could see it — and is what lets a run reach `enforce` at all.
+      //
+      // AN ABSENT STAMP IS A DECISION, NOT A MISSING OPINION. The backend
+      // writes no `gradingEngine` key at all when it resolved `off` — so the
+      // snapshot of an `off` run stays byte-identical to a pre-B3b one — and
+      // this resolver treats a position with no opinion as UNCONSTRAINED,
+      // falling back to the env ceiling. Passing the absence straight through
+      // would therefore promote every `off` run to whatever the process env
+      // says the moment that var is raised, which is exactly backwards: the
+      // suite ceiling, the org flag and the legacy clamp all live upstream of
+      // that stamp, and an absent stamp is their combined answer.
+      gradingMode: resolveFrozenRunGradingMode(runGradingEngine),
+      // PR 4d: thread the raw suite hostConfig record into the runner so
+      // it can resolve CONFIG fields (`systemPrompt` / `temperature` /
+      // `selectedServerIds`) via `resolveExecutionContext`. `hostPolicy`
+      // is the POLICY subset extracted upstream; this is the rest.
+      suiteHostConfig,
+      harnessRuntimeVenue,
+      // The run's PROJECT ENVIRONMENT — the same id echoed to
+      // `startSuiteRunWithRecorder` above, so it is exactly what the run's
+      // `configSnapshot.environmentRef` records and therefore exactly what
+      // `resolveGrantForSandbox` will derive for each iteration's box.
+      //
+      // Threaded for the HARNESS path's external-account credential check: a
+      // BROKERED project secret is composed onto an iteration's box only when
+      // THIS environment selects it, so a project-wide answer would start an
+      // iteration that provisions a box and then fails vendor auth against a
+      // placeholder. Absent for a legacy (non-environment) run, which grants
+      // no secrets at all.
+      ...(environmentId ? { projectEnvironmentId: environmentId } : {}),
+      ...(pinnedSkillSource ? { pinnedSkillSource } : {}),
+      // Presence is meaningful (empty ⇒ "no skills", absent ⇒ live fetch), so
+      // this checks for undefined rather than truthiness.
+      ...(pinnedHarnessSkills !== undefined ? { pinnedHarnessSkills } : {}),
+      ...(toolPolicy ? { toolPolicy } : {}),
+      // The SAME object, never a copy — see `extraHeaders` on the request type.
+      ...(extraHeaders ? { extraHeaders } : {}),
+      // Likewise by reference: the ledger inside is the RUN's.
+      ...(benchmarkWriteGuard ? { benchmarkWriteGuard } : {}),
+      ...(runToolDescriptionOverride
+        ? { toolDescriptionOverride: runToolDescriptionOverride }
+        : {}),
+    });
+  };
+
+  return {
+    suiteId: resolvedSuiteId,
+    runId,
+    caseUpsert: {
+      committed: committedCases,
+      failed: failedCases,
+    },
+    recorder,
+    deduped: runWasDeduped,
+    status: existingRunStatus,
+    execute,
+  };
+}
+
+export async function runEvalsWithManager(
+  clientManager: MCPClientManager,
+  request: RunEvalsWithManagerRequest,
+) {
+  const prepared = await prepareEvalRun(clientManager, request);
+  await prepared.execute();
+
+  return {
+    success: true,
+    suiteId: prepared.suiteId,
+    runId: prepared.runId,
+    message: "Evals completed successfully. Check the Evals tab for results.",
+    caseUpsert: prepared.caseUpsert,
+  };
+}
+
+export type RunEvalTestCaseWithManagerOptions = {
+  /** When true, skip mutating `testCase.lastMessageRun` after the run (safe for parallel quick runs on the same case). */
+  skipLastMessageRunUpdate?: boolean;
+};
+
+/**
+ * A single-case request as the shared preparation sees it: the parsed body,
+ * plus — for an environment quick run — the route's own preflight resolution.
+ * Reusing that resolution (rather than resolving again) keeps the revision the
+ * commit asserts equal to the one the manager connected.
+ */
+type SingleCaseExecutionRequest = RunTestCaseWithManagerRequest & {
+  resolvedEnvironment?: ResolvedEnvironmentForLaunch;
+};
+
+/**
+ * The runtime case for a single-case run: the persisted case with the
+ * request's CONTENT overrides layered on, and the suite defaults resolved the
+ * same way suite runs resolve them. Execution attribution (`model`,
+ * `provider`, `hostConfigOverride`) comes from the caller, which decides it
+ * from the environment or, for a legacy run, from the request.
+ */
+function buildSingleCaseRuntimeTest(args: {
+  testCase: any;
+  testCaseOverrides: RunTestCaseRequest["testCaseOverrides"];
+  model: string;
+  provider: string;
+  suiteDefaultMatchOptions: MatchOptionsDTO | undefined;
+  suiteDefaultPredicates: Awaited<
+    ReturnType<typeof loadSuiteDefaultPredicates>
+  >;
+  matchOptionsOverride: RunTestCaseRequest["matchOptionsOverride"];
+  hostConfigOverride: Record<string, unknown> | undefined;
+}) {
+  const { testCase, testCaseOverrides } = args;
+  const caseModelSelection = storedSelectionForCaseModel(
+    testCase,
+    args.model,
+    args.provider,
+  );
+  return {
+    title: testCase.title,
+    query: testCaseOverrides?.query ?? testCase.query,
+    runs: testCaseOverrides?.runs ?? 1,
+    model: args.model,
+    provider: args.provider,
+    ...(caseModelSelection ? { selection: caseModelSelection } : {}),
+    // Freeze the authored analytics label onto the runtime case. The runner
+    // carries it into each iteration snapshot; reading it live later would
+    // re-attribute historical trials after a case is retagged.
+    ...(typeof testCase.intent === "string" ? { intent: testCase.intent } : {}),
+    expectedToolCalls:
+      testCaseOverrides?.expectedToolCalls ?? testCase.expectedToolCalls ?? [],
+    isNegativeTest:
+      testCaseOverrides?.isNegativeTest ?? testCase.isNegativeTest,
+    expectedOutput:
+      testCaseOverrides?.expectedOutput ?? testCase.expectedOutput,
+    steps:
+      (testCaseOverrides?.steps as TestStep[] | undefined) ??
+      (testCase as { steps?: TestStep[] }).steps ??
+      legacyCaseStepsFallback(
+        testCase as { promptTurns?: unknown; advancedConfig?: unknown },
+      ),
+    advancedConfig:
+      testCaseOverrides?.advancedConfig ?? testCase.advancedConfig,
+    matchOptions: resolveMatchOptions(
+      args.suiteDefaultMatchOptions,
+      (testCaseOverrides?.matchOptions ?? testCase.matchOptions) as
+        | MatchOptionsDTO
+        | undefined,
+      args.matchOptionsOverride,
+    ),
+    // Thread the predicate gate into the runtime case so the runner
+    // evaluates it. See `resolveCaseSuccessPredicates` for the full
+    // precedence rules — kept as a shared helper so every resolution site
+    // (this one and the suite-run recorder) stays in lockstep.
+    successPredicates: resolveCaseSuccessPredicates({
+      suiteDefaults: args.suiteDefaultPredicates,
+      runOverride: testCaseOverrides?.successPredicates as
+        | import("@/shared/eval-matching").Predicate[]
+        | undefined,
+      suppressedSuiteStandardCheckIds:
+        testCaseOverrides?.suppressedSuiteStandardCheckIds ??
+        (testCase as { suppressedSuiteStandardCheckIds?: string[] })
+          .suppressedSuiteStandardCheckIds,
+      envelope: (testCaseOverrides?.predicates ??
+        (testCase as { predicates?: unknown }).predicates) as
+        | import("@/shared/eval-matching").CasePredicates
+        | undefined,
+      legacyCase: (testCase as { successPredicates?: unknown })
+        .successPredicates as
+        | import("@/shared/eval-matching").Predicate[]
+        | undefined,
+    }),
+    hostConfigOverride: args.hostConfigOverride,
+    testCaseId: testCase._id,
+  };
+}
+
+type SingleCaseRuntimeTest = ReturnType<typeof buildSingleCaseRuntimeTest>;
+
+/**
+ * The runtime server environment of an ENVIRONMENT quick run: the connected
+ * refs, plus name → id bindings from the environment's own resolution, so a
+ * pinned tool-call step naming a server resolves to the environment's server
+ * — never to the suite's legacy bindings.
+ */
+function environmentRuntimeEnvironment(
+  resolvedServerIds: string[],
+  resolved: ResolvedEnvironmentForLaunch,
+) {
+  const ids = environmentServerIds(resolved);
+  const names = environmentServerNames(resolved);
+  const serverBindings = names.flatMap((serverName, index) =>
+    ids[index] ? [{ serverName, projectServerId: ids[index]! }] : [],
+  );
+  return {
+    servers: resolvedServerIds,
+    ...(serverBindings.length > 0 ? { serverBindings } : {}),
+  };
+}
+
+/** Everything a single-case run needs, decided before anything executes. */
+export type PreparedSingleCaseExecution = {
+  harnessRuntimeVenue: "local" | "hosted";
+  convexClient: ConvexHttpClient;
+  convexHttpUrl: string;
+  testCase: any;
+  test: SingleCaseRuntimeTest;
+  resolvedServerIds: string[];
+  runtimeEnvironment: {
+    servers: string[];
+    serverBindings?: Array<{ serverName: string; projectServerId: string }>;
+  };
+  /** The host config the run EXECUTES with. */
+  suiteHostConfig: Record<string, unknown>;
+  suiteHostPolicy: ReturnType<typeof extractHostExecutionPolicy>;
+  suiteInjectOpenAiCompat: boolean;
+  modelApiKeys?: Record<string, string>;
+  orgModelConfig?: ResolvedOrgModelConfig;
+  orgModelConfigTarget?: { projectId: string };
+  /**
+   * ENVIRONMENT quick runs only: the preflight, what the backend committed,
+   * and the frozen skill channels built from the commit. When
+   * `committed.replayed` is true an earlier request owns these iterations and
+   * the caller must NOT execute them; `frozenSkills` is then absent.
+   */
+  environment?: {
+    resolved: ResolvedEnvironmentForLaunch;
+    committed: CommittedQuickRun;
+    frozenSkills?: BuiltPinnedSkillSource;
+  };
+};
+
+/**
+ * The preparation shared by the streamed and buffered single-case routes
+ * (hosted and local): everything up to — never including — the first model
+ * or tool call.
+ *
+ * An ENVIRONMENT quick run (the request names `environmentId`) resolves the
+ * environment eval-only, connects exactly its closed server set, and COMMITS
+ * every attempt in the backend before returning: rows, reservation, frozen
+ * host config, model attribution and skill pins in one transaction. A failure
+ * anywhere up to the commit leaves nothing behind; a failure after it marks
+ * the committed rows failed before rethrowing. The environment owns the
+ * model, client, servers and client configuration — the request contributes
+ * case content only.
+ *
+ * A LEGACY request (no environment) keeps its old shape during the
+ * transition: the request's model and servers, the suite's host config.
+ */
+export async function prepareSingleCaseExecution(
+  clientManager: MCPClientManager,
+  request: SingleCaseExecutionRequest,
+): Promise<PreparedSingleCaseExecution> {
+  const {
+    testCaseId,
+    model,
+    provider,
+    serverIds,
+    scenarioId,
+    accessVersion,
+    modelApiKeys,
+    orgModelConfig,
+    convexAuthToken,
+    testCaseOverrides,
+    matchOptionsOverride,
+    namedHostId,
+    hostConfigOverride,
+    toolPolicy,
+    environmentId,
+    projectId,
+    idempotencyKey,
+  } = request;
+  const { convexClient, convexHttpUrl } = createConvexClients(convexAuthToken);
+
+  let environmentLaunch: ResolvedEnvironmentForLaunch | undefined;
+  if (environmentId) {
+    // Before resolving: a request that also sets the client configuration is
+    // refused without a backend round trip.
+    assertNoConflictingEnvironmentOverrides(request);
+    environmentLaunch =
+      request.resolvedEnvironment &&
+      request.resolvedEnvironment.environmentRef.environmentId === environmentId
+        ? request.resolvedEnvironment
+        : await resolveEnvironmentForLaunch(convexClient, {
+            serverSource: EVAL_LAUNCH_SERVER_SOURCE,
+            ...(request.runtimeVenue
+              ? { runtimeVenue: request.runtimeVenue }
+              : {}),
+            projectId: projectId!,
+            environmentId,
+          }).catch((error) => {
+            throw translateEnvironmentResolveError(error);
+          });
+    assertNoConflictingEnvironmentOverrides(request, environmentLaunch);
+    assertEnvironmentQuickRunAdmissible(environmentLaunch);
+    // Deploy skew (no model fields at all) and an environment with no model
+    // are different refusals with different fixes.
+    assertEnvironmentQuickRunModel(environmentLaunch);
+  } else {
+    logLegacyEvalRequest({
+      surface: "quick_run",
+      use: "model_and_servers_from_request",
+      projectId: projectId ?? null,
+      ...(namedHostId ? { fields: ["namedHostId"] } : {}),
+    });
+    if (!model || !provider) {
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        "model and provider are required unless the run names an environment",
+      );
+    }
+    if (!serverIds || serverIds.length === 0) {
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        "At least one server must be selected",
+      );
+    }
+  }
+
+  const resolvedServerIds = resolveServerIdsOrThrow(
+    environmentLaunch
+      ? environmentServerRefsForManager(environmentLaunch, clientManager)
+      : serverIds!,
+    clientManager,
+  );
+
+  const testCase = await convexClient.query("testSuites:getTestCase" as any, {
+    testCaseId,
+  });
+
+  if (!testCase) {
+    throw new WebRouteError(404, ErrorCode.NOT_FOUND, "Test case not found");
+  }
+
+  assertTestCaseRunWithinCap(request, 1, {
+    // resolveSteps converts legacy promptTurns/probe rows so multi-turn cases
+    // without persisted `steps` count their real model calls, not a floored 1.
+    modelStepCount: countModelSteps(
+      resolveSteps(testCase as unknown as Parameters<typeof resolveSteps>[0]),
+    ),
+  });
+
+  const suiteDefaultMatchOptions = await loadSuiteDefaultMatchOptions(
+    convexClient,
+    testCase.evalTestSuiteId,
+  );
+  const suiteDefaultPredicates = await loadSuiteDefaultPredicates(
+    convexClient,
+    testCase.evalTestSuiteId,
+  );
+  // An environment runs AS its client; a legacy run as the suite's (or the
+  // named) host, with the request's one-off override on top.
+  const executionHostId = environmentLaunch?.hostId ?? namedHostId;
+  const liveHostConfig = environmentLaunch
+    ? await loadSuiteHostConfig(
+        convexClient,
+        undefined,
+        environmentLaunch.hostId,
+      )
+    : await loadSuiteHostConfig(
+        convexClient,
+        testCase.evalTestSuiteId,
+        namedHostId,
+      );
+  const legacyHostConfigOverride = environmentLaunch
+    ? undefined
+    : (hostConfigOverride as Record<string, unknown> | undefined);
+  const effectiveHostConfig = legacyHostConfigOverride ?? liveHostConfig;
+  const harnessRuntimeVenue = await shouldUseLocalHarness(harnessOfHostConfig(effectiveHostConfig), convexAuthToken, testCase.projectId ?? projectId ?? undefined) ? "local" : "hosted";
+  // Enforced at the MCP proxy for NATIVE-delivery harness runs (see the suite
+  // path); refused only where this deployment cannot seal the policy into the
+  // proxy token. Host-executed delivery enforces in-process and mints no token.
+  const harnessPolicyRefusal = harnessToolPolicyLaunchRefusal({
+    localExecution: harnessRuntimeVenue === "local",
+    hasToolPolicy: Boolean(toolPolicy),
+    harness: harnessOfHostConfig(effectiveHostConfig),
+  });
+  if (harnessPolicyRefusal) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      harnessPolicyRefusal,
+      { reason: "TOOL_POLICY_UNSUPPORTED" },
+    );
+  }
+
+  // The same honesty gate the suite path applies, with the surface named: a
+  // single-case run passes `runId: null`, and both sandbox-provisioning sites
+  // require `runId !== null`, so no box is ever booted for it. A host granting
+  // a computer-backed built-in would therefore execute with the tool silently
+  // skipped by `resolveHostTools`. Refused instead — and the message points at
+  // running the case inside a suite rather than at pinning an image, which
+  // would change nothing here. Before the commit, so a refusal writes nothing.
+  const singleCaseAdmission = checkEvalExecutionAdmission({
+    localExecution: harnessRuntimeVenue === "local",
+    hostConfig: effectiveHostConfig ?? null,
+    surface: "single-case",
+  });
+  if (!singleCaseAdmission.ok) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      singleCaseAdmission.reason,
+      { reason: "EVAL_EXECUTION_UNAVAILABLE" },
+    );
+  }
+
+  const runtimeEnvironment = environmentLaunch
+    ? environmentRuntimeEnvironment(resolvedServerIds, environmentLaunch)
+    : buildRuntimeEnvironmentWithBindings({
+        resolvedServerIds,
+        suiteEnvironment: await loadSuiteEnvironment(
+          convexClient,
+          testCase.evalTestSuiteId,
+        ),
+      });
+  const test = buildSingleCaseRuntimeTest({
+    testCase,
+    testCaseOverrides,
+    // Provisional for an environment run: the commit below returns the
+    // model and provider the backend projected, and those are what execute.
+    model: environmentLaunch ? environmentLaunch.effectiveModelId! : model!,
+    provider: environmentLaunch
+      ? providerForModelId(environmentLaunch.effectiveModelId!) ?? ""
+      : provider!,
+    suiteDefaultMatchOptions,
+    suiteDefaultPredicates,
+    matchOptionsOverride,
+    hostConfigOverride: legacyHostConfigOverride,
+  });
+
+  // Resolve org model config: prefer client-sent keys, fall back to org config.
+  // Treat an empty client-provided map as "no keys".
+  const hasClientKeysForCase =
+    !!modelApiKeys && Object.keys(modelApiKeys).length > 0;
+  const resolvedModelApiKeys = hasClientKeysForCase ? modelApiKeys : undefined;
+  let resolvedOrgModelConfig = orgModelConfig;
+  const testCaseProjectId =
+    typeof testCase.projectId === "string" ? testCase.projectId : undefined;
+  const orgModelConfigTarget = testCaseProjectId
+    ? { projectId: testCaseProjectId }
+    : undefined;
+  if (
+    !resolvedModelApiKeys &&
+    !resolvedOrgModelConfig &&
+    orgModelConfigTarget
+  ) {
+    try {
+      resolvedOrgModelConfig = await resolveOrgModelConfig(
+        orgModelConfigTarget,
+        {
+          bearerToken: convexAuthToken,
+          scenarioId,
+          accessVersion,
+          serverIds: resolvedServerIds,
+        },
+      );
+    } catch (error) {
+      logger.warn("[evals] Failed to resolve org model config for test case", {
+        testCaseId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  let suiteHostConfig = liveHostConfig;
+  let environment: PreparedSingleCaseExecution["environment"];
+  if (environmentLaunch) {
+    const committed = await commitEnvironmentQuickRun(convexClient, {
+      testCaseId,
+      testCaseSnapshot: buildQuickRunCommitSnapshot(
+        test as unknown as EvalTestCase,
+      ),
+      count: test.runs,
+      startedAt: Date.now(),
+      resolved: environmentLaunch,
+      // The caller's key makes a retried request replay; without one, this
+      // request's own key still makes the backend call retry-safe.
+      idempotencyKey: idempotencyKey ?? `quick-run:${randomUUID()}`,
+    });
+    let frozenSkills: BuiltPinnedSkillSource | undefined;
+    if (!committed.replayed) {
+      try {
+        assertCommittedExecutionMatchesPreflight(
+          environmentLaunch,
+          committed.execution,
+        );
+        frozenSkills = await loadCommittedQuickRunSkills(convexClient, {
+          committed,
+          effectiveServerIds: resolvedServerIds,
+          serverNames: environmentServerNames(environmentLaunch),
+        });
+      } catch (error) {
+        // Committed but never started: finalize every row so none is left
+        // running, then report the setup failure itself.
+        await failCommittedQuickRun(
+          convexClient,
+          committed.iterationIds,
+          error instanceof Error ? error.message : String(error),
+        );
+        throw error;
+      }
+    }
+    // Execute exactly what was committed: the backend's model attribution
+    // and its frozen host config, never the provisional values above.
+    test.model = committed.execution.model;
+    test.provider = committed.execution.provider;
+    suiteHostConfig = committed.execution.hostConfig;
+    environment = {
+      resolved: environmentLaunch,
+      committed,
+      ...(frozenSkills ? { frozenSkills } : {}),
+    };
+  }
+
+  return {
+    convexClient,
+    convexHttpUrl,
+    testCase,
+    test,
+    resolvedServerIds,
+    runtimeEnvironment,
+    suiteHostConfig,
+    harnessRuntimeVenue,
+    suiteHostPolicy: extractHostExecutionPolicy(
+      suiteHostConfig,
+      executionHostId,
+    ),
+    suiteInjectOpenAiCompat: resolveOpenAiCompatForHostConfig(
+      suiteHostConfig,
+      legacyHostConfigOverride,
+    ),
+    ...(resolvedModelApiKeys ? { modelApiKeys: resolvedModelApiKeys } : {}),
+    ...(resolvedOrgModelConfig
+      ? { orgModelConfig: resolvedOrgModelConfig }
+      : {}),
+    ...(orgModelConfigTarget ? { orgModelConfigTarget } : {}),
+    ...(environment ? { environment } : {}),
+  };
+}
+
+/** Is this iteration row finished? */
+function isTerminalIteration(iteration: unknown): boolean {
+  const status = (iteration as { status?: unknown } | null)?.status;
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "timed_out" ||
+    status === "setup_failed" ||
+    status === "skipped"
+  );
+}
+
+/** The runner options an environment quick run adds (none for legacy). */
+function environmentExecutionOptions(prepared: PreparedSingleCaseExecution): {
+  committedQuickRunIterationIds?: string[];
+  projectEnvironmentId?: string;
+  pinnedSkillSource?: EvalPinnedSkillSource;
+  pinnedHarnessSkills?: PinnedSkillArtifact[];
+} {
+  const environment = prepared.environment;
+  if (!environment) return {};
+  return {
+    committedQuickRunIterationIds: environment.committed.iterationIds,
+    projectEnvironmentId: environment.resolved.environmentRef.environmentId,
+    ...runFrozenSkillOptions({
+      ...(environment.frozenSkills?.pinnedSkillSource
+        ? { pinnedSkillSource: environment.frozenSkills.pinnedSkillSource }
+        : {}),
+      pinnedHarnessSkills: environment.frozenSkills?.pinnedHarnessSkills ?? [],
+    }),
+  };
+}
+
+/**
+ * An environment quick run whose idempotency key was already used: an
+ * earlier request committed — and owns — these iterations. Report where they
+ * stand; never execute them a second time.
+ */
+async function replayedQuickRunIteration(
+  prepared: PreparedSingleCaseExecution,
+): Promise<{ iterationId: string; iteration: unknown }> {
+  const iterationId = prepared.environment!.committed.iterationIds[0]!;
+  const iteration = await prepared.convexClient.query(
+    "testSuites:getTestIteration" as any,
+    { iterationId },
+  );
+  return { iterationId, iteration };
+}
+
+export async function runEvalTestCaseWithManager(
+  clientManager: MCPClientManager,
+  request: SingleCaseExecutionRequest,
+  options?: RunEvalTestCaseWithManagerOptions,
+) {
+  const {
+    testCaseId,
+    compareRunId,
+    skipLastMessageRunUpdate,
+    convexAuthToken,
+    toolPolicy,
+  } = request;
+
+  const prepared = await prepareSingleCaseExecution(clientManager, request);
+  const { convexClient, convexHttpUrl, testCase } = prepared;
+
+  if (prepared.environment?.committed.replayed) {
+    const replay = await replayedQuickRunIteration(prepared);
+    return {
+      success: true,
+      replayed: true,
+      message: isTerminalIteration(replay.iteration)
+        ? "This quick run already completed."
+        : "This quick run is already running in another request.",
+      iteration: replay.iteration,
+    };
+  }
+
+  let quickResult: Awaited<ReturnType<typeof runEvalSuiteWithAiSdk>>;
+  try {
+    quickResult = await runEvalSuiteWithAiSdk({
+      suiteId: testCase.evalTestSuiteId,
+      runId: null,
+      config: {
+        tests: [prepared.test],
+        environment: prepared.runtimeEnvironment,
+      },
+      modelApiKeys: prepared.modelApiKeys,
+      orgModelConfig: prepared.orgModelConfig,
+      orgModelConfigTarget: prepared.orgModelConfigTarget,
+      convexClient,
+      convexHttpUrl,
+      convexAuthToken,
+      mcpClientManager: clientManager,
+      recorder: null,
+      testCaseId,
+      compareRunId,
+      suiteInjectOpenAiCompat: prepared.suiteInjectOpenAiCompat,
+      hostExecutionPolicy: prepared.suiteHostPolicy,
+      // PR 4d: see comment on the suite-run wire-up site above.
+      suiteHostConfig: prepared.suiteHostConfig,
+      harnessRuntimeVenue: prepared.harnessRuntimeVenue,
+      ...(toolPolicy ? { toolPolicy } : {}),
+      ...environmentExecutionOptions(prepared),
+    });
+  } catch (error) {
+    // The runner's setup (tool loading, tool-policy checks) threw before any
+    // attempt took its row: after an environment commit nothing may be left
+    // running. A row an attempt did take is already terminal, and the
+    // backend ignores a later write to a terminal quick-run row.
+    if (prepared.environment) {
+      await failCommittedQuickRun(
+        convexClient,
+        prepared.environment.committed.iterationIds,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    throw error;
+  }
+
+  // An environment run answers with ITS committed row, never "the latest
+  // iteration of this case" — which could be another run's, and would report
+  // a rejected or crashed execution as this one's success.
+  const expectedIterationId = prepared.environment
+    ? prepared.environment.committed.iterationIds[0]
+    : quickResult?.quickRunIterationOutcomes?.[0]?.iterationId;
+
+  let latestIteration: unknown = null;
+  if (expectedIterationId) {
+    latestIteration = await convexClient.query(
+      "testSuites:getTestIteration" as any,
+      { iterationId: expectedIterationId },
+    );
+  }
+  if (!latestIteration && !prepared.environment) {
+    const recentIterations = await convexClient.query(
+      "testSuites:listTestIterations" as any,
+      { testCaseId },
+    );
+    latestIteration = recentIterations?.[0] || null;
+  }
+
+  if (
+    !options?.skipLastMessageRunUpdate &&
+    !skipLastMessageRunUpdate &&
+    (latestIteration as any)?._id
+  ) {
+    await convexClient.mutation("testSuites:updateTestCase" as any, {
+      testCaseId,
+      lastMessageRun: (latestIteration as any)._id,
+    });
+  }
+
+  return {
+    success: true,
+    message: "Test case completed successfully",
+    iteration: latestIteration,
+  };
+}
+
+// Map each manager key back to the runtime display name the inspector client
+// sent in `serverNames`. The map drives the snapshot rewrite below so the
+// Convex `applyAttachmentScope` set-comparison lines up with
+// `serverAttachment.resolvedServerNames` (display names) instead of the
+// manager keys (Convex Ids in hosted mode).
+export function buildManagerKeyToDisplayNameMap(
+  clientManager: MCPClientManager,
+  requestServerIds: string[],
+  requestServerNames: string[] | undefined,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  if (
+    !requestServerNames ||
+    requestServerNames.length !== requestServerIds.length
+  ) {
+    return map;
+  }
+  const available = listBaseServers(clientManager);
+  for (let i = 0; i < requestServerIds.length; i++) {
+    const requestedId = requestServerIds[i];
+    const displayName = requestServerNames[i];
+    if (!displayName || displayName === requestedId) continue;
+    const match =
+      available.find((id) => id === requestedId) ??
+      available.find((id) => id.toLowerCase() === requestedId.toLowerCase());
+    if (!match) continue;
+    if (!map.has(match)) {
+      map.set(match, displayName);
+    }
+  }
+  return map;
+}
+
+export function remapSnapshotServerIdsForAttachment(
+  snapshot: ServerToolSnapshot,
+  managerKeyToDisplayName: Map<string, string>,
+): ServerToolSnapshot {
+  if (managerKeyToDisplayName.size === 0) return snapshot;
+  let mutated = false;
+  const servers = snapshot.servers.map((server) => {
+    const displayName = managerKeyToDisplayName.get(server.serverId);
+    if (!displayName || displayName === server.serverId) return server;
+    mutated = true;
+    return { ...server, serverId: displayName };
+  });
+  return mutated ? { ...snapshot, servers } : snapshot;
+}
+
+/**
+ * The servers a generation request authors cases against: an environment's
+ * eval server set (resolved like a run resolves it — the caller's preflight
+ * resolution when it made one), or the request's own servers for a legacy
+ * request.
+ */
+async function resolveGenerationServers(
+  clientManager: MCPClientManager,
+  request: {
+    serverIds: string[];
+    serverNames?: string[];
+    convexAuthToken: string;
+    projectId?: string;
+    environmentId?: string;
+    resolvedEnvironment?: ResolvedEnvironmentForLaunch;
+    runtimeVenue?: "local" | "hosted";
+  },
+): Promise<{
+  resolvedServerIds: string[];
+  requestServerRefs: string[];
+  serverNames?: string[];
+}> {
+  if (request.environmentId) {
+    if (!request.projectId) {
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        "projectId is required to generate cases from an environment",
+      );
+    }
+    const resolved =
+      request.resolvedEnvironment?.environmentRef.environmentId ===
+      request.environmentId
+        ? request.resolvedEnvironment
+        : await resolveEnvironmentForLaunch(
+            createConvexClients(request.convexAuthToken).convexClient,
+            {
+              serverSource: EVAL_LAUNCH_SERVER_SOURCE,
+              ...(request.runtimeVenue
+                ? { runtimeVenue: request.runtimeVenue }
+                : {}),
+              projectId: request.projectId,
+              environmentId: request.environmentId,
+            },
+          ).catch((error) => {
+            throw translateEnvironmentResolveError(error);
+          });
+    const requestServerRefs = environmentServerRefsForManager(
+      resolved,
+      clientManager,
+    );
+    return {
+      resolvedServerIds: resolveServerIdsOrThrow(
+        requestServerRefs,
+        clientManager,
+      ),
+      requestServerRefs,
+      serverNames: environmentServerNames(resolved),
+    };
+  }
+  if (request.serverIds.length === 0) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "At least one server must be selected",
+    );
+  }
+  logLegacyEvalRequest({
+    surface: "generation",
+    use: "servers_from_request",
+    projectId: request.projectId ?? null,
+  });
+  return {
+    resolvedServerIds: resolveServerIdsOrThrow(
+      request.serverIds,
+      clientManager,
+    ),
+    requestServerRefs: request.serverIds,
+    ...(request.serverNames ? { serverNames: request.serverNames } : {}),
+  };
+}
+
+export async function generateEvalTestsWithManager(
+  clientManager: MCPClientManager,
+  request: GenerateTestsRequest & {
+    runtimeVenue?: "local" | "hosted";
+    resolvedEnvironment?: ResolvedEnvironmentForLaunch;
+  },
+) {
+  const { resolvedServerIds, requestServerRefs, serverNames } =
+    await resolveGenerationServers(clientManager, request);
+  const { toolSnapshot: rawSnapshot } =
+    await captureToolSnapshotForEvalAuthoring(
+      clientManager,
+      resolvedServerIds,
+      {
+        logPrefix: "evals.generate-tests",
+      },
+    );
+  const toolSnapshot = remapSnapshotServerIdsForAttachment(
+    rawSnapshot,
+    buildManagerKeyToDisplayNameMap(
+      clientManager,
+      requestServerRefs,
+      serverNames,
+    ),
+  );
+  const filteredTools = flattenServerToolSnapshotTools(toolSnapshot);
+
+  if (filteredTools.length === 0) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "No tools found for selected servers",
+    );
+  }
+
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) {
+    throw new Error("CONVEX_HTTP_URL is not set");
+  }
+
+  const tests = await generateTestCases(
+    toolSnapshot,
+    convexHttpUrl,
+    request.convexAuthToken,
+    request.serverAttachment,
+    request.projectId,
+    request.generationOptions,
+  );
+
+  return {
+    success: true,
+    tests,
+  };
+}
+
+export async function generateNegativeEvalTestsWithManager(
+  clientManager: MCPClientManager,
+  request: GenerateNegativeTestsRequest & {
+    runtimeVenue?: "local" | "hosted";
+    resolvedEnvironment?: ResolvedEnvironmentForLaunch;
+  },
+) {
+  const { resolvedServerIds, requestServerRefs, serverNames } =
+    await resolveGenerationServers(clientManager, request);
+  const { toolSnapshot: rawSnapshot } =
+    await captureToolSnapshotForEvalAuthoring(
+      clientManager,
+      resolvedServerIds,
+      {
+        logPrefix: "evals.generate-negative-tests",
+      },
+    );
+  const toolSnapshot = remapSnapshotServerIdsForAttachment(
+    rawSnapshot,
+    buildManagerKeyToDisplayNameMap(
+      clientManager,
+      requestServerRefs,
+      serverNames,
+    ),
+  );
+  const filteredTools = flattenServerToolSnapshotTools(toolSnapshot);
+
+  if (filteredTools.length === 0) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "No tools found for selected servers",
+    );
+  }
+
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) {
+    throw new Error("CONVEX_HTTP_URL is not set");
+  }
+
+  const tests = await generateNegativeTestCases(
+    toolSnapshot,
+    convexHttpUrl,
+    request.convexAuthToken,
+    request.serverAttachment,
+    request.projectId,
+  );
+
+  return {
+    success: true,
+    tests,
+    evalTests: convertToEvalTestCases(tests),
+  };
+}
+
+export async function streamEvalTestCaseWithManager(
+  clientManager: MCPClientManager,
+  request: SingleCaseExecutionRequest,
+  options?: {
+    skipLastMessageRunUpdate?: boolean;
+    onStreamComplete?: () => void;
+    /**
+     * The HTTP request's abort signal (`c.req.raw.signal`). Aborts the
+     * single-case run — including an in-flight `await`-mode task drive — when
+     * the client goes away. The returned stream's own `cancel()` aborts too,
+     * so either teardown path stops the work.
+     */
+    requestSignal?: AbortSignal;
+  },
+): Promise<ReadableStream<Uint8Array>> {
+  const {
+    testCaseId,
+    compareRunId,
+    skipLastMessageRunUpdate,
+    convexAuthToken,
+    toolPolicy,
+  } = request;
+
+  // Everything before the first model or tool call, shared with the buffered
+  // route. For an environment run this COMMITS every attempt; a failure here
+  // throws before the stream opens, so the caller gets an HTTP error rather
+  // than an SSE stream that runs nothing.
+  const prepared = await prepareSingleCaseExecution(clientManager, request);
+  const {
+    convexClient,
+    convexHttpUrl,
+    testCase,
+    test,
+    resolvedServerIds,
+    runtimeEnvironment,
+    suiteHostConfig,
+    suiteHostPolicy,
+    suiteInjectOpenAiCompat,
+  } = prepared;
+  const encoder = new TextEncoder();
+  const sseEncode = (event: EvalStreamEvent): Uint8Array =>
+    encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+
+  if (prepared.environment?.committed.replayed) {
+    // An earlier request with this idempotency key owns these iterations.
+    // Report where they stand; never execute them a second time.
+    const replay = await replayedQuickRunIteration(prepared);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          sseEncode(
+            isTerminalIteration(replay.iteration)
+              ? {
+                  type: "complete",
+                  iterationId: replay.iterationId,
+                  iteration: replay.iteration,
+                }
+              : {
+                  type: "error",
+                  message:
+                    "This quick run is already running in another request.",
+                  details: JSON.stringify({
+                    reason: "QUICK_RUN_ALREADY_STARTED",
+                    iterationId: replay.iterationId,
+                  }),
+                },
+          ),
+        );
+        controller.close();
+        options?.onStreamComplete?.();
+      },
+    });
+  }
+
+  // Mirror runEvalSuiteWithAiSdk: when a host policy is present, fetch the
+  // full tool set (including app-only) so the policy can both filter and
+  // count drops honestly. Without this, app-only tools are pre-stripped by
+  // getToolsForAiSdk and host visibility signals are blank.
+  // Host-only, and never merged with `hostConfigOverride`: a single-case
+  // override must not be able to switch tasks on for a suite whose host said
+  // off. Eval resolves to `await` — a run has nobody watching a handle.
+  // Abort umbrella for this single-case run, fired from BOTH teardown paths:
+  // the HTTP request aborting (client disconnect) and the SSE stream being
+  // cancelled by its consumer. Wired into the task seam (stops an in-flight
+  // `await`-mode task drive promptly instead of leaving it polling until the
+  // driver timeout) and into `streamTestCase` (stops the iteration loop).
+  const streamAbortController = new AbortController();
+  const abortSingleCaseRun = () => {
+    if (!streamAbortController.signal.aborted) {
+      streamAbortController.abort(
+        new Error("Eval stream aborted by the client"),
+      );
+    }
+  };
+  const requestSignal = options?.requestSignal;
+  if (requestSignal?.aborted) {
+    abortSingleCaseRun();
+  } else {
+    requestSignal?.addEventListener("abort", abortSingleCaseRun, {
+      once: true,
+    });
+  }
+  const releaseRequestAbortListener = () => {
+    requestSignal?.removeEventListener("abort", abortSingleCaseRun);
+  };
+
+  const singleCaseTasksSeam = resolveToolTaskSeam({
+    tasksPolicy: readTasksPolicy(
+      suiteHostConfig as Parameters<typeof readTasksPolicy>[0],
+    ),
+    surface: "eval",
+    // Driver `timeoutMs` stays at its default — the task drive nests under
+    // the run's own teardown, which aborts through this signal.
+    await: { signal: streamAbortController.signal },
+  });
+  // `includeAppOnly` is tied to the PRESENCE of a host policy, not to
+  // `respectToolVisibility`: eval wants the full set so the visibility gate
+  // below can both filter and COUNT the drops honestly.
+  const singleCaseToolOptions = mcpToolOptionsFor({
+    includeAppOnly: Boolean(suiteHostPolicy),
+    modelVisibleMcpToolResults: suiteHostPolicy?.modelVisibleMcpToolResults,
+    tasks: singleCaseTasksSeam,
+  });
+  let tools: Record<string, any>;
+  try {
+    tools = (
+      singleCaseToolOptions
+        ? await clientManager.getToolsForAiSdk(
+            resolvedServerIds,
+            singleCaseToolOptions,
+          )
+        : await clientManager.getToolsForAiSdk(resolvedServerIds)
+    ) as Record<string, any>;
+  } catch (error) {
+    // After an environment commit nothing may be left running: the rows were
+    // reserved for attempts that now cannot start.
+    releaseRequestAbortListener();
+    if (prepared.environment) {
+      await failCommittedQuickRun(
+        convexClient,
+        prepared.environment.committed.iterationIds,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    throw error;
+  }
+  let streamToolSignals:
+    | ReturnType<typeof applyVisibilityPolicyAndCountSignals>
+    | undefined;
+  try {
+    streamToolSignals = suiteHostPolicy
+      ? applyVisibilityPolicyAndCountSignals(
+          tools as Record<string, unknown>,
+          clientManager,
+          suiteHostPolicy,
+        )
+      : undefined;
+  } catch (error) {
+    releaseRequestAbortListener();
+    if (prepared.environment) {
+      await failCommittedQuickRun(
+        convexClient,
+        prepared.environment.committed.iterationIds,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    throw error;
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        const outcomes = await streamTestCase({
+          test,
+          // A quick run has no launch response to carry frozen budgets, so it
+          // takes the platform defaults — resolved through the real resolver,
+          // not hand-written, so it matches what a launch would freeze.
+          budgets: defaultEvalExecutionBudgets(),
+          tools,
+          selectedServers: resolvedServerIds,
+          mcpClientManager: clientManager,
+          recorder: null,
+          modelApiKeys: prepared.modelApiKeys,
+          orgModelConfig: prepared.orgModelConfig,
+          orgModelConfigTarget: prepared.orgModelConfigTarget,
+          convexHttpUrl,
+          convexAuthToken,
+          convexClient,
+          testCaseId,
+          suiteId: testCase.evalTestSuiteId,
+          runId: null,
+          // Previously unwired here: without it, a cancelled stream kept the
+          // iteration loop (and any awaited task) running to completion.
+          abortSignal: streamAbortController.signal,
+          compareRunId,
+          injectOpenAiCompat: suiteInjectOpenAiCompat,
+          hostPolicy: suiteHostPolicy,
+          // PR 4d: thread the raw hostConfig for the streamTestCase path
+          // so its runners (`streamIterationWithAiSdk` /
+          // `streamIterationViaBackend`) can resolve CONFIG fields via
+          // `resolveExecutionContext`. PR 5 will reduce these runners
+          // further; the threading still applies in the meantime.
+          suiteHostConfig,
+          harnessRuntimeVenue: prepared.harnessRuntimeVenue,
+          ...(toolPolicy ? { toolPolicy } : {}),
+          toolSignals: streamToolSignals,
+          environment: runtimeEnvironment,
+          // Environment runs: the committed rows (the runner creates none),
+          // the environment id, and the frozen skill channels.
+          ...(() => {
+            const { committedQuickRunIterationIds, ...environmentOptions } =
+              environmentExecutionOptions(prepared);
+            return {
+              ...environmentOptions,
+              ...(committedQuickRunIterationIds
+                ? { committedIterationIds: committedQuickRunIterationIds }
+                : {}),
+            };
+          })(),
+          emit: (event: EvalStreamEvent) => {
+            try {
+              controller.enqueue(sseEncode(event));
+            } catch {
+              // controller may be closed
+            }
+          },
+        });
+
+        // Retrieve the finalized iteration to attach to the `complete` event.
+        // The iteration is pre-created as `running` and finalized to a terminal
+        // status (`completed`/`failed`/`cancelled`) by `finalizeEvalIteration`
+        // right before the stream loop returns. An immediate read can race that
+        // write and return either `null` (write not yet visible) or the still
+        // `running` row (mid-finalize). Both are toxic to the client: a `null`
+        // or non-terminal `iteration` on `complete` makes a fully-graded run
+        // look like a failure — the Preview row vanishes and the user sees
+        // "Compare run failed for all selected models" (telemetry: rare
+        // `result=unknown` / `pending` compare_model_completed events). Poll
+        // briefly for the terminal row before emitting.
+        // An environment run reports ITS committed row — never another run's.
+        const expectedIterationId =
+          prepared.environment?.committed.iterationIds[0] ??
+          outcomes[0]?.iterationId;
+        let latestIteration: unknown = null;
+        if (expectedIterationId) {
+          for (let attempt = 0; attempt < 6; attempt++) {
+            latestIteration = await convexClient.query(
+              "testSuites:getTestIteration" as any,
+              { iterationId: expectedIterationId },
+            );
+            if (isTerminalIteration(latestIteration)) break;
+            // Backoff ~150ms between reads; total budget ~0.75s before we fall
+            // back. Don't keep the last (possibly non-terminal) read on the
+            // final attempt — let the fallback try a fresh listing instead.
+            if (attempt < 5) {
+              await new Promise((resolve) => setTimeout(resolve, 150));
+            } else {
+              latestIteration = null;
+            }
+          }
+        }
+        if (
+          prepared.environment &&
+          expectedIterationId &&
+          !isTerminalIteration(latestIteration)
+        ) {
+          // Still finalizing: report the committed row as it stands. Never
+          // the listing fallback below, which can pick another run's row.
+          latestIteration = await convexClient.query(
+            "testSuites:getTestIteration" as any,
+            { iterationId: expectedIterationId },
+          );
+        } else if (!isTerminalIteration(latestIteration)) {
+          const recentIterations = await convexClient.query(
+            "testSuites:listTestIterations" as any,
+            { testCaseId },
+          );
+          // Prefer a TERMINAL row so we never emit a `running` iteration on
+          // `complete` (the client reads that as a failed run). Order: our own
+          // created row if terminal → most recent terminal row → then the
+          // non-terminal fallbacks only as a last resort.
+          const byId = expectedIterationId
+            ? recentIterations?.find(
+                (iter: any) => iter?._id === expectedIterationId,
+              )
+            : undefined;
+          const terminalById = isTerminalIteration(byId) ? byId : undefined;
+          const terminalRecent = recentIterations?.find((iter: any) =>
+            isTerminalIteration(iter),
+          );
+          latestIteration =
+            terminalById ??
+            terminalRecent ??
+            byId ??
+            recentIterations?.[0] ??
+            latestIteration;
+        }
+
+        // Update lastMessageRun
+        if (
+          !options?.skipLastMessageRunUpdate &&
+          !skipLastMessageRunUpdate &&
+          (latestIteration as any)?._id
+        ) {
+          await convexClient.mutation("testSuites:updateTestCase" as any, {
+            testCaseId,
+            lastMessageRun: (latestIteration as any)._id,
+          });
+        }
+
+        // Emit complete event
+        try {
+          controller.enqueue(
+            sseEncode({
+              type: "complete",
+              iterationId: expectedIterationId,
+              iteration: latestIteration,
+            }),
+          );
+        } catch {
+          // stream cancelled mid-run; nobody is listening
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        try {
+          controller.enqueue(
+            sseEncode({
+              type: "error",
+              message,
+              details:
+                error instanceof WebRouteError && error.details
+                  ? JSON.stringify(error.details)
+                  : undefined,
+            }),
+          );
+        } catch {
+          // stream cancelled mid-run; nobody is listening
+        }
+      } finally {
+        releaseRequestAbortListener();
+        try {
+          controller.close();
+        } catch {
+          // already closed
+        }
+        options?.onStreamComplete?.();
+      }
+    },
+    cancel() {
+      // The consumer walked away from the SSE stream (tab closed, fetch
+      // aborted downstream of the route). Stop the run — and release the
+      // request listener here too, since `start`'s finally may still be far
+      // away while the iteration loop unwinds.
+      abortSingleCaseRun();
+      releaseRequestAbortListener();
+    },
+  });
+}

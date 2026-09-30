@@ -1,0 +1,113 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@mcpjam/design-system/alert-dialog";
+import { Checkbox } from "@mcpjam/design-system/checkbox";
+import { Label } from "@mcpjam/design-system/label";
+
+const SKIP_CHAT_RESET_CONFIRMATION_KEY = "skipChatResetConfirmation";
+
+const getShouldSkipChatResetConfirmation = () => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return localStorage.getItem(SKIP_CHAT_RESET_CONFIRMATION_KEY) === "true";
+  } catch {
+    return false;
+  }
+};
+
+interface ConfirmChatResetDialogProps {
+  open: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  message?: string;
+}
+
+export function ConfirmChatResetDialog({
+  open,
+  onConfirm,
+  onCancel,
+  message = "Clearing the chat will remove your current conversation thread. This action cannot be undone.",
+}: ConfirmChatResetDialogProps) {
+  const [dontShowAgain, setDontShowAgain] = useState(false);
+  const [shouldSkip, setShouldSkip] = useState(false);
+  const autoConfirmedRef = useRef(false);
+  const onConfirmRef = useRef(onConfirm);
+
+  useEffect(() => {
+    onConfirmRef.current = onConfirm;
+  }, [onConfirm]);
+
+  useEffect(() => {
+    if (!open) {
+      autoConfirmedRef.current = false;
+      setDontShowAgain(false);
+      return;
+    }
+    if (autoConfirmedRef.current) {
+      return;
+    }
+    const shouldSkipConfirmation = getShouldSkipChatResetConfirmation();
+    setShouldSkip(shouldSkipConfirmation);
+    if (shouldSkipConfirmation) {
+      autoConfirmedRef.current = true;
+      onConfirmRef.current();
+    }
+  }, [open]);
+
+  const handleConfirm = () => {
+    if (dontShowAgain && typeof window !== "undefined") {
+      try {
+        localStorage.setItem(SKIP_CHAT_RESET_CONFIRMATION_KEY, "true");
+        setShouldSkip(true);
+      } catch {}
+    }
+    onConfirm();
+  };
+
+  if (shouldSkip) {
+    return null;
+  }
+
+  return (
+    <AlertDialog open={open} onOpenChange={(open) => !open && onCancel()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Clear chat?</AlertDialogTitle>
+          <AlertDialogDescription>{message}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter className="flex-row items-center sm:justify-between">
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="dont-show-again"
+              checked={dontShowAgain}
+              onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+            />
+            <Label
+              htmlFor="dont-show-again"
+              className="text-sm text-muted-foreground cursor-pointer"
+            >
+              Don't show this again
+            </Label>
+          </div>
+          <div className="flex gap-2">
+            <AlertDialogCancel onClick={onCancel}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirm}>
+              Clear chat
+            </AlertDialogAction>
+          </div>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}

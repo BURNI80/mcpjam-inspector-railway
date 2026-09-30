@@ -1,0 +1,454 @@
+import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { ErrorCode } from "../web/errors.js";
+import { getSpendClientIp } from "../../utils/client-ip.js";
+import {
+  guestIpForwardHeaders,
+  hashGuestSpendIp,
+} from "../../utils/guest-spend-ip.js";
+import {
+  reportRouteFailure,
+  readRequestJson,
+} from "../../utils/route-error-report.js";
+
+const DEFAULT_STT_MODEL = "openai/whisper-1";
+const STT_TIMEOUT_MS = 55_000;
+const MCPJAM_VOICE_BUDGET_CODE = "user_rate_limit";
+const MCPJAM_VOICE_BUDGET_MESSAGE = "You've used today's voice budget.";
+const MCPJAM_VOICE_IN_PROGRESS_CODE = "voice_transcription_in_progress";
+const MCPJAM_VOICE_IN_PROGRESS_MESSAGE =
+  "Another voice message is still processing. Try again in a moment.";
+const SUPPORTED_AUDIO_FORMATS = new Set([
+  "wav",
+  "mp3",
+  "flac",
+  "m4a",
+  "ogg",
+  "webm",
+  "aac",
+]);
+
+interface TranscriptionRequestBody {
+  model?: unknown;
+  projectId?: unknown;
+  selectedServerIds?: unknown;
+  scenarioId?: unknown;
+  accessVersion?: unknown;
+  input_audio?: {
+    data?: unknown;
+    format?: unknown;
+  };
+  language?: unknown;
+  temperature?: unknown;
+  provider?: unknown;
+  audioDurationSeconds?: unknown;
+}
+
+function readErrorMessage(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== "object") return fallback;
+
+  const record = payload as Record<string, unknown>;
+  if (typeof record.error === "string") return record.error;
+  if (record.error && typeof record.error === "object") {
+    const error = record.error as Record<string, unknown>;
+    if (typeof error.message === "string") return error.message;
+  }
+  if (typeof record.message === "string") return record.message;
+  return fallback;
+}
+
+function readUpstreamError(
+  payload: unknown,
+  fallback: string,
+): Record<string, unknown> {
+  const message = readErrorMessage(payload, fallback);
+  if (!payload || typeof payload !== "object") {
+    return { error: message };
+  }
+
+  const record = payload as Record<string, unknown>;
+  const code = typeof record.code === "string" ? record.code : undefined;
+  const isVoiceBudgetError = code === MCPJAM_VOICE_BUDGET_CODE;
+  const isVoiceInProgressError = code === MCPJAM_VOICE_IN_PROGRESS_CODE;
+
+  return {
+    error: isVoiceBudgetError
+      ? MCPJAM_VOICE_BUDGET_MESSAGE
+      : isVoiceInProgressError
+        ? MCPJAM_VOICE_IN_PROGRESS_MESSAGE
+        : message,
+    ...(code ? { code } : {}),
+    ...(typeof record.isRetryable === "boolean"
+      ? { isRetryable: record.isRetryable }
+      : {}),
+    ...(typeof record.retryAfter === "number"
+      ? { retryAfter: record.retryAfter }
+      : {}),
+    ...(isVoiceBudgetError && typeof record.details === "string"
+      ? { details: record.details }
+      : {}),
+  };
+}
+
+function validateRequest(body: TranscriptionRequestBody):
+  | {
+      ok: true;
+      value: {
+        model: string;
+        projectId?: string;
+        selectedServerIds?: string[];
+        scenarioId?: string;
+        accessVersion?: number;
+        inputAudio: { data: string; format: string };
+        language?: string;
+        temperature?: number;
+        provider?: unknown;
+        audioDurationSeconds?: number;
+      };
+    }
+  | { ok: false; error: string } {
+  const projectId =
+    typeof body.projectId === "string" && body.projectId.trim().length > 0
+      ? body.projectId.trim()
+      : undefined;
+  const selectedServerIds = Array.isArray(body.selectedServerIds)
+    ? Array.from(
+        new Set(
+          body.selectedServerIds
+            .filter(
+              (serverId): serverId is string => typeof serverId === "string",
+            )
+            .map((serverId) => serverId.trim())
+            .filter((serverId) => serverId.length > 0),
+        ),
+      )
+    : undefined;
+  const scenarioId =
+    typeof body.scenarioId === "string" && body.scenarioId.trim().length > 0
+      ? body.scenarioId.trim()
+      : undefined;
+  const accessVersion =
+    typeof body.accessVersion === "number" &&
+    Number.isInteger(body.accessVersion) &&
+    body.accessVersion >= 0
+      ? body.accessVersion
+      : undefined;
+
+  const model =
+    typeof body.model === "string" && body.model.trim().length > 0
+      ? body.model.trim()
+      : DEFAULT_STT_MODEL;
+
+  const data =
+    typeof body.input_audio?.data === "string"
+      ? body.input_audio.data.trim()
+      : "";
+  if (!data) {
+    return { ok: false, error: "input_audio.data is required" };
+  }
+  if (data.startsWith("data:")) {
+    return {
+      ok: false,
+      error: "input_audio.data must be raw base64, not a data URI",
+    };
+  }
+
+  const format =
+    typeof body.input_audio?.format === "string"
+      ? body.input_audio.format.trim().toLowerCase()
+      : "";
+  if (!SUPPORTED_AUDIO_FORMATS.has(format)) {
+    return {
+      ok: false,
+      error:
+        "input_audio.format must be one of wav, mp3, flac, m4a, ogg, webm, or aac",
+    };
+  }
+
+  const language =
+    typeof body.language === "string" && body.language.trim().length > 0
+      ? body.language.trim()
+      : undefined;
+  const temperature =
+    typeof body.temperature === "number" &&
+    Number.isFinite(body.temperature) &&
+    body.temperature >= 0 &&
+    body.temperature <= 1
+      ? body.temperature
+      : undefined;
+  const audioDurationSeconds =
+    typeof body.audioDurationSeconds === "number" &&
+    Number.isFinite(body.audioDurationSeconds) &&
+    body.audioDurationSeconds > 0
+      ? body.audioDurationSeconds
+      : undefined;
+
+  return {
+    ok: true,
+    value: {
+      model,
+      ...(projectId ? { projectId } : {}),
+      ...(selectedServerIds && selectedServerIds.length > 0
+        ? { selectedServerIds }
+        : {}),
+      ...(scenarioId ? { scenarioId } : {}),
+      ...(accessVersion !== undefined ? { accessVersion } : {}),
+      inputAudio: { data, format },
+      ...(language ? { language } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(body.provider !== undefined ? { provider: body.provider } : {}),
+      ...(audioDurationSeconds !== undefined ? { audioDurationSeconds } : {}),
+    },
+  };
+}
+
+/**
+ * Whether this host is one the loopback exemption covers.
+ *
+ * `localhost` is included on top of the literal addresses because that is what
+ * a local Convex is actually configured as, and it resolves to loopback on
+ * every platform this ships to.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+/**
+ * Where the caller's bearer gets forwarded — over TLS, or not at all.
+ *
+ * This route hands the CALLER's `Authorization` header to Convex, so the
+ * scheme of `CONVEX_HTTP_URL` decides whether a bearer crosses the network in
+ * cleartext. The variable is operator-set rather than attacker-controlled, so
+ * this is a misconfiguration guard, not an injection one — but a misconfigured
+ * deployment leaking every voice caller's token is worth failing closed over,
+ * and the failure is loud (a 500 on one route at boot-time-constant config)
+ * rather than silent.
+ *
+ * LOOPBACK IS EXEMPT. A local Convex is `http://127.0.0.1:…`, and there is no
+ * network hop to protect — refusing it would break `npm run dev` for everyone
+ * to defend against nothing. This is the same rule browsers apply to secure
+ * contexts, for the same reason.
+ *
+ * Scoped to this route deliberately. The same forwarding shape exists in
+ * `routes/mcp/chat-v2.ts` and `routes/mcp/models.ts`, and a single assertion
+ * in `server/env.ts` at boot would cover all of them — that is the right home
+ * and a bigger change than a bearer-auth fix should carry. Noted here so the
+ * next person finds the thought rather than the gap.
+ */
+function getMcpjamTranscriptionUrl(): string {
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) {
+    throw new Error("CONVEX_HTTP_URL is not set");
+  }
+  const base = convexHttpUrl.replace(/\/$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(base);
+  } catch {
+    throw new Error("CONVEX_HTTP_URL is not a valid URL");
+  }
+  if (parsed.protocol !== "https:" && !isLoopbackHost(parsed.hostname)) {
+    throw new Error(
+      "CONVEX_HTTP_URL must use https — refusing to forward a bearer token over cleartext",
+    );
+  }
+  return `${base}/audio/transcriptions`;
+}
+
+const audioTranscriptions = new Hono();
+
+function createTranscriptionSignal(inboundSignal?: AbortSignal): {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  let didTimeOut = false;
+  const timeout = setTimeout(() => {
+    didTimeOut = true;
+    controller.abort();
+  }, STT_TIMEOUT_MS);
+  const abortFromInbound = () => controller.abort();
+
+  if (inboundSignal?.aborted) {
+    controller.abort();
+  } else {
+    inboundSignal?.addEventListener("abort", abortFromInbound, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    timedOut: () => didTimeOut,
+    cleanup: () => {
+      clearTimeout(timeout);
+      inboundSignal?.removeEventListener("abort", abortFromInbound);
+    },
+  };
+}
+
+audioTranscriptions.post("/transcriptions", async (c) => {
+  let body: TranscriptionRequestBody;
+  try {
+    body = (await readRequestJson(c)) as TranscriptionRequestBody;
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const validation = validateRequest(body);
+  if (!validation.ok) {
+    return c.json({ error: validation.error }, 400);
+  }
+
+  // Voice is always MCPJam-credit-backed. Keep the MCP-mounted copy from
+  // accepting transcription calls so local BYOK cannot bypass credit billing.
+  if (!c.req.path.startsWith("/api/web/")) {
+    return c.json(
+      {
+        error:
+          "Voice transcription uses MCPJam credits and is only available on the /api/web audio endpoint.",
+      },
+      403,
+    );
+  }
+
+  const {
+    model,
+    projectId,
+    selectedServerIds,
+    scenarioId,
+    accessVersion,
+    inputAudio,
+    language,
+    temperature,
+    provider,
+    audioDurationSeconds,
+  } = validation.value;
+
+  let transcriptionSignal:
+    ReturnType<typeof createTranscriptionSignal> | undefined;
+  try {
+    // The CALLER's bearer, and only ever the caller's. This route once fell
+    // back to a server-side guest session when the header was absent, which
+    // spent MCPJam's own credential on an anonymous request (MJ-002). The
+    // `/audio/*` mount now requires a bearer, so reaching here without one is
+    // not possible — and if a future mount changes that, this refuses rather
+    // than paying for it.
+    const authHeader = c.req.header("authorization");
+    if (!authHeader) {
+      return c.json(
+        { code: ErrorCode.UNAUTHORIZED, message: "Bearer token required" },
+        401,
+      );
+    }
+
+    transcriptionSignal = createTranscriptionSignal(c.req.raw.signal);
+    const transcriptionPayload = {
+      model,
+      input_audio: {
+        data: inputAudio.data,
+        format: inputAudio.format,
+      },
+      ...(language ? { language } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(provider !== undefined ? { provider } : {}),
+      ...(projectId ? { projectId } : {}),
+      ...(selectedServerIds && selectedServerIds.length > 0
+        ? { selectedServerIds }
+        : {}),
+      ...(scenarioId ? { scenarioId } : {}),
+      ...(accessVersion !== undefined ? { accessVersion } : {}),
+      ...(audioDurationSeconds !== undefined ? { audioDurationSeconds } : {}),
+    };
+    const originHeader = c.req.header("origin");
+    const clientIp = getSpendClientIp(c);
+    const guestIpHash = clientIp ? await hashGuestSpendIp(clientIp) : null;
+    const upstreamResponse = await fetch(getMcpjamTranscriptionUrl(), {
+      method: "POST",
+      signal: transcriptionSignal.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authHeader,
+        ...(originHeader ? { Origin: originHeader } : {}),
+        ...guestIpForwardHeaders(guestIpHash),
+      },
+      body: JSON.stringify(transcriptionPayload),
+    });
+
+    const generationId = upstreamResponse.headers.get("X-Generation-Id");
+    const responseText = await upstreamResponse.text();
+    let payload: unknown = null;
+    if (responseText) {
+      try {
+        payload = JSON.parse(responseText);
+      } catch {
+        payload = responseText;
+      }
+    }
+
+    if (!upstreamResponse.ok) {
+      const errorBody = readUpstreamError(
+        payload,
+        `Voice transcription failed with status ${upstreamResponse.status}`,
+      );
+      return c.json(
+        {
+          ...errorBody,
+          status: upstreamResponse.status,
+        },
+        upstreamResponse.status as ContentfulStatusCode,
+      );
+    }
+
+    if (!payload || typeof payload !== "object") {
+      return c.json(
+        { error: "MCPJam returned an invalid voice transcription response" },
+        502,
+      );
+    }
+
+    return c.json({
+      ...(payload as Record<string, unknown>),
+      ...(generationId ? { generationId } : {}),
+    });
+  } catch (error) {
+    if (transcriptionSignal?.timedOut()) {
+      // Returned before the reporter below ever ran, so every transcription
+      // timeout — a failure of OUR proxy — was invisible.
+      reportRouteFailure(
+        "[audio-transcriptions] Voice transcription timed out",
+        error,
+        {
+          source: "mcp.audio-transcriptions.transcribe",
+          hop: "mcpjam_internal",
+        },
+      );
+      return c.json(
+        {
+          error: "Voice transcription timed out. Try a shorter recording.",
+        },
+        504,
+      );
+    }
+    reportRouteFailure(
+      "[audio-transcriptions] Voice transcription request failed",
+      error,
+      {
+        // MCPJam's own transcription proxy. A BYO provider key hitting an
+        // auth or quota wall still classifies `user_config` and stays
+        // quiet — the boundary promotes only unrecognized failures.
+        source: "mcp.audio-transcriptions.transcribe",
+        hop: "mcpjam_internal",
+      },
+    );
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Voice transcription request failed";
+    return c.json({ error: message }, 502);
+  } finally {
+    transcriptionSignal?.cleanup();
+  }
+});
+
+export default audioTranscriptions;

@@ -1,0 +1,220 @@
+import type { ReactNode } from "react";
+import type { UIMessage } from "@ai-sdk/react";
+import type { DynamicToolUIPart, ToolUIPart, UITools } from "ai";
+
+import {
+  type AnyPart,
+  getDataLabel,
+  getToolInfo,
+  isDataPart,
+  isDynamicTool,
+  isToolPart,
+} from "./internal/thread-helpers";
+import {
+  readToolResultMeta,
+  readToolResultServerId,
+} from "./internal/tool-result-utils";
+import { readTraceDisplayText } from "./internal/trace-display";
+import {
+  detectUIType,
+  getUIResourceUri,
+  isWidgetUiType,
+} from "./internal/widget-detection";
+import { TextPart } from "./parts/text-part";
+import { ReasoningPart } from "./parts/reasoning-part";
+import { FilePart } from "./parts/file-part";
+import { SourceUrlPart } from "./parts/source-url-part";
+import { SourceDocumentPart } from "./parts/source-document-part";
+import { JsonPart } from "./parts/json-part";
+import { ToolCallPart } from "./tool-call-part";
+import { WidgetPlaceholder } from "./widget-placeholder";
+import type {
+  JsonRenderer,
+  ReasoningDisplayMode,
+  ToolRenderContext,
+  ToolRenderOverride,
+  ToolServerMap,
+  WidgetPolicy,
+  WidgetRenderInput,
+} from "./types";
+
+function getToolServerId(
+  toolName: string,
+  toolServerMap: ToolServerMap
+): string | undefined {
+  return toolServerMap[toolName];
+}
+
+export interface PartSwitchProps {
+  part: AnyPart;
+  role: UIMessage["role"];
+  toolsMetadata?: Record<string, Record<string, unknown>>;
+  toolServerMap?: ToolServerMap;
+  toolRenderOverrides?: Record<string, ToolRenderOverride>;
+  reasoningDisplayMode?: ReasoningDisplayMode;
+  widgetPolicy?: WidgetPolicy;
+  /**
+   * Host override for tool rendering. When provided, the package delegates the
+   * entire tool block to the host (the inspector returns its interactive
+   * `ToolPart`). When omitted, the static `ToolCallPart` is rendered.
+   */
+  renderTool?: (ctx: ToolRenderContext) => ReactNode;
+  /**
+   * Host override for widget rendering. When omitted, widget-bearing tools
+   * render `WidgetPlaceholder` (per `widgetPolicy`) — the package never mounts
+   * a widget itself.
+   */
+  renderWidget?: (input: WidgetRenderInput) => ReactNode;
+  /**
+   * Host override for displaying a tool's JSON payloads. Ignored when
+   * `renderTool` is supplied — that host owns the whole block, including how
+   * it shows a payload.
+   */
+  renderJson?: JsonRenderer;
+}
+
+export function PartSwitch({
+  part,
+  role,
+  toolsMetadata = {},
+  toolServerMap = {},
+  toolRenderOverrides,
+  reasoningDisplayMode = "inline",
+  widgetPolicy = "placeholder",
+  renderTool,
+  renderWidget,
+  renderJson,
+}: PartSwitchProps) {
+  if (isToolPart(part) || isDynamicTool(part)) {
+    const toolPart = part as ToolUIPart<UITools> | DynamicToolUIPart;
+    const info = getToolInfo(toolPart);
+
+    const renderOverride = info.toolCallId
+      ? toolRenderOverrides?.[info.toolCallId]
+      : undefined;
+    const partToolMeta = toolsMetadata[info.toolName];
+    const streamedToolMeta = readToolResultMeta(info.rawOutput);
+    const effectiveToolMeta =
+      renderOverride?.toolMetadata ?? partToolMeta ?? streamedToolMeta;
+    const uiType = detectUIType(effectiveToolMeta, info.rawOutput);
+    const isWidget = isWidgetUiType(uiType);
+    const serverId =
+      renderOverride?.serverId ??
+      getToolServerId(info.toolName, toolServerMap) ??
+      readToolResultServerId(info.rawOutput);
+
+    const hasOverrideOutput =
+      renderOverride !== undefined &&
+      Object.prototype.hasOwnProperty.call(renderOverride, "toolOutput");
+    const resolvedOutput = hasOverrideOutput
+      ? renderOverride?.toolOutput
+      : info.output ?? info.rawOutput;
+
+    // The readable result the trace adapter attached to the part under
+    // `attached-to-tool`. Read here rather than at the `ToolCallPart` call
+    // below because BOTH branches need it: a host that supplies `renderTool`
+    // replaces our tool block, and forwarding this only to ours would leave
+    // the override showing the raw payload for exactly the sessions this
+    // exists to make readable (BB-198).
+    //
+    // Via the shared reader, so this branch, `ToolCallPart` and the
+    // inspector's own tool card agree on what counts as a readable result —
+    // they previously each had their own answer. See `internal/trace-display`.
+    const resultText = readTraceDisplayText(toolPart);
+
+    const ctx: ToolRenderContext = {
+      toolName: info.toolName,
+      toolCallId: info.toolCallId,
+      toolState: info.toolState,
+      input: info.input,
+      output: resolvedOutput,
+      rawOutput: info.rawOutput,
+      errorText: info.errorText,
+      resultText,
+      uiType,
+      isWidget,
+      serverId: serverId ?? undefined,
+      toolMetadata: effectiveToolMeta,
+      renderOverride,
+    };
+
+    // `renderTool` replaces only the tool block; widget handling still runs
+    // afterward so a host can supply an interactive tool block AND mount a real
+    // widget (the inspector renders its ToolPart + WidgetReplay as siblings).
+    const toolBlock = renderTool ? (
+      renderTool(ctx)
+    ) : (
+      <ToolCallPart
+        toolName={info.toolName}
+        toolState={info.toolState}
+        input={info.input}
+        output={resolvedOutput}
+        errorText={info.errorText}
+        // Forwarded because this card did not read it (BB-198): the adapter
+        // computed it, wrote it onto the part, and the package's own tool
+        // card ignored it — so the Chat tab of an `attached-to-tool` session
+        // showed the raw payload and nothing else, while the modes that emit
+        // a sibling text part read fine. (The inspector's `chat-v2` ToolPart
+        // has rendered the same field since #1583; the gap was here.)
+        resultText={resultText}
+        renderJson={renderJson}
+      />
+    );
+
+    if (!isWidget) return <>{toolBlock}</>;
+
+    let widgetNode: ReactNode = null;
+    if (renderWidget) {
+      widgetNode = renderWidget({
+        ...ctx,
+        resourceUri:
+          renderOverride?.resourceUri ??
+          getUIResourceUri(uiType, effectiveToolMeta) ??
+          undefined,
+        toolsMetadata,
+        toolServerMap,
+      });
+    } else if (widgetPolicy === "placeholder") {
+      widgetNode = <WidgetPlaceholder toolName={info.toolName} />;
+    }
+
+    return (
+      <>
+        {toolBlock}
+        {widgetNode}
+      </>
+    );
+  }
+
+  if (isDataPart(part)) {
+    return (
+      <JsonPart
+        label={getDataLabel(part.type)}
+        value={(part as { data?: unknown }).data}
+      />
+    );
+  }
+
+  switch (part.type) {
+    case "text":
+      return <TextPart text={part.text} role={role} />;
+    case "reasoning":
+      return (
+        <ReasoningPart
+          text={part.text}
+          state={part.state}
+          displayMode={reasoningDisplayMode}
+        />
+      );
+    case "file":
+      return <FilePart part={part} />;
+    case "source-url":
+      return <SourceUrlPart part={part} />;
+    case "source-document":
+      return <SourceDocumentPart part={part} />;
+    case "step-start":
+      return null;
+    default:
+      return <JsonPart label="Unknown part" value={part} />;
+  }
+}

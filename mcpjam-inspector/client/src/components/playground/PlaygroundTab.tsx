@@ -1,0 +1,570 @@
+import { LocalBrowserOnboarding } from "@/components/browser/LocalBrowserOnboarding";
+import { useActiveChatSessionStore } from "@/stores/active-chat-session-store";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useConvexAuth } from "convex/react";
+import { track } from "@/lib/analytics";
+import {
+  PlaygroundStateProvider,
+  usePlaygroundState,
+} from "@/components/ui-playground/hooks/use-playground-state";
+import LoadingScreen from "@/components/LoadingScreen";
+import { HostStyledShell } from "@/components/chat-v2/host-styled-shell";
+import { cn } from "@/lib/utils";
+import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
+import { useHost } from "@/hooks/useClients";
+import { usePreviewedHostId } from "@/hooks/use-previewed-client-id";
+import { useAutoConnectProjectServers } from "@/hooks/useAutoConnectProjectServers";
+import { useProjectServers } from "@/hooks/useViews";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import type { ImperativePanelHandle } from "react-resizable-panels";
+import { CollapsedPanelStrip } from "@/components/ui/collapsed-panel-strip";
+import { PlaygroundRightRail } from "@/components/playground/PlaygroundRightRail";
+import {
+  browserPanelAvailable,
+  PlaygroundBrowserPanel,
+} from "@/components/playground/PlaygroundBrowserPanel";
+import { useLocalBrowserRunning } from "@/hooks/useLocalBrowserRunning";
+import { railShouldOpenForBrowse } from "@/hooks/useOpenBrowserOnBrowsing";
+import { useBrowserComparisonStore } from "@/stores/browser-comparison-store";
+import { useBrowserEngine } from "@/hooks/useBrowserEngine";
+import { useBrowserToolIds } from "@/hooks/useBrowserToolIds";
+import {
+  useBrowserWorkspaceEnabledState,
+  useBrowserEnabledState,
+} from "@/hooks/useComputersEnabled";
+import {
+  MAX_BROWSER_PANEL_SIZE,
+  MIN_BROWSER_PANEL_SIZE,
+  useBrowserWorkspaceStore,
+} from "@/stores/browser-workspace-store";
+import { PlaygroundCenter } from "./PlaygroundCenter";
+import { PlaygroundPreviewedClientSync } from "./PlaygroundPreviewedClientSync";
+import { PlaygroundLeftRail } from "./PlaygroundLeftRail";
+import type { MCPServerConfig } from "@mcpjam/sdk/browser";
+import type { ProjectHostContextDraft } from "@/lib/client-config";
+import type { ServerFormData } from "@/shared/types.js";
+import type {
+  EnsureServersReadyResult,
+  ServerWithName,
+} from "@/hooks/use-app-state";
+import type { PlaygroundServerSelectorProps } from "@/components/ActiveServerSelector";
+import type { EvalChatHandoff } from "@/lib/eval-chat-handoff";
+import {
+  gateMcpToolResultImageRenderingByModelVisibility,
+  type HostConfigDtoV2,
+} from "@/lib/client-config-v2";
+
+interface PlaygroundTabProps {
+  activeProjectId?: string | null;
+  /**
+   * Shared (Convex) project id for the active project, when synced. Used as
+   * the canonical previewed-host storage scope so this tab agrees with the
+   * global host bar and HostsTab. Falls back to `activeProjectId` for
+   * CLI / no-cloud-sync flows.
+   */
+  sharedProjectId?: string | null;
+  serverConfig?: MCPServerConfig;
+  serverName?: string;
+  servers?: Record<string, ServerWithName>;
+  isSignedInWithWorkOs?: boolean;
+  isWorkOsAuthLoading?: boolean;
+  isConvexAuthenticated?: boolean;
+  isProjectProvisioned?: boolean;
+  isClientConfigSyncPending?: boolean;
+  areServersHydrated?: boolean;
+  hasSeenFirstRunOnboarding?: boolean;
+  autoConnectFirstRun?: boolean;
+  isServerSyncing?: boolean;
+  onConnect?: (formData: ServerFormData) => void;
+  onSaveHostContext?: (
+    projectId: string,
+    hostContext: ProjectHostContextDraft,
+  ) => Promise<void>;
+  ensureServersReady?: (
+    serverNames: string[],
+  ) => Promise<EnsureServersReadyResult>;
+  onOnboardingChange?: (isOnboarding: boolean) => void;
+  playgroundServerSelectorProps?: PlaygroundServerSelectorProps;
+  /**
+   * Resolved active host from `useAppState` — the project default unless
+   * the user explicitly previewed a different host. Used as the host
+   * fallback when nothing is selected in the preview picker so the
+   * render gate agrees with what `initialize` is using server-side.
+   * Preview mode (when set) still wins over this fallback.
+   */
+  activeHost?: HostConfigDtoV2 | null;
+  evalChatHandoff?: EvalChatHandoff | null;
+  onEvalChatHandoffConsumed?: (id: string) => void;
+  /** One-shot prompt handed off by first-run server connection. */
+  firstRunPrompt?: string | null;
+  onFirstRunPromptConsumed?: () => void;
+  /** Pauses route-local reconnect work while first-run onboarding owns it. */
+  suspendAutoConnect?: boolean;
+}
+
+/**
+ * Playground tab — replacement for Chat + App Builder.
+ *
+ * Layout mirrors `ChatTabV2`:
+ *   left rail (Sessions/Tools, collapsible)  │  center (chat)  │  right rail (logger, collapsible)
+ *
+ * Rail visibility is local React state — we don't persist it per saved view
+ * in v2. Chat-v2 also keeps these local, and matching that behavior keeps the
+ * mental model simple ("rails are workspace chrome, not part of a view").
+ *
+ * Owns the single `usePlaygroundState()` call for the surface; the
+ * `PlaygroundStateProvider` exposes it to both the left rail's Tools tab and
+ * the center pane.
+ */
+export function PlaygroundTab(props: PlaygroundTabProps) {
+  const themeMode = usePreferencesStore((state) => state.themeMode);
+
+  const hasCapturedViewRef = useRef(false);
+  useEffect(() => {
+    // Wait until auth is settled so the boolean flags reflect the user's
+    // real state, not a pre-hydration false. After that, fire exactly once
+    // per mount.
+    if (hasCapturedViewRef.current) return;
+    if (props.isWorkOsAuthLoading) return;
+    hasCapturedViewRef.current = true;
+    track("playground_tab_viewed", {
+      location: "playground_tab",
+      has_active_project: !!props.activeProjectId,
+      has_shared_project: !!props.sharedProjectId,
+      is_signed_in: !!props.isSignedInWithWorkOs,
+    });
+  }, [
+    props.activeProjectId,
+    props.sharedProjectId,
+    props.isSignedInWithWorkOs,
+    props.isWorkOsAuthLoading,
+  ]);
+
+  // Resolve the previewed host once at the tab root so the host-config-
+  // derived providers (Active MCP Profile, hostStyle, capabilities override,
+  // chatUiOverride) share a single Convex subscription with
+  // PlaygroundPreviewedClientSync below. `useHost` short-circuits on null
+  // hostId, so this is cheap when no host is picked yet.
+  const { isAuthenticated: isConvexAuthenticated } = useConvexAuth();
+  const [previewedHostId] = usePreviewedHostId(
+    props.sharedProjectId ?? props.activeProjectId ?? null,
+  );
+  const { host: previewedHost } = useHost({
+    isAuthenticated: isConvexAuthenticated,
+    hostId: previewedHostId,
+  });
+  const effectiveHostConfig = previewedHostId
+    ? previewedHost?.config ?? null
+    : props.activeHost ?? null;
+  const activeMcpProfile = effectiveHostConfig?.mcpProfile;
+
+  // Host-derived widget runtime values. The preferences store is the
+  // editing surface for ad-hoc previews; once a host is selected its
+  // persisted fields win so "select a host" actually means "operate under
+  // its properties" everywhere.
+  const prefHostStyle = usePreferencesStore((state) => state.hostStyle);
+  const prefHostCapabilitiesOverride = usePreferencesStore(
+    (state) => state.hostCapabilitiesOverride,
+  );
+  const prefChatUiOverride = usePreferencesStore(
+    (state) => state.chatUiOverride,
+  );
+  const hostStyle = effectiveHostConfig?.hostStyle ?? prefHostStyle;
+  const hostCapabilitiesOverride =
+    effectiveHostConfig?.hostCapabilitiesOverride ??
+    prefHostCapabilitiesOverride;
+  const chatUiOverride =
+    effectiveHostConfig?.chatUiOverride ?? prefChatUiOverride;
+
+  // Auto-connect every project server once per session (personal
+  // preference; see `useAutoConnectProjectServers`). The effective host only
+  // supplies the scope key: preview mode wins; otherwise the project default
+  // host, so a client switch re-runs the handshake under the new identity.
+  const { servers: projectServersList } = useProjectServers({
+    projectId: props.sharedProjectId ?? null,
+    isAuthenticated: isConvexAuthenticated,
+  });
+  const projectServerNames = useMemo(
+    () => (projectServersList ?? []).map((s) => s.name),
+    [projectServersList],
+  );
+  useAutoConnectProjectServers({
+    projectId: props.sharedProjectId ?? props.activeProjectId ?? null,
+    hostScopeKey: previewedHostId ?? effectiveHostConfig?.id ?? null,
+    serverNames: projectServerNames,
+    catalogLoaded: projectServersList !== undefined,
+    suspendAutoConnect: props.suspendAutoConnect,
+  });
+
+  const playgroundState = usePlaygroundState({
+    // This IS the Playground screen, so it publishes the snapshot the agent
+    // reads for `playground`. The hook's other caller (the Evals Record
+    // panel's embedded chat) deliberately doesn't — it isn't this screen.
+    snapshotSurfaceId: "playground",
+    activeProjectId: props.activeProjectId,
+    serverConfig: props.serverConfig,
+    serverName: props.serverName,
+    servers: props.servers,
+    isSignedInWithWorkOs: props.isSignedInWithWorkOs,
+    isWorkOsAuthLoading: props.isWorkOsAuthLoading,
+    isConvexAuthenticated: props.isConvexAuthenticated,
+    isProjectProvisioned: props.isProjectProvisioned,
+    isClientConfigSyncPending: props.isClientConfigSyncPending,
+    areServersHydrated: props.areServersHydrated,
+    hasSeenFirstRunOnboarding: props.hasSeenFirstRunOnboarding,
+    autoConnectFirstRun: props.autoConnectFirstRun,
+    isServerSyncing: props.isServerSyncing,
+    onConnect: props.onConnect,
+    onSaveHostContext: props.onSaveHostContext,
+    ensureServersReady: props.ensureServersReady,
+    modelVisibleMcpToolResults: effectiveHostConfig?.modelVisibleMcpToolResults,
+    mcpToolResultImageRendering:
+      gateMcpToolResultImageRenderingByModelVisibility(
+        effectiveHostConfig?.mcpToolResultImageRendering,
+        effectiveHostConfig?.modelVisibleMcpToolResults,
+      ),
+    onOnboardingChange: props.onOnboardingChange,
+    // Playground supports multi-server tool selection — pass the active
+    // multi-server set through so the docked tools pane aggregates across
+    // all of them and execution routes to the right server per tool.
+    selectedServerNames:
+      props.playgroundServerSelectorProps?.selectedMultipleServers,
+  });
+
+  // Rail collapse state — local to the workspace; not persisted per view.
+  // Defaults match the previous flag-on behavior (left rail showing tools,
+  // right rail collapsed).
+  const [isLeftRailVisible, setIsLeftRailVisible] = useState(true);
+  const [isRightRailVisible, setIsRightRailVisible] = useState(false);
+
+  // The browser panel's own layout, which is a STORE rather than state here
+  // because three unrelated things move it: the agent starting to browse, the
+  // person dragging the divider, and the panel's own controls.
+  const restorationPending = useActiveChatSessionStore(
+    (state) => state.restorationPending,
+  );
+  const conversationId = useActiveChatSessionStore((state) => state.sessionId);
+  const restoredHasBrowser = useActiveChatSessionStore(
+    (state) => !!state.restoredSession?.browser,
+  );
+  const comparisonHasBrowser = useBrowserComparisonStore((state) =>
+    Object.values(state.clients).some(
+      (client) => client.workspaceId === conversationId && client.started,
+    ),
+  );
+  const sessionHasBrowser = restoredHasBrowser || comparisonHasBrowser;
+  const browserOpen = useBrowserWorkspaceStore((state) =>
+    conversationId ? !!state.conversations[conversationId]?.open : false,
+  );
+  const browserSize = useBrowserWorkspaceStore((state) => state.size);
+  const browserExpanded = useBrowserWorkspaceStore((state) =>
+    conversationId ? !!state.conversations[conversationId]?.expanded : false,
+  );
+  const setBrowserSize = useBrowserWorkspaceStore((state) => state.setSize);
+  const closeConversationBrowser = useBrowserWorkspaceStore(
+    (state) => state.closeBrowser,
+  );
+  const closeBrowser = useCallback(() => {
+    if (conversationId) closeConversationBrowser(conversationId);
+  }, [conversationId, closeConversationBrowser]);
+  const collapsedRailForBrowser = useBrowserWorkspaceStore(
+    (state) => state.collapsedRailForBrowser,
+  );
+  const noteRailCollapsed = useBrowserWorkspaceStore(
+    (state) => state.noteRailCollapsed,
+  );
+  const browseRevealSeq = useBrowserWorkspaceStore((state) => state.revealSeq);
+  const browseRevealId = useBrowserWorkspaceStore(
+    (state) => state.revealConversationId,
+  );
+
+  const projectScope = props.sharedProjectId ?? props.activeProjectId ?? null;
+  const browsersEnabled = useBrowserEnabledState();
+  const browserEngine = useBrowserEngine(projectScope);
+  const browserToolIds = useBrowserToolIds(
+    effectiveHostConfig,
+    browserEngine.selectedEngine,
+    { projectId: projectScope, hostId: previewedHostId },
+  );
+  // Polled only on the local engine, where the question means something: on
+  // hosted this route describes a machine that is not the one running the
+  // browser.
+  const localBrowserRunning = useLocalBrowserRunning(
+    browserEngine.selectedEngine === "local" && browsersEnabled === true,
+  );
+  // GATED until all three engines meet the release criteria. Off, the browser
+  // is the right rail's Browser tab again — see `BROWSER_WORKSPACE_FLAG`.
+  // TRI-STATE, kept as one: `undefined` is "PostHog has not answered", which
+  // is not the same as "no" and must not close a panel on its own.
+  const workspaceState = useBrowserWorkspaceEnabledState();
+  const canBrowseResolved =
+    workspaceState !== undefined && browsersEnabled !== undefined;
+  const canBrowse =
+    workspaceState === true &&
+    browsersEnabled === true &&
+    browserPanelAvailable({
+      sessionHasBrowser,
+      hostHasBrowser: !!browserToolIds?.includes("browser"),
+      selectedEngine: browserEngine.selectedEngine,
+      isAuthenticated: isConvexAuthenticated,
+      localBrowserRunning,
+    });
+  const showBrowser = browserOpen && canBrowse;
+
+  // The browser takes its room from the Sessions rail, ONCE. Doing it on every
+  // reopen would fight a person who deliberately put the rail back — which is
+  // why the store remembers that it happened rather than this effect keying on
+  // `showBrowser` alone.
+  useEffect(() => {
+    if (!showBrowser || collapsedRailForBrowser) return;
+    noteRailCollapsed();
+    setIsLeftRailVisible(false);
+  }, [showBrowser, collapsedRailForBrowser, noteRailCollapsed]);
+
+  // A host that loses the browser capability while the panel is open leaves it
+  // showing a browser nothing can drive. Closed rather than left inert: the
+  // session behind it is gone either way, and an empty panel holding 60% of
+  // the workspace is worse than the room back.
+  useEffect(() => {
+    // RESOLVED FALSE, not merely falsy. Both flag hooks report `false` while
+    // they are still loading, so a panel opened by `useOpenBrowserOnBrowsing`
+    // during that window was closed again the moment this ran — and the
+    // auto-open effect does not fire a second time when the flags land,
+    // because nothing it watches changed. The browser simply never appeared.
+    if (!restorationPending && browserOpen && canBrowseResolved && !canBrowse)
+      closeBrowser();
+  }, [
+    restorationPending,
+    browserOpen,
+    canBrowse,
+    canBrowseResolved,
+    closeBrowser,
+  ]);
+
+  // Panel handles let us programmatically expand a collapsed rail when the
+  // user clicks the corresponding `CollapsedPanelStrip` peek button.
+  const leftPanelRef = useRef<ImperativePanelHandle | null>(null);
+  const rightPanelRef = useRef<ImperativePanelHandle | null>(null);
+  const pendingRailReveal = useRef(false);
+
+  // The rail starts collapsed. A tab switch inside an unmounted rail is how
+  // "open the browser when they navigate" silently did nothing.
+  useEffect(() => {
+    if (
+      !railShouldOpenForBrowse({
+        conversationId,
+        revealConversationId: browseRevealId,
+        workspacePanelVisible: workspaceState === true,
+      })
+    ) {
+      return;
+    }
+    pendingRailReveal.current = true;
+    setIsRightRailVisible(true);
+  }, [browseRevealSeq, browseRevealId, conversationId, workspaceState]);
+
+  useEffect(() => {
+    if (!isRightRailVisible || !pendingRailReveal.current) return;
+    pendingRailReveal.current = false;
+    rightPanelRef.current?.expand();
+  }, [isRightRailVisible]);
+
+  if (playgroundState.loadingState.kind === "skeleton") {
+    return (
+      <div className="fixed inset-0 z-[100] bg-background">
+        <LoadingScreen message="Setting things up..." />
+      </div>
+    );
+  }
+
+  return (
+    <PlaygroundStateProvider value={playgroundState}>
+      <HostStyledShell
+        hostSnapshot={{
+          hostStyle,
+          hostCapabilitiesOverride,
+          chatUiOverride,
+          mcpProfile: activeMcpProfile,
+        }}
+        // Keep the render gate aligned with the host used for initialize.
+        activeHost={effectiveHostConfig}
+        themeMode={themeMode}
+        className="flex h-full min-h-0 flex-1 flex-col overflow-hidden"
+      >
+        {/* Watches the project's previewed-host id (the named-host
+        dropdown in the global header) and re-snapshots its
+        persisted config into the chip stores when it changes.
+        Renders nothing. */}
+        <LocalBrowserOnboarding
+          projectId={projectScope}
+          authReady={
+            !props.isWorkOsAuthLoading &&
+            (!props.isSignedInWithWorkOs || isConvexAuthenticated)
+          }
+        />
+        <PlaygroundPreviewedClientSync
+          projectId={props.sharedProjectId ?? props.activeProjectId ?? null}
+        />
+        <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
+          {isLeftRailVisible ? (
+            <>
+              <ResizablePanel
+                ref={leftPanelRef}
+                id="playground-left"
+                order={1}
+                defaultSize={22}
+                minSize={15}
+                maxSize={35}
+                collapsible
+                collapsedSize={0}
+                onCollapse={() => setIsLeftRailVisible(false)}
+                className="min-h-0 min-w-0 overflow-hidden"
+              >
+                <PlaygroundLeftRail
+                  previewedHostId={previewedHostId}
+                  // Same project scope PlaygroundMain feeds
+                  // `usePlaygroundEnvironment`, so the rail and
+                  // the composer agree on which environment (if
+                  // any) is active.
+                  projectId={
+                    props.sharedProjectId ?? props.activeProjectId ?? null
+                  }
+                />
+              </ResizablePanel>
+              <ResizableHandle withHandle />
+            </>
+          ) : (
+            <CollapsedPanelStrip
+              side="left"
+              onOpen={() => {
+                setIsLeftRailVisible(true);
+                // The panel only remounts on the next paint; expand
+                // imperatively once it has a ref to honor the click.
+                requestAnimationFrame(() => leftPanelRef.current?.expand());
+              }}
+              tooltipText="Show sessions"
+            />
+          )}
+          <ResizablePanel
+            id="playground-center"
+            order={2}
+            // The floor drops once a browser is beside it. 40% of
+            // the workspace for chat and 60% for the browser do not
+            // both fit, and the panel group answers an impossible
+            // set of constraints by ignoring the sizes it was
+            // given — so the browser opened at whatever was left
+            // rather than at the size it asked for.
+            // ZERO WHILE EXPANDED, and the reason is arithmetic:
+            // the browser panel asks for 100 and the group enforces
+            // every panel's minimum, so a floor of 15 here left the
+            // browser clamped to 85 — with chat hidden by CSS
+            // rather than unmounted, that 15% was an unusable gap
+            // beside a browser that was supposed to fill the space.
+            minSize={browserExpanded ? 0 : showBrowser ? 15 : 40}
+            className={cn(
+              "min-h-0 min-w-0 overflow-hidden",
+              // An expanded browser hides chat rather than
+              // unmounting it: the panel group would otherwise
+              // renumber its children, and a remounted chat pane
+              // loses its scroll position and its composer draft.
+              browserExpanded && showBrowser && "hidden",
+            )}
+          >
+            <PlaygroundCenter
+              activeProjectId={props.activeProjectId}
+              serverName={props.serverName}
+              enableMultiModelChat={true}
+              onSaveHostContext={props.onSaveHostContext}
+              ensureServersReady={props.ensureServersReady}
+              playgroundServerSelectorProps={
+                props.playgroundServerSelectorProps
+              }
+              evalChatHandoff={props.evalChatHandoff}
+              onEvalChatHandoffConsumed={props.onEvalChatHandoffConsumed}
+              firstRunPrompt={props.firstRunPrompt}
+              onFirstRunPromptConsumed={props.onFirstRunPromptConsumed}
+            />
+          </ResizablePanel>
+          {showBrowser ? (
+            <>
+              {/* No handle while expanded: there is nothing on the
+                  other side of it to resize against, and a divider
+                  that moves a hidden panel is a control that does
+                  nothing visible. */}
+              {browserExpanded ? null : <ResizableHandle withHandle />}
+              <ResizablePanel
+                id="playground-browser"
+                order={3}
+                defaultSize={browserExpanded ? 100 : browserSize}
+                minSize={browserExpanded ? 100 : MIN_BROWSER_PANEL_SIZE}
+                maxSize={browserExpanded ? 100 : MAX_BROWSER_PANEL_SIZE}
+                // The store, not the panel group, is the record of
+                // what somebody chose — the group forgets on
+                // unmount, and the browser panel unmounts every
+                // time it is closed.
+                onResize={(size) => {
+                  if (!browserExpanded) setBrowserSize(size);
+                }}
+                className="min-h-0 min-w-0 overflow-hidden"
+              >
+                <PlaygroundBrowserPanel
+                  projectId={projectScope}
+                  hostId={previewedHostId ?? null}
+                  // MOUNTED but not claiming while the panel is off
+                  // screen. Dropping the socket would stop the
+                  // screencast and lose whatever the agent was
+                  // mid-way through; claiming while hidden keeps a
+                  // metered box awake.
+                  visible={showBrowser}
+                  onClose={closeBrowser}
+                />
+              </ResizablePanel>
+            </>
+          ) : null}
+          {isRightRailVisible ? (
+            <>
+              <ResizableHandle withHandle />
+              <ResizablePanel
+                ref={rightPanelRef}
+                id="playground-right"
+                order={4}
+                defaultSize={30}
+                minSize={4}
+                maxSize={50}
+                collapsible
+                collapsedSize={0}
+                onCollapse={() => setIsRightRailVisible(false)}
+                className="min-h-0 overflow-hidden"
+              >
+                <div className="h-full min-h-0 overflow-hidden">
+                  <PlaygroundRightRail
+                    onClose={() => setIsRightRailVisible(false)}
+                    hostConfig={effectiveHostConfig}
+                    hostId={previewedHostId ?? null}
+                    projectId={
+                      props.sharedProjectId ?? props.activeProjectId ?? null
+                    }
+                    isAuthenticated={isConvexAuthenticated}
+                  />
+                </div>
+              </ResizablePanel>
+            </>
+          ) : (
+            <CollapsedPanelStrip
+              side="right"
+              onOpen={() => {
+                setIsRightRailVisible(true);
+                requestAnimationFrame(() => rightPanelRef.current?.expand());
+              }}
+              tooltipText="Show logs"
+            />
+          )}
+        </ResizablePanelGroup>
+      </HostStyledShell>
+    </PlaygroundStateProvider>
+  );
+}

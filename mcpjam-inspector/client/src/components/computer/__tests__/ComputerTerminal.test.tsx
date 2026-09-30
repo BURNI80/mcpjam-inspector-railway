@@ -1,0 +1,266 @@
+import { render, fireEvent, waitFor, act } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  LOCAL_TERMINAL_WS_PATH,
+  type OpenTerminalOptions,
+} from "@/lib/computer-terminal-connection";
+
+// xterm can't render under jsdom, and we don't need it to — stub the bits the
+// component touches and record writes so we can assert stale output is dropped.
+const h = vi.hoisted(() => {
+  const writes: Uint8Array[] = [];
+  class FakeTerminal {
+    cols = 80;
+    rows = 24;
+    options: Record<string, unknown> = {};
+    loadAddon() {}
+    open() {}
+    focus() {}
+    write(bytes: Uint8Array) {
+      writes.push(bytes);
+    }
+    onData() {
+      return { dispose() {} };
+    }
+    onResize() {
+      return { dispose() {} };
+    }
+    onSelectionChange() {
+      return { dispose() {} };
+    }
+    hasSelection() {
+      return false;
+    }
+    getSelection() {
+      return "";
+    }
+    dispose() {}
+  }
+  class FakeFit {
+    fit() {}
+  }
+  const connections: Array<{ opts: OpenTerminalOptions; close: () => void }> =
+    [];
+  return { writes, FakeTerminal, FakeFit, connections };
+});
+
+vi.mock("@xterm/xterm", () => ({ Terminal: h.FakeTerminal }));
+vi.mock("@xterm/addon-fit", () => ({ FitAddon: h.FakeFit }));
+vi.mock("@/lib/computer-terminal-connection", async () => ({
+  // Spread the real module so route CONSTANTS stay real — a test that
+  // hardcoded the path would keep passing if the constant ever moved.
+  ...(await vi.importActual<
+    typeof import("@/lib/computer-terminal-connection")
+  >("@/lib/computer-terminal-connection")),
+  openTerminalConnection: (opts: OpenTerminalOptions) => {
+    const conn = {
+      opts,
+      sendInput: vi.fn(),
+      resize: vi.fn(),
+      ping: vi.fn(),
+      close: vi.fn(),
+    };
+    h.connections.push(conn);
+    return conn;
+  },
+}));
+
+import { ComputerTerminal } from "../ComputerTerminal";
+
+afterEach(() => {
+  h.connections.length = 0;
+  h.writes.length = 0;
+});
+
+describe("ComputerTerminal — reconnect overlay", () => {
+  it("stacks the reconnect overlay above xterm after a disconnect", async () => {
+    const mintToken = vi.fn(async () => "tok");
+    const { getByRole } = render(
+      <ComputerTerminal mintToken={mintToken} themeMode="dark" />
+    );
+
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+    const connection = h.connections[0];
+    act(() => connection.opts.onEvent({ type: "ready", sessionId: "s1" }));
+    act(() => connection.opts.onClose(1006, "dropped"));
+
+    const reconnect = await waitFor(() =>
+      getByRole("button", { name: "Reconnect" })
+    );
+    expect(reconnect.closest(".z-20")).not.toBeNull();
+  });
+});
+
+describe("ComputerTerminal — stale-connection guards", () => {
+  it("ignores output and close callbacks from a superseded connection after reconnect", async () => {
+    const mintToken = vi.fn(async () => "tok");
+    const { getByText, queryByText } = render(
+      <ComputerTerminal mintToken={mintToken} themeMode="dark" />
+    );
+
+    // First connection comes up after the async token mint, then drops.
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+    const first = h.connections[0];
+    act(() => first.opts.onEvent({ type: "ready", sessionId: "s1" }));
+    act(() => first.opts.onClose(1006, "dropped"));
+
+    // The drop surfaces a Reconnect affordance; clicking it opens a 2nd socket.
+    const reconnect = await waitFor(() => getByText("Reconnect"));
+    fireEvent.click(reconnect);
+    await waitFor(() => expect(h.connections).toHaveLength(2));
+    const second = h.connections[1];
+    act(() => second.opts.onEvent({ type: "ready", sessionId: "s2" }));
+    expect(queryByText("Reconnect")).toBeNull(); // connected on the new socket
+
+    // The OLD socket now fires late callbacks. They must be no-ops: no write to
+    // the live terminal, and no flip back to a disconnected/overlay state.
+    const writesBefore = h.writes.length;
+    act(() => {
+      first.opts.onOutput(new Uint8Array([65, 66, 67]));
+      first.opts.onClose(4401, "expired");
+    });
+
+    expect(h.writes.length).toBe(writesBefore);
+    expect(queryByText("Reconnect")).toBeNull();
+
+    // The current connection still drives the terminal.
+    act(() => second.opts.onOutput(new Uint8Array([100])));
+    expect(h.writes.length).toBe(writesBefore + 1);
+  });
+
+  it("drops a token mint that resolves after the component unmounts", async () => {
+    let resolveToken: (value: string) => void = () => {};
+    const mintToken = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveToken = resolve;
+        })
+    );
+    const { unmount } = render(
+      <ComputerTerminal mintToken={mintToken} themeMode="dark" />
+    );
+    await waitFor(() => expect(mintToken).toHaveBeenCalled());
+
+    // Unmount before the token resolves, then resolve: no connection should open.
+    unmount();
+    await act(async () => {
+      resolveToken("late-token");
+      await Promise.resolve();
+    });
+    expect(h.connections).toHaveLength(0);
+  });
+});
+
+describe("ComputerTerminal — wsPath + uploadEnabled", () => {
+  it("threads wsPath through to the connection", async () => {
+    const mintToken = vi.fn(async () => "nonce");
+    render(
+      <ComputerTerminal
+        mintToken={mintToken}
+        themeMode="dark"
+        wsPath={LOCAL_TERMINAL_WS_PATH}
+      />
+    );
+
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+    expect(h.connections[0].opts.path).toBe(LOCAL_TERMINAL_WS_PATH);
+  });
+
+  it("omits path entirely by default (cloud terminal)", async () => {
+    const mintToken = vi.fn(async () => "tok");
+    render(<ComputerTerminal mintToken={mintToken} themeMode="dark" />);
+
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+    expect(h.connections[0].opts.path).toBeUndefined();
+  });
+
+  it("uploadEnabled={false} suppresses the upload and the overlay", async () => {
+    const mintToken = vi.fn(async () => "nonce");
+    const { container } = render(
+      <ComputerTerminal
+        mintToken={mintToken}
+        themeMode="dark"
+        uploadEnabled={false}
+      />
+    );
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+
+    const surface = container.querySelector('[data-testid="terminal-drop-surface"]');
+    expect(surface).not.toBeNull();
+    // A drag that WOULD open the overlay must do nothing: on the local pane the
+    // upload posts to the cloud box's route and would burn the single-use nonce.
+    fireEvent.dragEnter(surface!, { dataTransfer: { types: ["Files"] } });
+    expect(container.textContent?.includes("Drop files to upload")).toBe(false);
+
+    // And the mint must not have been called a second time by a drop.
+    fireEvent.drop(surface!, {
+      dataTransfer: { types: ["Files"], files: [new File(["x"], "a.txt")] },
+    });
+    expect(mintToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("uploadEnabled={false} STILL cancels the browser's file-drop navigation", async () => {
+    // A file dropped on an element with no drop handler makes the browser
+    // navigate to that local file, unloading the inspector and losing the
+    // session. Disabling uploads must not disable that cancellation.
+    const mintToken = vi.fn(async () => "nonce");
+    const { container } = render(
+      <ComputerTerminal
+        mintToken={mintToken}
+        themeMode="dark"
+        uploadEnabled={false}
+      />
+    );
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+    const surface = container.querySelector('[data-testid="terminal-drop-surface"]')!;
+
+    for (const type of ["dragEnter", "dragOver", "drop"] as const) {
+      const event = new Event(type.toLowerCase(), {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "dataTransfer", {
+        value: { types: ["Files"], files: [], dropEffect: "none" },
+      });
+      fireEvent(surface, event);
+      expect(event.defaultPrevented).toBe(true);
+    }
+  });
+
+  it("forces uploads OFF on the local route even if a caller leaves the default", async () => {
+    // The invariant is structural, not caller discipline: the upload posts to
+    // the CLOUD box's route, so on the local pane it would burn the single-use
+    // nonce against the wrong endpoint.
+    const mintToken = vi.fn(async () => "nonce");
+    const { container } = render(
+      <ComputerTerminal
+        mintToken={mintToken}
+        themeMode="dark"
+        wsPath={LOCAL_TERMINAL_WS_PATH}
+      />
+    );
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+
+    const surface = container.querySelector('[data-testid="terminal-drop-surface"]')!;
+    fireEvent.dragEnter(surface, { dataTransfer: { types: ["Files"] } });
+    expect(container.textContent?.includes("Drop files to upload")).toBe(false);
+    fireEvent.drop(surface, {
+      dataTransfer: { types: ["Files"], files: [new File(["x"], "a.txt")] },
+    });
+    expect(mintToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("uploadEnabled defaults to true — the cloud pane keeps its drop overlay", async () => {
+    const mintToken = vi.fn(async () => "tok");
+    const { container } = render(
+      <ComputerTerminal mintToken={mintToken} themeMode="dark" />
+    );
+    await waitFor(() => expect(h.connections).toHaveLength(1));
+
+    const surface = container.querySelector('[data-testid="terminal-drop-surface"]');
+    fireEvent.dragEnter(surface!, { dataTransfer: { types: ["Files"] } });
+    await waitFor(() =>
+      expect(container.textContent?.includes("Drop files to upload")).toBe(true)
+    );
+  });
+});

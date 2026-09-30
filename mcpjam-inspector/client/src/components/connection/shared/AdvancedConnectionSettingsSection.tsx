@@ -1,0 +1,484 @@
+import { useEffect, useId, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
+import { Input } from "@mcpjam/design-system/input";
+import { useMaskedValues } from "../hooks/use-masked-values";
+import { HiddenValuesField } from "./HiddenValuesField";
+import { MaskedValueInput } from "./MaskedValueInput";
+import { StoredKeyRows } from "./StoredKeyRows";
+import { Switch } from "@mcpjam/design-system/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@mcpjam/design-system/select";
+import { JsonEditor } from "@/components/ui/json-editor";
+import { protocolVersionLabel } from "@mcpjam/sdk/browser";
+import type { McpProtocolVersion } from "@/lib/client-config-v2";
+
+/**
+ * Per-server protocol-version pin. Three-state picker:
+ *   - "inherit" → `undefined`, defers to the host default (or SDK default if
+ *     no host default is set).
+ *   - "november" → `"2025-11-25"`, explicit stateful pin.
+ *   - "latest"   → `"2026-07-28"`, the newest stateless preview client.
+ */
+type DropdownValue = "inherit" | "november" | "latest" | McpProtocolVersion;
+
+const MCP_PROTOCOL_OPTIONS: Array<{
+  value: DropdownValue;
+  label: string;
+}> = [
+  { value: "inherit", label: "Client default" },
+  { value: "latest", label: protocolVersionLabel("2026-07-28") },
+  { value: "november", label: protocolVersionLabel("2025-11-25") },
+];
+
+interface HeaderEntry {
+  id?: string;
+  key: string;
+  value: string;
+}
+
+interface AdvancedConnectionSettingsSectionProps {
+  showConfiguration: boolean;
+  onToggle: () => void;
+  requestTimeout: string;
+  onRequestTimeoutChange: (value: string) => void;
+  inheritedRequestTimeout?: number;
+  customHeaders?: HeaderEntry[];
+  onAddHeader?: () => void;
+  onRemoveHeader?: (index: number) => void;
+  onUpdateHeader?: (
+    index: number,
+    field: "key" | "value",
+    value: string,
+  ) => void;
+  hasStoredHeaders?: boolean;
+  isRevealingHeaders?: boolean;
+  headersRevealError?: string | null;
+  onRevealHeaders?: () => void;
+  /** Names of the headers the server has stored, once fetched. Callers exclude
+   * Authorization only when the reveal would route it into the bearer field —
+   * an OAuth/none server keeps its own Authorization header as a row. */
+  storedHeaderKeys?: string[];
+  /** Asks for those names — names only, no values. See EnvVarsSection. */
+  onRequestStoredKeys?: () => void;
+  /** Identity of the server these headers belong to. Re-masks everything when
+   * it changes, so a form that swaps servers without remounting can't carry an
+   * uncovered row onto the next server's values. */
+  maskingKey?: string | null;
+  clientCapabilitiesOverrideEnabled?: boolean;
+  onClientCapabilitiesOverrideEnabledChange?: (enabled: boolean) => void;
+  clientCapabilitiesOverrideText?: string;
+  onClientCapabilitiesOverrideTextChange?: (value: string) => void;
+  clientCapabilitiesOverrideError?: string | null;
+  headersWarning?: string;
+  /**
+   * Visibility for the protocol-version override row. Edit-server contexts
+   * (where the per-server override can be persisted on the project layer)
+   * pass true; the Add Server modal passes true only when a shared project
+   * id exists (the pin rides the form payload and is applied to the project
+   * layer once the hosted server row is created). Defaults to false.
+   * Host-default JSON keeps working regardless — just no per-server
+   * affordance.
+   */
+  showMcpProtocolVersionOverride?: boolean;
+  /**
+   * Current per-server pinned MCP protocol version. `undefined` = inherit
+   * host default (which itself may be `undefined` = SDK default). Bound on
+   * the project server config row at save time, NOT on the server's own
+   * config blob — host-default vs per-server override is a control-plane
+   * edit fanned out to host configs.
+   */
+  mcpProtocolVersionOverride?: McpProtocolVersion;
+  onMcpProtocolVersionOverrideChange?: (
+    version: McpProtocolVersion | undefined,
+  ) => void;
+  /**
+   * Transport kind of this server. MCPJam's current stateless preview
+   * is HTTP-POST only, so for stdio / SSE we filter the dropdown to
+   * stateful versions (factory rejects stateless on those transports —
+   * UI filter is the user-friendly safety net).
+   */
+  transportKind?: "http" | "stdio" | "sse";
+}
+
+export function AdvancedConnectionSettingsSection({
+  showConfiguration,
+  onToggle,
+  requestTimeout,
+  onRequestTimeoutChange,
+  inheritedRequestTimeout = 10000,
+  customHeaders,
+  onAddHeader,
+  onRemoveHeader,
+  onUpdateHeader,
+  hasStoredHeaders = false,
+  isRevealingHeaders = false,
+  headersRevealError,
+  onRevealHeaders,
+  storedHeaderKeys,
+  onRequestStoredKeys,
+  maskingKey,
+  clientCapabilitiesOverrideEnabled = false,
+  onClientCapabilitiesOverrideEnabledChange,
+  clientCapabilitiesOverrideText = "{}",
+  onClientCapabilitiesOverrideTextChange,
+  clientCapabilitiesOverrideError,
+  headersWarning,
+  showMcpProtocolVersionOverride = false,
+  mcpProtocolVersionOverride,
+  onMcpProtocolVersionOverrideChange,
+  transportKind = "http",
+}: AdvancedConnectionSettingsSectionProps) {
+  const showHeaderControls =
+    customHeaders !== undefined &&
+    onAddHeader !== undefined &&
+    onRemoveHeader !== undefined &&
+    onUpdateHeader !== undefined;
+  const headersHidden = hasStoredHeaders && (customHeaders?.length ?? 0) === 0;
+  // Header values carry bearer tokens and API keys, so they mask the same way
+  // env-var values do. See use-masked-values for why the toggle needs no fetch.
+  const maskedHeaders = useMaskedValues(maskingKey);
+  const handleAddHeader = () => {
+    maskedHeaders.markAdded(customHeaders?.length ?? 0);
+    onAddHeader?.();
+  };
+  const handleRemoveHeader = (index: number) => {
+    maskedHeaders.dropAt(index);
+    onRemoveHeader?.(index);
+  };
+  // Same as the env-var editor: expanding "Connection overrides" fetches the
+  // header *names* so the masked rows can say which are set, and nothing more.
+  // `onRevealHeaders` decrypts the values — including a bearer token — so it
+  // stays behind an explicit gesture on a row. See EnvVarsSection.
+  const storedKeys = storedHeaderKeys ?? [];
+  const keysRequested = useRef(false);
+  useEffect(() => {
+    if (!showConfiguration || !headersHidden || !onRequestStoredKeys) return;
+    if (keysRequested.current) return;
+    keysRequested.current = true;
+    onRequestStoredKeys();
+  }, [showConfiguration, headersHidden, onRequestStoredKeys]);
+
+  const [pendingRevealKey, setPendingRevealKey] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pendingRevealKey) return;
+    const index = (customHeaders ?? []).findIndex(
+      (header) => header.key === pendingRevealKey,
+    );
+    if (index === -1) return;
+    maskedHeaders.show(index);
+    setPendingRevealKey(null);
+  }, [customHeaders, maskedHeaders, pendingRevealKey]);
+
+  const handleRevealStoredKey = (key: string) => {
+    setPendingRevealKey(key);
+    onRevealHeaders?.();
+  };
+  const showClientCapabilitiesControls =
+    onClientCapabilitiesOverrideEnabledChange !== undefined &&
+    onClientCapabilitiesOverrideTextChange !== undefined;
+  const showProtocolVersionControl = showMcpProtocolVersionOverride;
+  const canEditProtocolVersion =
+    onMcpProtocolVersionOverrideChange !== undefined;
+  // MCPJam's current RC preview is Streamable HTTP POST only — picking
+  // it on stdio / sse would fail at construction with
+  // `StatelessRequiresHttpTransport`.
+  // Hide it on non-HTTP transports as the user-friendly safety net.
+  const isHttp = transportKind === "http";
+  const visibleOptions = MCP_PROTOCOL_OPTIONS.filter((opt) => {
+    if (opt.value === "latest" && !isHttp) return false;
+    return true;
+  });
+  // Per-instance so several of these forms can be mounted at once without
+  // colliding on a shared element id. Suffixed for the controls whose visible
+  // label sits in a sibling element and so needs an explicit association.
+  const bodyId = useId();
+  const timeoutFieldId = `${bodyId}-timeout`;
+  const protocolLabelId = `${bodyId}-protocol-label`;
+  const protocolTriggerId = `${bodyId}-protocol-trigger`;
+  const selectedDropdownValue: DropdownValue =
+    mcpProtocolVersionOverride === "2026-07-28"
+      ? "latest"
+      : mcpProtocolVersionOverride === "2025-11-25"
+      ? "november"
+      : mcpProtocolVersionOverride ?? "inherit";
+
+  if (
+    !visibleOptions.some((option) => option.value === selectedDropdownValue)
+  ) {
+    visibleOptions.push({
+      value: selectedDropdownValue,
+      label: `Pinned (${selectedDropdownValue})`,
+    });
+  }
+
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={showConfiguration}
+        aria-controls={bodyId}
+        className="group flex cursor-pointer items-center gap-1.5 text-left"
+      >
+        {showConfiguration ? (
+          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground transition-colors group-hover:text-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-colors group-hover:text-foreground" />
+        )}
+        <span className="text-sm font-medium text-foreground">
+          Connection overrides
+        </span>
+      </button>
+
+      {/* Always mounted so `aria-controls` resolves while collapsed. */}
+      <div id={bodyId}>
+        {showConfiguration && (
+          <div className="space-y-4">
+            {/* Timeout */}
+            <div className="space-y-1.5">
+              <label
+                htmlFor={timeoutFieldId}
+                className="text-xs font-medium text-foreground"
+              >
+                Timeout{" "}
+                <span className="font-normal text-muted-foreground">
+                  (ms, default {inheritedRequestTimeout})
+                </span>
+              </label>
+              <Input
+                id={timeoutFieldId}
+                type="number"
+                value={requestTimeout}
+                onChange={(e) => onRequestTimeoutChange(e.target.value)}
+                placeholder={String(inheritedRequestTimeout)}
+                className="h-8 text-xs"
+                min="1000"
+                max="600000"
+                step="1000"
+              />
+            </div>
+
+            {/* Headers. Same row idiom as the env-var editor: monospace
+                key/value pair, muted separator, ghost remove. */}
+            {showHeaderControls && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-medium text-foreground">
+                    Headers
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleAddHeader}
+                    disabled={headersHidden}
+                    className="flex items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Add
+                  </button>
+                </div>
+                {headersHidden && storedKeys.length > 0 && (
+                  <StoredKeyRows
+                    keys={storedKeys}
+                    separator=":"
+                    rowNoun="Header"
+                    isRevealing={isRevealingHeaders}
+                    error={headersRevealError}
+                    onReveal={handleRevealStoredKey}
+                  />
+                )}
+                {/* No names yet — in flight, or the fetch failed and this is
+                    the retry. */}
+                {headersHidden && storedKeys.length === 0 && (
+                  <HiddenValuesField
+                    subject="headers"
+                    isRevealing={isRevealingHeaders}
+                    error={headersRevealError}
+                    onReveal={onRevealHeaders}
+                  />
+                )}
+                {!headersHidden && customHeaders.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAddHeader}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-border py-2.5 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:bg-muted/40 hover:text-foreground"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Add header
+                  </button>
+                )}
+                {customHeaders.length > 0 && (
+                  <div className="space-y-1.5">
+                    {customHeaders.map((header, index) => {
+                      const label = header.key || `header ${index + 1}`;
+                      return (
+                        <div
+                          key={header.id ?? `${header.key}-${index}`}
+                          className="flex items-center gap-1.5"
+                        >
+                          <Input
+                            value={header.key}
+                            onChange={(e) =>
+                              onUpdateHeader(index, "key", e.target.value)
+                            }
+                            placeholder="Header"
+                            spellCheck={false}
+                            autoCapitalize="off"
+                            autoCorrect="off"
+                            aria-label={`Header ${index + 1} name`}
+                            className="h-8 flex-1 font-mono text-xs"
+                          />
+                          <span
+                            aria-hidden="true"
+                            className="shrink-0 select-none text-xs text-muted-foreground/70"
+                          >
+                            :
+                          </span>
+                          <MaskedValueInput
+                            value={header.value}
+                            onChange={(value) =>
+                              onUpdateHeader(index, "value", value)
+                            }
+                            visible={maskedHeaders.isVisible(index)}
+                            onToggleVisibility={() =>
+                              maskedHeaders.toggle(index)
+                            }
+                            inputLabel={`Header ${index + 1} value`}
+                            subject={label}
+                            className="flex-[1.4]"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveHeader(index)}
+                            aria-label={`Remove ${label}`}
+                            className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-destructive"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {headersWarning && (
+                  <p role="alert" className="text-xs text-amber-700">
+                    {headersWarning}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Client capabilities override */}
+            {showClientCapabilitiesControls && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-medium text-foreground">
+                    Capabilities override
+                  </label>
+                  <Switch
+                    checked={clientCapabilitiesOverrideEnabled}
+                    onCheckedChange={onClientCapabilitiesOverrideEnabledChange}
+                    aria-label="Toggle client capabilities override"
+                    className="scale-90"
+                  />
+                </div>
+
+                {clientCapabilitiesOverrideEnabled && (
+                  <>
+                    {clientCapabilitiesOverrideError && (
+                      <div className="rounded border border-destructive/30 bg-destructive/5 px-2.5 py-1.5 text-xs text-destructive">
+                        {clientCapabilitiesOverrideError}
+                      </div>
+                    )}
+                    <div className="overflow-hidden rounded border border-border bg-background">
+                      <JsonEditor
+                        rawContent={clientCapabilitiesOverrideText}
+                        onRawChange={onClientCapabilitiesOverrideTextChange}
+                        mode="edit"
+                        showModeToggle={false}
+                        showToolbar={false}
+                        className="h-[160px]"
+                        height="160px"
+                        wrapLongLinesInEdit={false}
+                        showLineNumbers
+                        showValidationErrorInStatusBar={false}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Per-server MCP protocol-version pin. Tri-state picker:
+                "November" → `"2025-11-25"` (legacy adapter + initialize
+                handshake); "Latest" → `"2026-07-28"` (stateless preview
+                client). The Latest option is hidden on non-HTTP
+                transports because MCPJam's current stateless client
+                requires Streamable HTTP. */}
+            {showProtocolVersionControl && (
+              <div className="space-y-1.5">
+                <label
+                  id={protocolLabelId}
+                  className="text-xs font-medium text-foreground"
+                  title="Latest: MCPJam's newest 2026-07-28 stateless preview over Streamable HTTP POST. November: the 2025-11-25 stateful MCP wire version."
+                >
+                  Protocol version
+                </label>
+                <Select
+                  value={selectedDropdownValue}
+                  disabled={!canEditProtocolVersion}
+                  onValueChange={(next) => {
+                    if (!onMcpProtocolVersionOverrideChange) return;
+                    onMcpProtocolVersionOverrideChange(
+                      next === "latest"
+                        ? "2026-07-28"
+                        : next === "november"
+                        ? "2025-11-25"
+                        : next === "inherit"
+                        ? undefined
+                        : (next as McpProtocolVersion),
+                    );
+                  }}
+                >
+                  {/* Name from the visible label AND the trigger's own text, so
+                      the selected version is still announced — a bare
+                      `aria-label` would replace the value, not add to it. */}
+                  <SelectTrigger
+                    id={protocolTriggerId}
+                    aria-labelledby={`${protocolLabelId} ${protocolTriggerId}`}
+                    className="h-8 w-full text-xs"
+                  >
+                    <SelectValue placeholder="Latest" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {visibleOptions.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {!isHttp && (
+                  <p className="text-xs text-muted-foreground">
+                    Latest requires Streamable HTTP and is unavailable for this
+                    transport.
+                  </p>
+                )}
+                {!canEditProtocolVersion && (
+                  <p className="text-xs text-muted-foreground">
+                    Project configuration must finish loading before setting a
+                    per-server protocol override.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

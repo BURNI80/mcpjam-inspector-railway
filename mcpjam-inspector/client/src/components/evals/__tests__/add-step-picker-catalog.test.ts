@@ -1,0 +1,114 @@
+import { describe, expect, it } from "vitest";
+import {
+  PICKER_CATALOG,
+  catalogPredicateKinds,
+  catalogStepKinds,
+  catalogWidgetCheckKinds,
+  primaryItems,
+  secondaryCount,
+  secondaryItems,
+} from "../add-step-picker-catalog";
+import {
+  isScenarioPredicateKind,
+  PREDICATE_KIND_ORDER,
+} from "@/shared/predicate-kinds";
+import { LIBRARY_OPT_IN_KINDS } from "../suite-scorer-table-model";
+
+const EXPECTED_STEP_KINDS = ["prompt", "interact", "toolCall"] as const;
+
+/**
+ * `widgetToolCalled` is excluded from the picker ON PURPOSE, and the exclusion
+ * costs nothing.
+ *
+ * It does not belong to the group these four sit in ("What's on screen"): it
+ * asserts the widget INVOKED a tool, which is a claim about behavior, not
+ * about what is rendered. And it is not unreachable — the step's own Assertion
+ * dropdown (`WIDGET_ASSERTION_KINDS` in `step-list-editor.tsx`) lists all five
+ * kinds and `WidgetAssertionFields` has its `calledToolName` input, so an
+ * author adds any widget check here and switches it there.
+ *
+ * If it is ever promoted into the picker it needs its own group, not a fifth
+ * row under "What's on screen".
+ */
+const EXPECTED_WIDGET_CHECK_KINDS = [
+  "textVisible",
+  "elementVisible",
+  "elementHidden",
+  "inputValue",
+] as const;
+
+describe("add-step-picker-catalog integrity", () => {
+  it("covers every scenario predicate kind exactly once", () => {
+    // Opt-in kinds are excluded on purpose. `onlyToolsCalled` is turn-scopable,
+    // so it qualifies as a scenario kind, but this picker belongs to /evals —
+    // a surface that still has the matcher's exclusivity option and the
+    // case-level negative flag. Offering it here would put two controls for
+    // one claim on the same page.
+    const expected = PREDICATE_KIND_ORDER.filter(
+      (kind) =>
+        isScenarioPredicateKind(kind) && !LIBRARY_OPT_IN_KINDS.has(kind),
+    );
+    const actual = catalogPredicateKinds();
+
+    expect(actual).toHaveLength(expected.length);
+    expect(new Set(actual).size).toBe(actual.length);
+    expect([...actual].sort()).toEqual([...expected].sort());
+  });
+
+  it("does not reference non-scenario predicate kinds", () => {
+    for (const kind of catalogPredicateKinds()) {
+      expect(isScenarioPredicateKind(kind)).toBe(true);
+    }
+  });
+
+  it("has no duplicate catalog keys", () => {
+    const keys = PICKER_CATALOG.map((e) => e.key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("covers all drive step kinds", () => {
+    expect([...catalogStepKinds()].sort()).toEqual(
+      [...EXPECTED_STEP_KINDS].sort(),
+    );
+  });
+
+  it("covers all inline widget-check kinds (excluding widgetToolCalled)", () => {
+    expect([...catalogWidgetCheckKinds()].sort()).toEqual(
+      [...EXPECTED_WIDGET_CHECK_KINDS].sort(),
+    );
+  });
+
+  it("has 6 primary items and 18 secondary items", () => {
+    expect(primaryItems()).toHaveLength(6);
+    expect(secondaryItems()).toHaveLength(18);
+    expect(secondaryCount()).toBe(18);
+  });
+
+  it("files toolInputMatches with the other tool-call checks", () => {
+    const entry = PICKER_CATALOG.find(
+      (e) =>
+        e.choice.kind === "check" &&
+        e.choice.predicateKind === "toolInputMatches",
+    );
+    expect(entry?.group).toBe("transcriptMore");
+    expect(entry?.tier).toBe("secondary");
+  });
+
+  it("leaves toolResultMatches out, like toolResultContains", () => {
+    // Neither can be scoped to a turn, so neither is a step here; both are
+    // added from the Add drawer as whole-run checks.
+    const kinds = catalogPredicateKinds();
+    expect(kinds).not.toContain("toolResultMatches");
+    expect(kinds).not.toContain("toolResultContains");
+  });
+
+  it("places widgetNoConsoleErrors under viewLifecycle, not transcript", () => {
+    const entry = PICKER_CATALOG.find(
+      (e) =>
+        e.choice.kind === "check" &&
+        e.choice.predicateKind === "widgetNoConsoleErrors",
+    );
+    expect(entry?.group).toBe("viewLifecycle");
+    expect(entry?.tier).toBe("secondary");
+  });
+});

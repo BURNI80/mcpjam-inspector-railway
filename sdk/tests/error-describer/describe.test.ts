@@ -1,0 +1,984 @@
+import { describe, expect, it } from "vitest";
+import {
+  describeAsSlug,
+  mcpjamLimitSlugForMessage,
+  describeError,
+  ERROR_CATALOG,
+  extractNodeErrno,
+  isNormalizedError,
+  originOf,
+  type NormalizedError,
+} from "../../src/error-describer/index.js";
+import { MCPAuthError, MCPError } from "../../src/mcp-client-manager/errors.js";
+import { ProtocolVersionPinUnsupported } from "../../src/mcp-client-manager/managed-mcp-client.js";
+
+function makeError(message: string, extras: Record<string, unknown> = {}) {
+  const err = new Error(message) as Error & Record<string, unknown>;
+  Object.assign(err, extras);
+  return err;
+}
+
+describe("describeError — catalog completeness", () => {
+  it("every catalog entry has the required surface", () => {
+    for (const [slug, entry] of Object.entries(ERROR_CATALOG)) {
+      expect(entry.slug, `entry ${slug}`).toBe(slug);
+      expect(entry.title.length).toBeGreaterThan(0);
+      expect(entry.oneLine.length).toBeGreaterThan(0);
+      expect(entry.likelyCauses.length).toBeGreaterThan(0);
+      expect(entry.nextSteps.length).toBeGreaterThan(0);
+      expect(entry.docsAnchor.startsWith("/troubleshooting/error-codes#")).toBe(
+        true,
+      );
+      expect(["info", "warning", "error"]).toContain(entry.severity);
+    }
+  });
+
+  it("catalog covers >= 18 entries", () => {
+    expect(Object.keys(ERROR_CATALOG).length).toBeGreaterThanOrEqual(18);
+  });
+});
+
+type Case = {
+  name: string;
+  build: () => unknown;
+  expectSlug: string;
+  expectRawCode?: number | string;
+};
+
+const CASES: Case[] = [
+  // JSON-RPC numeric
+  {
+    name: "-32700 parse error",
+    build: () => makeError("Parse error", { code: -32700 }),
+    expectSlug: "jsonrpc/parse_error",
+    expectRawCode: -32700,
+  },
+  {
+    name: "-32600 invalid request",
+    build: () => makeError("Invalid request", { code: -32600 }),
+    expectSlug: "jsonrpc/invalid_request",
+    expectRawCode: -32600,
+  },
+  {
+    name: "-32601 method not found",
+    build: () => makeError("Method not found", { code: -32601 }),
+    expectSlug: "jsonrpc/method_not_found",
+    expectRawCode: -32601,
+  },
+  {
+    name: "-32602 invalid params",
+    build: () => makeError("Invalid params", { code: -32602 }),
+    expectSlug: "jsonrpc/invalid_params",
+    expectRawCode: -32602,
+  },
+  {
+    name: "-32603 internal error",
+    build: () => makeError("Internal error", { code: -32603 }),
+    expectSlug: "jsonrpc/internal_error",
+    expectRawCode: -32603,
+  },
+  {
+    name: "-32603 invalid response format",
+    build: () => makeError("Invalid response format", { code: -32603 }),
+    expectSlug: "jsonrpc/invalid_response_format",
+    expectRawCode: -32603,
+  },
+  {
+    name: "-32603 invalid response format (MCP error wrapping)",
+    build: () =>
+      makeError("MCP error -32603: Invalid response format", { code: -32603 }),
+    expectSlug: "jsonrpc/invalid_response_format",
+    expectRawCode: -32603,
+  },
+  {
+    name: "invalid response format without numeric code",
+    build: () => makeError("Invalid response format"),
+    expectSlug: "jsonrpc/invalid_response_format",
+  },
+  {
+    name: "-32000 connection closed",
+    build: () => makeError("Connection closed", { code: -32000 }),
+    expectSlug: "jsonrpc/connection_closed",
+    expectRawCode: -32000,
+  },
+  {
+    name: "-32001 request timeout",
+    build: () => makeError("Request timed out", { code: -32001 }),
+    expectSlug: "jsonrpc/request_timeout",
+    expectRawCode: -32001,
+  },
+  {
+    name: "-32001 header mismatch (inspector overload)",
+    build: () =>
+      makeError("MCP-Protocol-Version header mismatch", { code: -32001 }),
+    expectSlug: "jsonrpc/header_mismatch",
+    expectRawCode: -32001,
+  },
+  {
+    name: "-32004 unsupported protocol version (pre-renumber draft, transitional)",
+    build: () => makeError("Unsupported protocol version", { code: -32004 }),
+    expectSlug: "jsonrpc/unsupported_protocol_version",
+    expectRawCode: -32004,
+  },
+  // Modern 2026-07-28 protocol codes (post-renumber). These are the final wire
+  // codes; the -32001/-32004 cases above are the transitional pre-renumber path.
+  {
+    name: "-32020 header mismatch (modern, unambiguous)",
+    build: () =>
+      makeError("MCP-Protocol-Version header mismatch", { code: -32020 }),
+    expectSlug: "jsonrpc/header_mismatch",
+    expectRawCode: -32020,
+  },
+  {
+    name: "-32021 missing required client capability (modern)",
+    build: () =>
+      makeError("Missing required client capability: elicitation", {
+        code: -32021,
+      }),
+    expectSlug: "jsonrpc/missing_required_client_capability",
+    expectRawCode: -32021,
+  },
+  {
+    name: "-32022 unsupported protocol version (modern)",
+    build: () => makeError("Unsupported protocol version", { code: -32022 }),
+    expectSlug: "jsonrpc/unsupported_protocol_version",
+    expectRawCode: -32022,
+  },
+  {
+    name: "-32042 url elicitation required",
+    build: () => makeError("URL elicitation required", { code: -32042 }),
+    expectSlug: "jsonrpc/url_elicitation_required",
+    expectRawCode: -32042,
+  },
+  // Node errno
+  {
+    name: "ECONNREFUSED",
+    build: () => makeError("connect ECONNREFUSED 127.0.0.1:9999", { code: "ECONNREFUSED" }),
+    expectSlug: "transport/econnrefused",
+    expectRawCode: "ECONNREFUSED",
+  },
+  {
+    name: "ECONNRESET",
+    build: () => makeError("socket reset", { code: "ECONNRESET" }),
+    expectSlug: "transport/econnreset",
+    expectRawCode: "ECONNRESET",
+  },
+  {
+    name: "ETIMEDOUT",
+    build: () => makeError("connect timeout", { code: "ETIMEDOUT" }),
+    expectSlug: "transport/etimedout",
+    expectRawCode: "ETIMEDOUT",
+  },
+  {
+    name: "ENOTFOUND",
+    build: () => makeError("getaddrinfo ENOTFOUND foo", { code: "ENOTFOUND" }),
+    expectSlug: "transport/enotfound",
+    expectRawCode: "ENOTFOUND",
+  },
+  {
+    name: "EAI_AGAIN",
+    build: () => makeError("Temporary failure", { code: "EAI_AGAIN" }),
+    expectSlug: "transport/eai_again",
+    expectRawCode: "EAI_AGAIN",
+  },
+  {
+    name: "UND_ERR_SOCKET",
+    build: () => makeError("socket terminated", { code: "UND_ERR_SOCKET" }),
+    expectSlug: "transport/undici",
+    expectRawCode: "UND_ERR_SOCKET",
+  },
+  {
+    name: "fetch failed",
+    build: () => new Error("fetch failed"),
+    expectSlug: "transport/fetch_failed",
+  },
+  {
+    name: "socket hang up",
+    build: () => new Error("socket hang up"),
+    expectSlug: "transport/socket_hang_up",
+  },
+  // Auth
+  {
+    name: "HTTP 401 statusCode",
+    build: () => makeError("Unauthorized", { statusCode: 401 }),
+    expectSlug: "auth/http_401",
+    expectRawCode: 401,
+  },
+  {
+    name: "HTTP 403 statusCode",
+    build: () => makeError("Forbidden", { statusCode: 403 }),
+    expectSlug: "auth/http_403",
+    expectRawCode: 403,
+  },
+  {
+    name: "401 in message",
+    build: () => new Error("Server responded HTTP 401"),
+    expectSlug: "auth/http_401",
+  },
+  {
+    name: "OAuth refresh failed message",
+    build: () => new Error("OAuth refresh token failed: invalid_grant"),
+    expectSlug: "auth/oauth_refresh_failed",
+  },
+  {
+    name: "Missing bearer",
+    build: () => new Error("Missing or invalid bearer token"),
+    expectSlug: "auth/missing_bearer",
+  },
+  // MCPJam's own consent wording. Both strings are produced by the client's
+  // OAuth orchestrator and used to land on `internal/unknown`, which rendered
+  // an expected one-click state as "Unknown error".
+  {
+    name: "consent-required wording",
+    build: () =>
+      new Error("OAuth consent is required for asana. Click Reconnect to continue."),
+    expectSlug: "auth/consent_required",
+  },
+  {
+    name: "reauthenticate-to-continue wording",
+    build: () => new Error("Reauthenticate asana to continue."),
+    expectSlug: "auth/consent_required",
+  },
+  // Provider quota / rate limit. A 429 reaches us in three shapes: the AI-SDK
+  // `APICallError` carries `statusCode`, some transports set a numeric `code`,
+  // and the local-BYOK swarm path loses both and leaves only the message.
+  {
+    name: "HTTP 429 statusCode",
+    build: () => makeError("Too Many Requests", { statusCode: 429 }),
+    expectSlug: "provider/quota",
+    expectRawCode: 429,
+  },
+  {
+    name: "HTTP 429 status",
+    build: () => makeError("Rate limited", { status: 429 }),
+    expectSlug: "provider/quota",
+    expectRawCode: 429,
+  },
+  {
+    name: "429 numeric code",
+    build: () => makeError("Rate limited", { code: 429 }),
+    expectSlug: "provider/quota",
+    expectRawCode: 429,
+  },
+  {
+    name: "bare 429 in message",
+    build: () => new Error("429 Too Many Requests"),
+    expectSlug: "provider/quota",
+  },
+  {
+    name: "'too many requests' wording without a status",
+    build: () => new Error("Anthropic returned Too Many Requests"),
+    expectSlug: "provider/quota",
+  },
+  {
+    // What a real throttle looks like: the AI SDK retries three times, then
+    // wraps the last provider error in a `RetryError` that keeps no status.
+    name: "AI SDK RetryError wording",
+    build: () =>
+      new Error("Failed after 3 attempts. Last error: Too Many Requests"),
+    expectSlug: "provider/quota",
+  },
+  {
+    // A port is not a status: with no `code` field to classify on, the bare-429
+    // matcher used to win here and the transport reason never reached the user.
+    name: "port 429 stays a transport error",
+    build: () => new Error("connect ECONNREFUSED 127.0.0.1:429"),
+    expectSlug: "transport/econnrefused",
+  },
+  {
+    name: "MCPJam daily model limit",
+    build: () =>
+      new Error(
+        "Daily MCPJam model limit reached. Use BYOK or try again tomorrow.",
+      ),
+    expectSlug: "provider/mcpjam_limit_daily",
+  },
+  {
+    name: "MCPJam monthly model limit",
+    build: () =>
+      new Error(
+        "Monthly MCPJam model limit reached. Top up or use BYOK to keep chatting.",
+      ),
+    expectSlug: "provider/mcpjam_limit_monthly",
+  },
+  {
+    // Composed copy: the backend's `details` sentence names the renewal
+    // period, and reading /monthly/ from anywhere in the string would file a
+    // daily refusal under the monthly slug.
+    name: "a daily refusal whose detail sentence mentions the month",
+    build: () =>
+      new Error(
+        "Daily MCPJam model limit reached. Use BYOK or try again tomorrow. Your monthly credits are unaffected.",
+      ),
+    expectSlug: "provider/mcpjam_limit_daily",
+  },
+  {
+    // The net for copy that names no period — without it a reworded backend
+    // message drops back to "Unknown error", which is the BB-151 report.
+    name: "an MCPJam limit that names no billing period",
+    build: () =>
+      new Error("This organization has reached its MCPJam model limit."),
+    expectSlug: "provider/mcpjam_limit",
+  },
+  {
+    // The new pattern is anchored on "MCPJam … model limit", so a third
+    // party's own quota wording must not be swallowed by it.
+    name: "a provider's own quota is not the MCPJam allowance",
+    build: () => new Error("OpenAI: You exceeded your current quota"),
+    expectSlug: "internal/unknown",
+  },
+  {
+    // Pins the bound on the gap between "MCPJam" and "model limit". It is
+    // bounded because `[\w\s-]` matches "mcpjam" too: unbounded, a wire
+    // message of repeated "mcpjam" that never reaches the phrase backtracks
+    // quadratically. Real copy puts one space here, so 40 is already generous
+    // — and unbounded, this case would match and return the limit slug.
+    name: "a gap wider than the bound is not the MCPJam allowance",
+    build: () => new Error(`MCPJam ${"detail ".repeat(10)}model limit reached`),
+    expectSlug: "internal/unknown",
+  },
+  // OAuth body
+  {
+    name: "oauth invalid_grant body",
+    build: () => ({ body: { error: "invalid_grant", error_description: "Bad code" } }),
+    expectSlug: "oauth/invalid_grant",
+  },
+  {
+    name: "oauth invalid_client body",
+    build: () => ({ data: { error: "invalid_client" } }),
+    expectSlug: "oauth/invalid_client",
+  },
+  {
+    name: "oauth redirect mismatch body",
+    build: () => ({ error: "redirect_uri_mismatch" }),
+    expectSlug: "oauth/redirect_mismatch",
+  },
+  {
+    // `OAuthResponseError` keeps the RFC 6749 code on `.code`, not on
+    // `error`/`error_code`, so before it was read here the whole error fell to
+    // `internal/unknown` (origin `ambiguous`) no matter what the authorization
+    // server actually said — the 2026-08-24 incident shape.
+    name: "OAuthResponseError code",
+    build: () =>
+      makeError(
+        "Request context not available — authentication or export lookup failed",
+        { name: "OAuthResponseError", code: "invalid_grant" },
+      ),
+    expectSlug: "oauth/invalid_grant",
+  },
+  {
+    name: "OAuthResponseError with an unrecognized code stays unclassified",
+    build: () =>
+      makeError("Something else", {
+        name: "OAuthResponseError",
+        code: "some_vendor_specific_code",
+      }),
+    expectSlug: "internal/unknown",
+  },
+  {
+    name: "oauth well-known unreachable",
+    build: () =>
+      new Error(".well-known/oauth-authorization-server unreachable"),
+    expectSlug: "oauth/well_known_unreachable",
+  },
+  // Inspector sentinels
+  {
+    name: "NotYetSupportedInStateless sentinel",
+    build: () => new Error("NotYetSupportedInStateless: resources/subscribe"),
+    expectSlug: "sdk/not_yet_supported_in_stateless",
+  },
+  {
+    name: "StatelessRequiresHttpTransport sentinel",
+    build: () => new Error("StatelessRequiresHttpTransport"),
+    expectSlug: "sdk/stateless_requires_http",
+  },
+  {
+    name: "PaginatedToolHeaderDiscoveryUnsupported sentinel",
+    build: () => new Error("PaginatedToolHeaderDiscoveryUnsupported"),
+    expectSlug: "sdk/paginated_tool_header_discovery_unsupported",
+  },
+  {
+    // The REAL error, not a hand-written string: this class's message is the
+    // only thing that survives to the describer (name and identity are lost
+    // across the realm boundary), so the two must be tested together or the
+    // pairing can silently break on a reword.
+    name: "ProtocolVersionPinUnsupported sentinel",
+    build: () => new ProtocolVersionPinUnsupported("srv-1", "2026-07-28"),
+    expectSlug: "sdk/protocol_version_pin_unsupported",
+  },
+  // Provider
+  {
+    name: "Anthropic invalid tool name",
+    build: () =>
+      new Error('messages.tools.0: Invalid tool name "weird name with spaces"'),
+    expectSlug: "provider/invalid_tool_name",
+  },
+];
+
+describe("describeError — table-driven", () => {
+  for (const c of CASES) {
+    it(c.name, () => {
+      const out = describeError(c.build());
+      expect(out.slug, JSON.stringify(out)).toBe(c.expectSlug);
+      if (c.expectRawCode !== undefined) {
+        expect(out.rawCode).toBe(c.expectRawCode);
+      }
+      expect(out.title.length).toBeGreaterThan(0);
+      expect(out.rawMessage.length).toBeGreaterThan(0);
+    });
+  }
+});
+
+describe("describeError — invalid response format copy", () => {
+  it("points at the result shape, not a retry", () => {
+    const out = describeError(
+      makeError("Invalid response format", { code: -32603 }),
+    );
+    expect(out.slug).toBe("jsonrpc/invalid_response_format");
+    expect(out.likelyCauses).toHaveLength(1);
+    expect(out.nextSteps.join(" ")).toMatch(/Traffic Log/);
+    expect(out.nextSteps.join(" ").toLowerCase()).not.toMatch(/retry/);
+  });
+
+  it("does not treat a buried phrase as invalid response format", () => {
+    const out = describeError(
+      makeError("Internal error: logs mention invalid response format", {
+        code: -32603,
+      }),
+    );
+    expect(out.slug).toBe("jsonrpc/internal_error");
+  });
+});
+
+describe("describeError — fallback shapes (>= 8)", () => {
+  const cases: Array<[string, unknown, string]> = [
+    ["plain Error", new Error("something exploded"), "internal/unknown"],
+    ["null", null, "internal/unknown"],
+    ["undefined", undefined, "internal/unknown"],
+    ["string thrown", "boom", "internal/unknown"],
+    [
+      "AbortError",
+      Object.assign(new Error("aborted"), { name: "AbortError" }),
+      "internal/unknown",
+    ],
+    [
+      "OAuth body without error_description",
+      { body: { error_description: "Bad" } },
+      "internal/unknown",
+    ],
+    ["MCPAuthError", new MCPAuthError("token expired", 401), "auth/http_401"],
+    [
+      "hosted error envelope",
+      { code: "INTERNAL_ERROR", message: "Hosted failure" },
+      "internal/unknown",
+    ],
+    ["unknown numeric code", makeError("weird", { code: -42 }), "internal/unknown"],
+    ["bare number", 42, "internal/unknown"],
+  ];
+  for (const [name, input, expectSlug] of cases) {
+    it(name, () => {
+      const out: NormalizedError = describeError(input);
+      expect(out.slug).toBe(expectSlug);
+      expect(out).toHaveProperty("rawMessage");
+    });
+  }
+});
+
+describe("describeError — redaction", () => {
+  it("redacts bearer tokens from raw message", () => {
+    const out = describeError(
+      new Error("Authorization: Bearer abcdef.ghi.jkl failed"),
+    );
+    expect(out.rawMessage).not.toContain("abcdef.ghi.jkl");
+    expect(out.rawMessage.toLowerCase()).toContain("redacted");
+  });
+
+  it("leaves the hosted 401's own copy intact and classifies it", () => {
+    // The reported bug, end to end: `bearer-auth.ts` answers a bearer-less
+    // `/api/web/*` request with "Bearer token required", the swarm create flow
+    // renders that message as a bare string, and the describer used to both
+    // rewrite the sentence ("Bearer [REDACTED] required") and fail to
+    // recognize it ("Unknown error"). One assertion per half, on the one input
+    // the user actually saw.
+    const out = describeError(new Error("Bearer token required"));
+    expect(out.rawMessage).toBe("Bearer token required");
+    expect(out.slug).toBe("auth/missing_bearer");
+  });
+
+  it("never throws on truly unusual input", () => {
+    expect(() => describeError({ get code() { throw new Error("nope"); } })).not.toThrow();
+  });
+
+  it("crash-safe fallback still redacts bearer tokens", () => {
+    // Reproduces the leak: classification path throws (via a throwing
+    // `code` getter) AND the error message contains a token. Pre-fix the
+    // catch block returned `error.message` verbatim, so the token leaked
+    // through rawMessage. The fallback must still call redactString.
+    // `Object.defineProperty` is required — `Object.assign({}, {get x(){}})`
+    // invokes the getter at copy time.
+    const err = new Error(
+      "Authorization: Bearer leaky.deadbeef.token failed",
+    );
+    Object.defineProperty(err, "code", {
+      get(): string {
+        throw new Error("classification boom");
+      },
+    });
+    const out = describeError(err);
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.rawMessage).not.toContain("leaky.deadbeef.token");
+    expect(out.rawMessage.toLowerCase()).toContain("redacted");
+  });
+
+  it("describeAsSlug crash-safe fallback also redacts", () => {
+    // Force the fallback by making the error's `message` getter throw
+    // inside the try block, then ensure the catch path still redacts the
+    // serialized form. `String(error)` on a real Error reads .toString,
+    // which by default reads .message — so we override toString too to
+    // give the fallback a non-throwing source carrying the token.
+    const err = new Error("placeholder");
+    Object.defineProperty(err, "message", {
+      get(): string {
+        throw new Error("message boom");
+      },
+    });
+    Object.defineProperty(err, "toString", {
+      value: () => "Authorization: Bearer leaky.value.here failed",
+    });
+    const out = describeAsSlug("provider/auth_error", err);
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.rawMessage).not.toContain("leaky.value.here");
+  });
+});
+
+describe("extractNodeErrno — cause walking", () => {
+  it("returns top-level code when present", () => {
+    expect(extractNodeErrno({ code: "ECONNREFUSED" })).toBe("ECONNREFUSED");
+  });
+
+  it("walks one level of cause (undici fetch wrapping)", () => {
+    // Reproduces Node's typical fetch-failed shape:
+    // TypeError("fetch failed") with cause = SystemError carrying the errno.
+    const cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9999"), {
+      code: "ECONNREFUSED",
+    });
+    const wrapper = Object.assign(new TypeError("fetch failed"), { cause });
+    expect(extractNodeErrno(wrapper)).toBe("ECONNREFUSED");
+  });
+
+  it("walks multiple cause levels but stops at the depth bound", () => {
+    const deep = Object.assign(new Error("inner"), { code: "ENOTFOUND" });
+    const mid = Object.assign(new Error("mid"), { cause: deep });
+    const outer = Object.assign(new TypeError("fetch failed"), { cause: mid });
+    expect(extractNodeErrno(outer)).toBe("ENOTFOUND");
+  });
+
+  it("tolerates a self-referential cause without looping forever", () => {
+    const err: { cause?: unknown } = {};
+    err.cause = err;
+    expect(() => extractNodeErrno(err)).not.toThrow();
+    expect(extractNodeErrno(err)).toBeUndefined();
+  });
+});
+
+describe("describeError — fetch failed surfaces specific transport slug", () => {
+  it("classifies undici-wrapped ECONNREFUSED as transport/econnrefused", () => {
+    // Before the cause-walking fix this fell through to the message-regex
+    // fallback and produced the generic "fetch failed" slug, defeating the
+    // entire point of the transport catalog for the #1 docs-chat query.
+    const cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9999"), {
+      code: "ECONNREFUSED",
+    });
+    const wrapper = Object.assign(new TypeError("fetch failed"), { cause });
+    const out = describeError(wrapper);
+    expect(out.slug).toBe("transport/econnrefused");
+    expect(out.rawCode).toBe("ECONNREFUSED");
+  });
+});
+
+describe("isNormalizedError — shape guard", () => {
+  it("accepts a fully-populated NormalizedError", () => {
+    const out = describeError(new Error("boom"));
+    expect(isNormalizedError(out)).toBe(true);
+  });
+
+  it("rejects a partial payload missing docsAnchor", () => {
+    const partial = {
+      slug: "x",
+      title: "y",
+      oneLine: "z",
+      severity: "error",
+      rawMessage: "",
+      likelyCauses: [],
+      nextSteps: [],
+    };
+    expect(isNormalizedError(partial)).toBe(false);
+  });
+
+  it("rejects null / undefined / non-objects", () => {
+    expect(isNormalizedError(null)).toBe(false);
+    expect(isNormalizedError(undefined)).toBe(false);
+    expect(isNormalizedError("nope")).toBe(false);
+    expect(isNormalizedError(42)).toBe(false);
+  });
+
+  it("rejects shape with array fields swapped for strings", () => {
+    const bad = {
+      slug: "x",
+      title: "y",
+      oneLine: "z",
+      docsAnchor: "/troubleshooting/error-codes#x",
+      severity: "error",
+      rawMessage: "",
+      likelyCauses: "not-an-array",
+      nextSteps: [],
+    };
+    expect(isNormalizedError(bad)).toBe(false);
+  });
+});
+
+describe("describeError — specific message wording wins over generic HTTP 401", () => {
+  it("classifies 'Missing or invalid bearer token' (status 401) as auth/missing_bearer", () => {
+    // Reproduces the hosted-backend path: assertBearerToken throws
+    // WebRouteError(401, UNAUTHORIZED, "Missing or invalid bearer token"),
+    // then mapRuntimeError calls describeError(err). Before the fix the
+    // generic HTTP-status branch fired first and returned auth/http_401
+    // (MCP server re-auth guidance), instead of auth/missing_bearer
+    // (MCPJam CLI / MCPJAM_API_KEY guidance).
+    const err = Object.assign(new Error("Missing or invalid bearer token"), {
+      status: 401,
+      name: "WebRouteError",
+    });
+    const out = describeError(err);
+    expect(out.slug).toBe("auth/missing_bearer");
+  });
+
+  it("preserves MCPAuthError mapping to auth/http_401 (class wins)", () => {
+    // The class-name detector runs BEFORE the message check, so a real
+    // MCPAuthError still maps to auth/http_401 even if its message
+    // happens to contain the word "bearer". This is the desired
+    // behavior — MCPAuthError specifically means MCP-server auth.
+    const err = Object.assign(
+      new Error("Server rejected bearer token"),
+      { name: "MCPAuthError", statusCode: 401 },
+    );
+    const out = describeError(err);
+    expect(out.slug).toBe("auth/http_401");
+  });
+
+  it("falls back to auth/http_401 for a plain 401 without bearer wording", () => {
+    // Generic 401 with no specific message hints should still match
+    // the catch-all status branch.
+    const err = Object.assign(new Error("Unauthorized"), { status: 401 });
+    const out = describeError(err);
+    expect(out.slug).toBe("auth/http_401");
+  });
+});
+
+describe("describeError — a 401 reaching the UI as prose or a wrapped cause", () => {
+  it.each([
+    ["401 Unauthorized"],
+    ["SSE error: Non-200 status code (401)"],
+    ["Error POSTing to endpoint (HTTP 401): Unauthorized"],
+  ])("classifies %j as auth/http_401", (message) => {
+    expect(describeError(new Error(message)).slug).toBe("auth/http_401");
+  });
+
+  it("keeps a port or decimal that merely contains 401 unclassified", () => {
+    expect(
+      describeError(new Error("connect ECONNREFUSED 127.0.0.1:401")).slug
+    ).toBe("transport/econnrefused");
+  });
+
+  it("reads the 401 off an era-negotiation wrapper's inner transport error", () => {
+    // Auto activation probes an UNCONFIGURED connection with `server/discover`;
+    // against an OAuth-gated server the upstream client raises
+    // SdkError(EraNegotiationFailed) carrying the real UnauthorizedError at
+    // `data.cause`, and the toast's docs link pointed at the unknown-error
+    // section because only the wrapper was inspected.
+    const unauthorized = Object.assign(new Error("Unauthorized"), {
+      name: "UnauthorizedError",
+    });
+    const wrapper = Object.assign(new Error("Era negotiation failed"), {
+      name: "SdkError",
+      code: "ERA_NEGOTIATION_FAILED",
+      data: { cause: unauthorized },
+    });
+    expect(describeError(wrapper).slug).toBe("auth/http_401");
+  });
+
+  it("reads the 401 off a plain cause chain", () => {
+    const connect = Object.assign(new Error("Failed to connect"), {
+      cause: Object.assign(new Error("Unauthorized"), { status: 401 }),
+    });
+    expect(describeError(connect).slug).toBe("auth/http_401");
+  });
+});
+
+describe("describeError — unclassified errors surface their raw message", () => {
+  it("promotes rawMessage into oneLine when slug is internal/unknown", () => {
+    // OAuth step errors and other unclassified text used to be hidden
+    // behind the generic "An error occurred that the inspector could
+    // not classify." placeholder, forcing users to expand "Show details"
+    // to see what actually went wrong. The describer now surfaces the
+    // raw message as the visible oneLine for unknown classifications.
+    // Pick a string that doesn't trip any of the resolver's regex
+    // fallbacks (well-known, refresh token, missing bearer, HTTP status,
+    // econn*) so we hit the genuinely-unclassified internal/unknown.
+    const oauthStep = "PKCE code_verifier rejected by authorization server";
+    const out = describeError(new Error(oauthStep));
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.oneLine).toBe(oauthStep);
+    expect(out.rawMessage).toBe(oauthStep);
+    // Title and docs anchor still come from the catalog so the
+    // ErrorCard's structure (icon, "Learn more" link, severity) is
+    // intact.
+    expect(out.title).toBe(ERROR_CATALOG["internal/unknown"].title);
+    expect(out.docsAnchor).toBe(ERROR_CATALOG["internal/unknown"].docsAnchor);
+  });
+
+  it("does NOT clobber catalog oneLine for known slugs", () => {
+    // A classified error keeps the catalog's hand-written one-liner —
+    // the raw message goes in rawMessage / details where it belongs.
+    const out = describeError(
+      Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9999"), {
+        code: "ECONNREFUSED",
+      }),
+    );
+    expect(out.slug).toBe("transport/econnrefused");
+    expect(out.oneLine).toBe(
+      ERROR_CATALOG["transport/econnrefused"].oneLine,
+    );
+    expect(out.rawMessage).toBe("connect ECONNREFUSED 127.0.0.1:9999");
+  });
+
+  it("truncates very long raw messages so layout doesn't break", () => {
+    const long = "x".repeat(500);
+    const out = describeError(new Error(long));
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.oneLine.length).toBeLessThanOrEqual(200);
+    expect(out.oneLine.endsWith("…")).toBe(true);
+    // The full untruncated text is still available in rawMessage.
+    expect(out.rawMessage).toBe(long);
+  });
+
+  it("falls back to the catalog oneLine when rawMessage is empty", () => {
+    const out = describeError(new Error(""));
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.oneLine).toBe(ERROR_CATALOG["internal/unknown"].oneLine);
+  });
+});
+
+describe("describeError — MCPError dispatch table", () => {
+  it("classifies MCPError with AUTH_ERROR code as auth/http_401", () => {
+    // MCPAuthError extends MCPError and supplies code "AUTH_ERROR".
+    const out = describeError(new MCPAuthError("Unauthorized", 401));
+    expect(out.slug).toBe("auth/http_401");
+  });
+
+  it("classifies MCPError with OAUTH_REQUIRED code as auth/http_401", () => {
+    // Defensively covered even though no SDK path currently throws this.
+    // Adding a future throw at this code shouldn't silently fall back to
+    // internal/unknown.
+    const out = describeError(new MCPError("OAuth required", "OAUTH_REQUIRED"));
+    expect(out.slug).toBe("auth/http_401");
+  });
+
+  it("falls through gracefully for unmapped MCPError codes", () => {
+    // Catalog miss → fall through to message-regex or internal/unknown.
+    // No throw, no crash, complete shape returned.
+    const out = describeError(new MCPError("weird thing", "SOMETHING_NEW"));
+    expect(isNormalizedError(out)).toBe(true);
+    expect(out.slug).toBeDefined();
+  });
+});
+
+describe("describeAsSlug — explicit catalog pinning", () => {
+  it("uses the requested slug when the caller has more context than the resolver", () => {
+    // chat-v2's use case: an HTTP 401 from an LLM provider, where the
+    // generic resolver would pick auth/http_401 (MCP server re-auth) but
+    // the route knows it's a provider-key issue.
+    const out = describeAsSlug(
+      "provider/auth_error",
+      Object.assign(new Error("Invalid API key"), { statusCode: 401 }),
+    );
+    expect(out.slug).toBe("provider/auth_error");
+    expect(out.title).toBe(ERROR_CATALOG["provider/auth_error"].title);
+    expect(out.rawMessage).toContain("Invalid API key");
+  });
+
+  it("falls back to internal/unknown for an unknown slug instead of throwing", () => {
+    const out = describeAsSlug("not/in/catalog", new Error("nope"));
+    expect(out.slug).toBe("internal/unknown");
+    expect(out.rawMessage).toContain("nope");
+  });
+
+  it("accepts a missing error argument", () => {
+    const out = describeAsSlug("provider/quota");
+    expect(out.slug).toBe("provider/quota");
+    expect(out.rawMessage).toBe("");
+  });
+});
+
+describe("protocol version pin", () => {
+  it("names the server and the version it refused", () => {
+    const error = new ProtocolVersionPinUnsupported("github-mcp", "2026-07-28");
+    expect(error.message).toContain("github-mcp");
+    expect(error.message).toContain("2026-07-28");
+    // Structured too, so a consumer never has to parse the sentence.
+    expect(error.serverId).toBe("github-mcp");
+    expect(error.protocolVersion).toBe("2026-07-28");
+  });
+
+  it("is the user's configuration, not an MCPJam incident", () => {
+    // The pin is a setting MCPJam chose on the user's behalf, so unlike the
+    // transport symptom this failure used to be reported as, it must never
+    // land in a paging bucket.
+    const normalized = describeError(
+      new ProtocolVersionPinUnsupported("srv", "2026-07-28"),
+    );
+    expect(normalized.slug).toBe("sdk/protocol_version_pin_unsupported");
+    expect(ERROR_CATALOG[normalized.slug]?.origin).toBe("user_config");
+  });
+
+  it("tells the reader how to fix it", () => {
+    const entry = ERROR_CATALOG["sdk/protocol_version_pin_unsupported"];
+    expect(entry?.nextSteps.join(" ")).toMatch(/automatic/i);
+  });
+
+  it("keeps the clause the inspector's chat banner matches on", () => {
+    // Cross-package contract, guarded here because only this side can see the
+    // class. The inspector's chat surfaces receive this failure as a bare
+    // string (the AI SDK collapses a failed response into
+    // `new Error(await response.text())`), so `chat-helpers.ts` recognizes it
+    // by this clause to offer "Change protocol version" instead of a dead-end
+    // "MCPJam is unreachable" banner. Rewording the message means updating
+    // `PROTOCOL_VERSION_PIN_MARKER` in
+    // `mcpjam-inspector/client/src/components/chat-v2/shared/chat-helpers.ts`
+    // and the fixture in `chat-v2/__tests__/protocol-version-pin-banner.test.tsx`.
+    expect(new ProtocolVersionPinUnsupported("srv", "2026-07-28").message).toContain(
+      "which this client is pinned to",
+    );
+  });
+});
+
+describe("a 429 is attributed to the boundary it crossed", () => {
+  // The status arrives identically from an LLM provider and from the MCP
+  // server under test (`StreamableHTTPError` puts it on `.code`), so the
+  // classifier alone cannot tell them apart. Only the caller knows.
+  it("still reads an unqualified 429 as provider quota", () => {
+    const d = describeError(makeError("Too Many Requests", { statusCode: 429 }));
+    expect(d.slug).toBe("provider/quota");
+    expect(originOf(d)).toBe("user_config");
+  });
+
+  it("reads an MCP server's 429 as the SERVER's rate limit", () => {
+    const d = describeError(makeError("Too Many Requests", { statusCode: 429 }), {
+      surface: "mcpServer",
+    });
+    expect(d.slug).toBe("server/rate_limited");
+    // The user's provider settings are not at fault, so the advice must not
+    // send them to a provider dashboard.
+    expect(originOf(d)).toBe("user_server");
+    expect(JSON.stringify(d.nextSteps)).not.toMatch(/provider/i);
+  });
+
+  it("covers the numeric-code shape too — that is how a transport reports it", () => {
+    const d = describeError(makeError("Rate limited", { code: 429 }), {
+      surface: "mcpServer",
+    });
+    expect(d.slug).toBe("server/rate_limited");
+  });
+
+  it("leaves every other slug alone under the same surface", () => {
+    const d = describeError(makeError("Unauthorized", { statusCode: 401 }), {
+      surface: "mcpServer",
+    });
+    expect(d.slug).toBe("auth/http_401");
+  });
+});
+
+it.each(["content", "messages"])(
+  "describes an empty hosted model response (%s) without blaming the server",
+  (noun) => {
+    expect(
+      describeError(
+        `Backend step returned no ${noun} (stream error or empty response)`
+      )
+    ).toMatchObject({
+      slug: "provider/empty_response",
+      origin: "ambiguous",
+      oneLine:
+        "The model returned no response, so the turn could not complete.",
+    });
+  }
+);
+
+
+describe("MCPJam containment refusals", () => {
+  it.each([
+    ["platform_free_budget_exhausted", "provider/mcpjam_platform_budget"],
+    ["account_suspended", "account/suspended"],
+  ])("preserves %s without reporting provider authentication failure", (code, slug) => {
+    expect(describeError({ code, message: "Forbidden" }).slug).toBe(slug);
+    expect(describeError({ data: { code }, message: "Forbidden" }).slug).toBe(slug);
+  });
+});
+
+it.each([
+  ["Daily MCPJam model limit reached.", "provider/mcpjam_limit_daily"],
+  ["Monthly MCPJam model limit reached.", "provider/mcpjam_limit_monthly"],
+  [
+    "MCPJam model limit reached for the moment: 2 in-flight requests hold the remaining credits.",
+    "provider/mcpjam_limit",
+  ],
+  [
+    "This request needs about 30 MCPJam credits; your organization has 23 left today.",
+    "provider/mcpjam_limit_insufficient",
+  ],
+  [
+    "This request needs about 30 MCPJam credits; your organization has 0 left today.",
+    undefined,
+  ],
+  [
+    "This request needs about 20 MCPJam credits; your organization has 23 left today.",
+    undefined,
+  ],
+  ["Provider rate limit", undefined],
+])("classifies MCPJam limit markers: %s", (message, slug) => {
+  expect(mcpjamLimitSlugForMessage(message)).toBe(slug);
+  if (slug) expect(describeError(new Error(message)).slug).toBe(slug);
+});
+
+it("describes the credit exhaustion heading with plan-appropriate recovery guidance", () => {
+  const result = describeError("Out of MCPJam credits.");
+  expect(result.slug).toBe("provider/mcpjam_limit");
+  expect(result.title).toBe("Out of MCPJam credits");
+});
+
+it("classifies the shortfall even when composed copy also says out of credits", () => {
+  expect(
+    describeError(
+      "Out of MCPJam credits. This request needs about 30 MCPJam credits; your organization has 23 left today.",
+    ).slug,
+  ).toBe("provider/mcpjam_limit_insufficient");
+});
+
+it("does not call a partial balance used up when the request needs more than is left", () => {
+  const result = describeError(
+    JSON.stringify({
+      code: "user_rate_limit",
+      limitKind: "total",
+      refusalReason: "insufficient_for_request",
+      creditsRemaining: 23,
+      creditsRequired: 30,
+      error:
+        "Daily MCPJam model limit reached. This request needs about 30 MCPJam credits; your organization has 23 left today.",
+    }),
+  );
+  expect(result.slug).toBe("provider/mcpjam_limit_insufficient");
+  expect(result.title).toBe("Not enough MCPJam credits");
+  expect(result.oneLine).toBe(
+    "This request needs about 30 MCPJam credits; your organization has 23 left today.",
+  );
+});

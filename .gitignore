@@ -1,0 +1,26 @@
+.DS_Store
+worktrees/
+.worktrees/
+.cursor/
+node_modules/
+node_modules
+.mcpjam/skills/
+**/.mcpjam/skills/
+.claude/
+docs/superpowers/
+*.bundled.ts
+mcpjam-inspector/server/utils/browser-harness/*.generated.ts
+cli/dist/
+sdk/dist/
+chat-ui/dist/
+widget-react/dist/
+vitest/dist/
+
+# Local git worktrees checked out under the repo
+worktrees/
+wt-*/
+
+# Playwright MCP scratch output (screenshots, snapshots, console logs)
+.playwright-mcp/
+evaluators/dist/
+

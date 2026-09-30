@@ -1,0 +1,3122 @@
+/**
+ * use-eval-handlers.ts Tests
+ *
+ * Tests for the eval handlers hook, specifically verifying:
+ * - All API calls use authFetch for session authentication
+ * - handleRerun uses authFetch for /api/mcp/evals/run
+ * - handleGenerateTests uses authFetch for /api/mcp/evals/generate-tests
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, act, waitFor } from "@testing-library/react";
+import { toast } from "sonner";
+import {
+  formatEnsureServersReadyError,
+  useEvalHandlers,
+} from "../use-eval-handlers";
+import { API_ENDPOINTS } from "../constants";
+import { createFetchResponse, createDeferred } from "@/test";
+import { setApiContext } from "@/lib/apis/web/context";
+import { usePlanLimitDialogStore } from "@/stores/plan-limit-dialog-store";
+
+/**
+ * Server-side eval-iteration cap rejection, in the shape `postEvalRequest`
+ * re-throws as a ConvexError (`details` carries the billing payload).
+ */
+function createEvalIterationCapResponse(): Response {
+  return createFetchResponse(
+    {
+      message: "Eval iteration limit reached",
+      details: {
+        code: "billing_limit_reached",
+        limitName: "maxEvalIterationsPerMonth",
+        allowedValue: 100,
+        currentValue: 100,
+        resetsAt: 1_760_000_000_000,
+        windowKind: "month",
+      },
+    },
+    402,
+  );
+}
+
+const { hostedModeRef } = vi.hoisted(() => ({
+  hostedModeRef: { value: false },
+}));
+vi.mock("@/lib/config", () => ({
+  get HOSTED_MODE() {
+    return hostedModeRef.value;
+  },
+}));
+vi.mock("@/lib/apis/mode-client", () => ({
+  isHostedMode: () => hostedModeRef.value,
+  ensureLocalMode: vi.fn(),
+  runByMode: (handlers: { local: () => unknown; hosted: () => unknown }) =>
+    hostedModeRef.value ? handlers.hosted() : handlers.local(),
+}));
+
+// Mock authFetch
+const mockAuthFetch = vi.fn();
+vi.mock("@/lib/session-token", () => ({
+  authFetch: (...args: unknown[]) => mockAuthFetch(...args),
+}));
+
+// Mock useAuth
+const mockGetAccessToken = vi.fn();
+vi.mock("@workos-inc/authkit-react", () => ({
+  useAuth: () => ({
+    getAccessToken: mockGetAccessToken,
+  }),
+}));
+
+// Mock useConvex
+const mockConvexQuery = vi.fn();
+const mockConvexMutation = vi.fn();
+vi.mock("convex/react", () => ({
+  useConvex: () => ({
+    query: mockConvexQuery,
+    mutation: mockConvexMutation,
+  }),
+  useMutation: () => vi.fn().mockResolvedValue(undefined),
+  useAction: () => vi.fn().mockResolvedValue(undefined),
+  // Pulled in via useProjectEnvironments (env-suite fan-out labels); the
+  // handlers under test never enable that query (flag off ⇒ "skip").
+  useQuery: () => undefined,
+  useConvexAuth: () => ({ isAuthenticated: false, isLoading: false }),
+}));
+
+// Mock useAiProviderKeys (mutable for replay-without-keys coverage)
+const mockProviderGetToken = vi.fn().mockReturnValue("mock-api-key");
+const mockProviderHasToken = vi.fn().mockReturnValue(true);
+vi.mock("@/hooks/use-ai-provider-keys", () => ({
+  useAiProviderKeys: () => ({
+    getToken: mockProviderGetToken,
+    hasToken: mockProviderHasToken,
+  }),
+}));
+
+// Mock the typed analytics wrapper
+vi.mock("@/lib/analytics", () => ({
+  track: vi.fn(),
+}));
+
+// Mock toast
+vi.mock("sonner", () => ({
+  toast: {
+    loading: vi.fn().mockReturnValue("toast-id"),
+    success: vi.fn().mockReturnValue("toast-id"),
+    error: vi.fn(),
+    warning: vi.fn(),
+    info: vi.fn(),
+    dismiss: vi.fn(),
+  },
+}));
+
+const mockNavigateApp = vi.fn();
+vi.mock("@/lib/app-navigation", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/app-navigation")>(
+    "@/lib/app-navigation",
+  );
+  return {
+    ...actual,
+    navigateApp: (...args: unknown[]) => mockNavigateApp(...args),
+  };
+});
+
+const mockIsHostedMode = {
+  mockReturnValue(next: boolean) {
+    hostedModeRef.value = next;
+  },
+};
+
+// Mock isMCPJamProvidedModel
+vi.mock("@/shared/types", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/shared/types")>();
+  return {
+    ...actual,
+    isMCPJamProvidedModel: vi.fn().mockReturnValue(false),
+  };
+});
+
+vi.mock("@/hooks/use-available-models", () => ({
+  useAvailableModels: () => ({ availableModels: [] }),
+}));
+
+describe("useEvalHandlers", () => {
+  const mockMutations = {
+    deleteSuiteMutation: vi.fn(),
+    duplicateSuiteMutation: vi.fn(),
+    cancelRunMutation: vi.fn(),
+    deleteRunMutation: vi.fn(),
+    createTestCaseMutation: vi.fn(),
+    deleteTestCaseMutation: vi.fn(),
+    duplicateTestCaseMutation: vi.fn(),
+  };
+
+  const defaultProps = {
+    mutations: mockMutations as any,
+    selectedSuiteEntry: null,
+    selectedSuiteId: null,
+    selectedTestId: null,
+    projectId: "project-1",
+    connectedServerNames: new Set(["server-1"]),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsHostedMode.mockReturnValue(false);
+    mockProviderGetToken.mockReturnValue("mock-api-key");
+    mockProviderHasToken.mockReturnValue(true);
+    usePlanLimitDialogStore.setState({ isOpen: false, limit: null });
+    // Pinned so the wall tests can assert the exact toast the handler dismisses.
+    vi.mocked(toast.success).mockReturnValue("toast-id");
+
+    // Default mock implementations
+    mockGetAccessToken.mockResolvedValue("mock-access-token");
+
+    // Mock convex query to return test cases with models
+    mockConvexQuery.mockResolvedValue([
+      {
+        _id: "test-case-1",
+        title: "Test Case 1",
+        query: "Test query",
+        runs: 1,
+        models: [{ model: "gpt-4", provider: "openai" }],
+        expectedToolCalls: [],
+      },
+    ]);
+
+    // Default authFetch mock - return successful response
+    mockAuthFetch.mockResolvedValue(createFetchResponse({ success: true }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setApiContext(null);
+  });
+
+  describe("handleRerun", () => {
+    it.each([false, true])("opens the first accepted environment run without waiting for siblings (later failure: %s)", async (failSibling) => {
+      const slow = createDeferred<Response>();
+      mockAuthFetch.mockImplementation(async (_path: string, init: { body: string }) => {
+        const body = JSON.parse(init.body);
+        return body.environmentId === "env-slow"
+          ? slow.promise
+          : createFetchResponse({ success: true, runId: "accepted-run" });
+      });
+      const { result } = renderHook(() => useEvalHandlers({ ...defaultProps, evalsNavigationContext: "evaluate" }));
+      let launch!: Promise<unknown>;
+      act(() => {
+        launch = result.current.handleRerun({
+          _id: "suite-multi", name: "Suite", environment: { servers: [] },
+          environmentIds: ["env-slow", "env-fast"],
+        } as any);
+      });
+      await waitFor(() => expect(mockNavigateApp).toHaveBeenCalledTimes(1));
+      expect(mockNavigateApp).toHaveBeenCalledWith("/evaluate/suite/suite-multi/runs/accepted-run");
+      expect(result.current.rerunningSuiteId).toBe("suite-multi");
+      await act(async () => {
+        slow.resolve(failSibling
+          ? createFetchResponse({ message: "Client unavailable" }, 500)
+          : createFetchResponse({ success: true, runId: "later-run" }));
+        await launch;
+      });
+      expect(mockNavigateApp).toHaveBeenCalledTimes(1);
+      expect(result.current.rerunningSuiteId).toBeNull();
+      if (failSibling) expect(toast.error).toHaveBeenCalled();
+    });
+
+    it.each([false, true])("forwards temporary-environment launch intent (%s) without server overrides", async (ephemeralEnvironment) => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun({ _id: "suite-123", name: "Suite", environment: { servers: [] }, environmentIds: ["temporary-env"] } as any, { ephemeralEnvironment });
+      });
+      const request = mockAuthFetch.mock.calls.find(([url]) => url === "/api/mcp/evals/run");
+      expect(request).toBeDefined();
+      const body = JSON.parse(request![1]!.body as string);
+      expect(body.environmentId).toBe("temporary-env");
+      expect(body.ephemeralEnvironment).toBe(ephemeralEnvironment ? true : undefined);
+      expect(body.serverIds ?? []).toEqual([]);
+    });
+
+    it("runs a model-less case on an environment suite even when the suite default model is not in the picker", async () => {
+      mockConvexQuery.mockResolvedValue([
+        { _id: "case-1", title: "Case 1", query: "Q", runs: 1, models: [], expectedToolCalls: [] },
+      ]);
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-env", name: "Suite", environment: { servers: [] },
+          environmentIds: ["env-1"], defaultConfig: { modelId: "claude-sonnet-4-5" },
+        } as any);
+      });
+      expect(toast.error).not.toHaveBeenCalled();
+      const request = mockAuthFetch.mock.calls.find(([url]) => url === "/api/mcp/evals/run");
+      const body = JSON.parse(request![1]!.body as string);
+      expect(body.environmentId).toBe("env-1");
+      expect(body.tests).toHaveLength(1);
+      expect(body.tests[0]).toMatchObject({ testCaseId: "case-1", model: "environment-model", provider: "none" });
+    });
+
+    it("still refuses a model-less case on a non-environment suite whose default model is not in the picker", async () => {
+      mockConvexQuery.mockResolvedValue([
+        { _id: "case-1", title: "Case 1", query: "Q", runs: 1, models: [], expectedToolCalls: [] },
+      ]);
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-flat", name: "Suite", environment: { servers: ["server-1"] },
+          defaultConfig: { modelId: "claude-sonnet-4-5" },
+        } as any);
+      });
+      expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("Suite default model claude-sonnet-4-5 is not available"));
+      expect(mockAuthFetch.mock.calls.some(([url]) => url === "/api/mcp/evals/run")).toBe(false);
+    });
+
+    it("returns scoped run ids without navigating away from the editor", async () => {
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ success: true, runId: "run-scoped" }));
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      let output: unknown;
+      await act(async () => {
+        output = await result.current.handleRerun({ _id: "suite-123", name: "Suite", environment: { servers: ["server-1"] } } as any, { stayOnPage: true });
+      });
+      expect(output).toMatchObject({ status: "started", runIds: ["run-scoped"] });
+      expect(mockNavigateApp).not.toHaveBeenCalled();
+    });
+
+    it.each(["no servers", "disconnected", "no cases"])(
+      "rejects scoped launches with %s instead of reporting success",
+      async (reason) => {
+        if (reason === "no cases") mockConvexQuery.mockResolvedValue([]);
+        const { result } = renderHook(() => useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: reason === "disconnected" ? new Set<string>() : defaultProps.connectedServerNames,
+        }));
+        await act(async () => {
+          await expect(result.current.handleRerun({
+            _id: "suite-123", name: "Prepared",
+            environment: { servers: reason === "no servers" ? [] : ["server-1"] },
+          } as any, { stayOnPage: true })).rejects.toThrow();
+        });
+        expect(mockAuthFetch).not.toHaveBeenCalled();
+        expect(mockNavigateApp).not.toHaveBeenCalled();
+      },
+    );
+
+    it("keeps a prepared launch idempotent across run retries", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      const suite = { _id: "suite-123", name: "Prepared", environment: { servers: ["server-1"] } };
+      await act(async () => {
+        await result.current.handleRerun(suite as any, { idempotencyKey: "prepared:review:1" });
+        await result.current.handleRerun(suite as any, { idempotencyKey: "prepared:review:1" });
+      });
+      const requests = mockAuthFetch.mock.calls.filter(([url]) => url === "/api/mcp/evals/run");
+      expect(requests).toHaveLength(2);
+      expect(JSON.parse(requests[0][1]!.body as string).idempotencyKey).toBe("prepared:review:1:default");
+      expect(JSON.parse(requests[1][1]!.body as string).idempotencyKey).toBe("prepared:review:1:default");
+    });
+
+    it("uses authFetch for /api/mcp/evals/run endpoint", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "Test Suite",
+        description: "A test suite",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      // Verify authFetch was called with the correct endpoint
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/mcp/evals/run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+
+    it("narrows a run to one case, and says so in the body", async () => {
+      // "Run test" on the case page. It must be a SUITE run — the judge is
+      // keyed by `suiteRunId` at every surface, so a quick run can never
+      // answer "did it accomplish the goal?" — narrowed to the one case so the
+      // suite's total cap does not reject it.
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      const mockSuite = {
+        _id: "suite-run-one",
+        name: "Suite",
+        environment: { servers: ["server-1"] },
+      };
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any, {
+          caseIds: ["test-case-1"],
+        });
+      });
+      const body = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(body.caseIds).toEqual(["test-case-1"]);
+      expect(body.suiteRerun).toBe(true);
+      // The payload must agree with what the server will execute; sending the
+      // whole suite alongside a narrowing `caseIds` makes the run's own record
+      // disagree with its results.
+      expect(body.tests).toHaveLength(1);
+    });
+
+    it("stays on the page for a case-scoped launch", async () => {
+      // The page that launched the run is what asks the judge to grade it when
+      // it finishes. Navigating to run detail unmounts that, so Run test would
+      // never deliver the judged result it promises.
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ runId: "run-1" }));
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        const ids = await result.current.handleRerun(
+          {
+            _id: "suite-stay",
+            name: "Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          { caseIds: ["test-case-1"] },
+        );
+        expect(ids).toEqual({
+          status: "started",
+          runIds: ["run-1"],
+          failedCount: 0,
+        });
+      });
+      expect(mockNavigateApp).not.toHaveBeenCalled();
+    });
+
+    it("still navigates for an ordinary full rerun", async () => {
+      // The control for the test above: navigation is conditional on the API
+      // returning a run id, so without one the assertion would pass for the
+      // wrong reason.
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ runId: "run-1" }));
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-nav",
+          name: "Suite",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+      expect(mockNavigateApp).toHaveBeenCalled();
+    });
+
+    it("refuses a case id that is not in the suite, before launching", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun(
+          {
+            _id: "suite-x",
+            name: "Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          { caseIds: ["not-in-this-suite"] },
+        );
+      });
+      // Launching with an empty narrowed list would run the WHOLE suite on the
+      // server, which is the opposite of what the caller asked for.
+      expect(mockAuthFetch).not.toHaveBeenCalled();
+    });
+
+    it("sends no caseIds for an ordinary full rerun", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-all",
+          name: "Suite",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+      const body = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(body.caseIds).toBeUndefined();
+    });
+
+    it("passes correct request body to authFetch", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      const mockSuite = {
+        _id: "suite-456",
+        name: "My Suite",
+        description: "Suite description",
+        environment: { servers: ["server-1"] },
+        defaultPassCriteria: { minimumPassRate: 80 },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      // Verify the request body
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      expect(requestBody).toMatchObject({
+        suiteId: "suite-456",
+        suiteName: "My Suite",
+        suiteDescription: "Suite description",
+        serverIds: ["server-1"],
+      });
+    });
+
+    it("sends iterationOverride as a top-level field while tests[].runs preserves the persisted default", async () => {
+      mockConvexQuery.mockResolvedValueOnce([
+        {
+          _id: "tc-1",
+          title: "case A",
+          query: "q a",
+          runs: 1,
+          models: [{ model: "gpt-4", provider: "openai" }],
+          expectedToolCalls: [],
+        },
+        {
+          _id: "tc-2",
+          title: "case B",
+          query: "q b",
+          runs: 7, // persisted default — must NOT be replaced by the override
+          models: [{ model: "gpt-4", provider: "openai" }],
+          expectedToolCalls: [],
+        },
+      ]);
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun(
+          {
+            _id: "suite-iter",
+            name: "Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          { iterationOverride: 4 },
+        );
+      });
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody.tests.length).toBe(2);
+      expect(requestBody.tests[0].runs).toBe(1);
+      expect(requestBody.tests[1].runs).toBe(7);
+      expect(requestBody.iterationOverride).toBe(4);
+    });
+
+    it("forwards matchOptionsOverride and iterationOverride together to runEvals", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun(
+          {
+            _id: "suite-overrides",
+            name: "Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            iterationOverride: 4,
+            matchOptionsOverride: { argumentMatching: "exact" },
+          },
+        );
+      });
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody.iterationOverride).toBe(4);
+      expect(requestBody.matchOptionsOverride).toEqual({
+        argumentMatching: "exact",
+      });
+    });
+
+    it("forwards matchOptionsOverride without iterationOverride", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun(
+          {
+            _id: "suite-match-only",
+            name: "Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            matchOptionsOverride: {
+              argumentMatching: "exact",
+              allowExtraToolCalls: false,
+            },
+          },
+        );
+      });
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody.matchOptionsOverride).toEqual({
+        argumentMatching: "exact",
+        allowExtraToolCalls: false,
+      });
+      expect(requestBody.iterationOverride).toBeUndefined();
+    });
+
+    it("includes steps and expectedOutput when rerunning saved cases", async () => {
+      mockConvexQuery.mockResolvedValueOnce([
+        {
+          _id: "test-case-1",
+          title: "Multi-turn case",
+          query: "Legacy query",
+          runs: 1,
+          models: [{ model: "gpt-4", provider: "openai" }],
+          expectedToolCalls: [],
+          expectedOutput: "Summarize the tool result",
+          promptTurns: [
+            {
+              id: "turn-1",
+              prompt: "First prompt",
+              expectedToolCalls: [],
+            },
+            {
+              id: "turn-2",
+              prompt: "Follow up",
+              expectedToolCalls: [
+                { toolName: "search", arguments: { q: "status" } },
+              ],
+            },
+          ],
+        },
+      ]);
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-456",
+          name: "My Suite",
+          description: "Suite description",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      // The rerun payload now speaks the unified `steps` model: each legacy
+      // turn's prompt becomes a `prompt` step (in order), and a turn's expected
+      // tool calls become `assert` steps. The Convex mutation rejects
+      // `promptTurns`, so it must not appear on the payload.
+      expect(requestBody.tests[0]).toMatchObject({
+        expectedOutput: "Summarize the tool result",
+        steps: [
+          expect.objectContaining({ kind: "prompt", prompt: "First prompt" }),
+          expect.objectContaining({ kind: "prompt", prompt: "Follow up" }),
+          expect.objectContaining({
+            kind: "assert",
+            assertion: expect.objectContaining({
+              type: "toolCalledWith",
+              toolName: "search",
+            }),
+          }),
+        ],
+      });
+      expect(requestBody.tests[0].promptTurns).toBeUndefined();
+    });
+
+    it("does not use regular fetch for /api/mcp/evals/run", async () => {
+      const originalFetch = global.fetch;
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy;
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "Test Suite",
+        description: "A test suite",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      // Verify regular fetch was NOT called with the evals/run endpoint
+      const fetchCalls = fetchSpy.mock.calls.filter(
+        (call) =>
+          typeof call[0] === "string" && call[0].includes("/api/mcp/evals/run"),
+      );
+      expect(fetchCalls).toHaveLength(0);
+
+      global.fetch = originalFetch;
+    });
+
+    it("uses the live rerun path after auto-connect restores missing servers", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+          latestRunBySuiteId: new Map<string, any>([
+            [
+              "suite-123",
+              {
+                _id: "run-source",
+                hasServerReplayConfig: true,
+                passCriteria: { minimumPassRate: 92 },
+              },
+            ],
+          ]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-123",
+          name: "Auto-connect Suite",
+          description: "Retries live execution after reconnect",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"]);
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/mcp/evals/run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+
+    it("normalizes hosted suite server ids before auto-connect and rerun", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+      setApiContext({
+        projectId: "project-1",
+        isAuthenticated: true,
+        serverIdsByName: { "server-1": "srv-1" },
+      });
+
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-123",
+          name: "Hosted id-backed suite",
+          description: "Stored with project server ids",
+          environment: { servers: ["srv-1"] },
+        } as any);
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"]);
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody).toMatchObject({
+        projectId: "project-1",
+        serverIds: ["srv-1"],
+        serverNames: ["server-1"],
+        storageServerIds: ["server-1"],
+      });
+    });
+
+    it("replays the latest run when auto-connect fails and replay is available", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: [],
+        missingServerNames: [],
+        failedServerNames: ["server-1"],
+        reauthServerNames: [],
+      });
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-123",
+          runId: "run-replay",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+          latestRunBySuiteId: new Map<string, any>([
+            [
+              "suite-123",
+              {
+                _id: "run-source",
+                hasServerReplayConfig: true,
+                passCriteria: { minimumPassRate: 92 },
+              },
+            ],
+          ]),
+        }),
+      );
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "CI Suite",
+        description: "A CI-backed suite",
+        source: "ui",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"]);
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/web/evals/replay-run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody).toMatchObject({
+        runId: "run-source",
+        passCriteria: { minimumPassRate: 92 },
+      });
+      expect(requestBody.convexAuthToken).toBeUndefined();
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evals/runs/suite/suite-123/runs/run-replay?insights=1",
+      );
+    });
+
+    it("replays the latest run when suite server metadata is empty but replay is available", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-123",
+          runId: "run-replay",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          latestRunBySuiteId: new Map<string, any>([
+            [
+              "suite-123",
+              {
+                _id: "run-source",
+                hasServerReplayConfig: true,
+                passCriteria: { minimumPassRate: 92 },
+              },
+            ],
+          ]),
+        }),
+      );
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "SDK Suite",
+        description: "A replayable suite without stored server names",
+        source: "sdk",
+        environment: { servers: [] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/web/evals/replay-run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody).toMatchObject({
+        runId: "run-source",
+        passCriteria: { minimumPassRate: 92 },
+      });
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evals/runs/suite/suite-123/runs/run-replay?insights=1",
+      );
+    });
+
+    it.each([{ servers: [] }, { servers: ["server-1"] }])("refuses whole-suite replay for a scoped launch with unavailable servers $servers", async ({ servers }) => {
+      const { result } = renderHook(() => useEvalHandlers({
+        ...defaultProps,
+        connectedServerNames: new Set(),
+        ensureServersReady: vi.fn().mockResolvedValue({
+          readyServerNames: [], missingServerNames: [], failedServerNames: ["server-1"], reauthServerNames: [],
+        }),
+        latestRunBySuiteId: new Map([["suite-123", { _id: "old-run", hasServerReplayConfig: true } as any]]),
+      }));
+      await act(async () => {
+        const ids = await result.current.handleRerun({
+          _id: "suite-123", name: "Suite", environment: { servers },
+        } as any, { caseIds: ["test-case-1"], iterationOverride: 1 });
+        expect(ids).toBeUndefined();
+      });
+      expect(mockAuthFetch).not.toHaveBeenCalled();
+      expect(toast.error).toHaveBeenCalled();
+    });
+
+    it("returns only accepted run ids after a partial case fanout", async () => {
+      mockAuthFetch.mockImplementation(async (_path, init) => {
+        const body = JSON.parse(init.body);
+        return body.namedHostId === "host-a"
+          ? createFetchResponse({ runId: "new-a" })
+          : createFetchResponse({ message: "Unavailable" }, 500);
+      });
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+      await act(async () => {
+        const ids = await result.current.handleRerun({
+          _id: "suite-partial", name: "Suite", environment: { servers: ["server-1"] },
+          hostAttachments: ["host-a", "host-b"].map(namedHostId => ({
+            namedHostId, hostName: namedHostId, enabledOptionalServerIds: [], resolvedServerNames: ["server-1"],
+          })),
+        } as any, { caseIds: ["test-case-1"] });
+        expect(ids).toMatchObject({
+          status: "partially_started",
+          runIds: ["new-a"],
+        });
+      });
+      expect(mockNavigateApp).not.toHaveBeenCalled();
+    });
+
+    it("uses the normal rerun path when live servers are connected", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+      setApiContext({
+        projectId: "ws-123",
+        isAuthenticated: true,
+        serverIdsByName: { "server-1": "srv-1" },
+      });
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-123",
+          runId: "run-rerun",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          selectedSuiteId: "suite-123",
+          connectedServerNames: new Set(["server-1"]),
+          latestRunBySuiteId: new Map<string, any>([
+            [
+              "suite-123",
+              {
+                _id: "run-source",
+                hasServerReplayConfig: true,
+                passCriteria: { minimumPassRate: 92 },
+              },
+            ],
+          ]),
+        }),
+      );
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "Hosted SDK Suite",
+        description: "A replay-eligible suite with live connectivity",
+        source: "ui",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/web/evals/run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+
+    it("uses the clicked suite latest run instead of the selected suite entry", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-clicked",
+          runId: "run-replay",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          selectedSuiteEntry: {
+            suite: { _id: "suite-selected" },
+            latestRun: {
+              _id: "run-selected",
+              hasServerReplayConfig: false,
+            },
+            recentRuns: [],
+          } as any,
+          latestRunBySuiteId: new Map<string, any>([
+            [
+              "suite-clicked",
+              {
+                _id: "run-clicked",
+                hasServerReplayConfig: true,
+              },
+            ],
+          ]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-clicked",
+          name: "Clicked Suite",
+          description: "Uses clicked latest run",
+          environment: { servers: [] },
+        } as any);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody.runId).toBe("run-clicked");
+    });
+
+    it("includes a shared runGroupId on every POST when the rerun fans out to multiple hosts", async () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(["server-a", "server-b"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-multi-host",
+          name: "Multi-host suite",
+          environment: { servers: ["server-a", "server-b"] },
+          hostAttachments: [
+            {
+              namedHostId: "host-mcpjam",
+              hostName: "MCPJam",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-a"],
+            },
+            {
+              namedHostId: "host-claude",
+              hostName: "Claude",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-b"],
+            },
+          ],
+        } as any);
+      });
+
+      // One POST per host attachment.
+      const evalRunCalls = mockAuthFetch.mock.calls.filter(
+        (call) => call[0] === "/api/mcp/evals/run",
+      );
+      expect(evalRunCalls).toHaveLength(2);
+
+      const bodies = evalRunCalls.map((call) =>
+        JSON.parse(call[1].body as string),
+      );
+      const groupIds = bodies.map((b) => b.runGroupId);
+
+      // Each body carries the same non-empty runGroupId.
+      expect(groupIds[0]).toBeTypeOf("string");
+      expect(groupIds[0]).not.toEqual("");
+      expect(groupIds[0]).toEqual(groupIds[1]);
+
+      // namedHostId is still wired through per host (sanity check that the
+      // fan-out itself works — group id rides on top of it, not replacing).
+      const hostIds = bodies.map((b) => b.namedHostId).sort();
+      expect(hostIds).toEqual(["host-claude", "host-mcpjam"]);
+    });
+
+    it("omits runGroupId on a single-host rerun so the row stays ungrouped", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-single",
+          name: "Single host suite",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody.runGroupId).toBeUndefined();
+    });
+
+    it("omits runGroupId on a single-attachment rerun (one host attached)", async () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(["server-a"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-one-attachment",
+          name: "Single attachment suite",
+          environment: { servers: ["server-a"] },
+          hostAttachments: [
+            {
+              namedHostId: "host-mcpjam",
+              hostName: "MCPJam",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-a"],
+            },
+          ],
+        } as any);
+      });
+
+      const evalRunCalls = mockAuthFetch.mock.calls.filter(
+        (call) => call[0] === "/api/mcp/evals/run",
+      );
+      expect(evalRunCalls).toHaveLength(1);
+      const body = JSON.parse(evalRunCalls[0][1].body as string);
+      expect(body.runGroupId).toBeUndefined();
+      expect(body.namedHostId).toBe("host-mcpjam");
+    });
+
+    it("surfaces an environment-drift 409 carried by a LATER plan when every plan fails", async () => {
+      // The drift 409 is the retry-able, actionable cause. Selecting
+      // `failures[0]` blind buries it behind whichever generic error happened
+      // to come first — the partial-failure branch already prefers the
+      // conflict, and the all-failed branch must agree.
+      mockAuthFetch.mockImplementation(
+        async (path: string, init: { body: string }) => {
+          if (path !== "/api/mcp/evals/run") {
+            return createFetchResponse({ success: true });
+          }
+          const body = JSON.parse(init.body);
+          return body.namedHostId === "host-claude"
+            ? createFetchResponse(
+                {
+                  code: "ENVIRONMENT_REVISION_CONFLICT",
+                  message: "Environment changed — retry the run.",
+                },
+                409,
+              )
+            : createFetchResponse({ message: "Upstream exploded" }, 500);
+        },
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(["server-a", "server-b"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-all-failed",
+          name: "Multi-host suite",
+          environment: { servers: ["server-a", "server-b"] },
+          hostAttachments: [
+            // Ordered so the conflict is NOT `failures[0]`.
+            {
+              namedHostId: "host-mcpjam",
+              hostName: "MCPJam",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-a"],
+            },
+            {
+              namedHostId: "host-claude",
+              hostName: "Claude",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-b"],
+            },
+          ],
+        } as any);
+      });
+
+      const errorToasts = vi
+        .mocked(toast.error)
+        .mock.calls.map((call) => String(call[0]))
+        .join(" | ");
+      expect(errorToasts).toContain("Environment changed — retry the run.");
+      expect(errorToasts).not.toContain("Upstream exploded");
+    });
+
+    it("opens the upgrade wall and clears the optimistic toast when the server rejects the launch on the eval-iteration cap", async () => {
+      // The "Run started successfully!" toast fires before the request
+      // resolves, so leaving it up alongside the wall would claim the run is
+      // on its way.
+      mockAuthFetch.mockResolvedValue(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({ ...defaultProps, organizationId: "org-1" }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-123",
+          name: "Test Suite",
+          description: "A test suite",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      expect(usePlanLimitDialogStore.getState().limit).toMatchObject({
+        kind: "evalIterations",
+        organizationId: "org-1",
+        used: 100,
+        allowed: 100,
+        windowKind: "month",
+      });
+      expect(toast.dismiss).toHaveBeenCalledWith("toast-id");
+      expect(toast.error).not.toHaveBeenCalled();
+    });
+
+    it("opens the wall for a cap the replay endpoint nests under details", async () => {
+      // Replay is a hand-rolled fetch, not `postEvalRequest`: it threw the
+      // response body whole, so the parser read the outer envelope and the
+      // cap looked like an ordinary failure.
+      mockIsHostedMode.mockReturnValue(true);
+      mockAuthFetch.mockResolvedValue(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          organizationId: "org-1",
+          connectedServerNames: new Set(),
+          ensureServersReady: vi.fn().mockResolvedValue({
+            readyServerNames: [],
+            missingServerNames: [],
+            failedServerNames: ["server-1"],
+            reauthServerNames: [],
+          }),
+          latestRunBySuiteId: new Map<string, any>([
+            ["suite-123", { _id: "run-source", hasServerReplayConfig: true }],
+          ]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-123",
+          name: "CI Suite",
+          source: "ui",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/web/evals/replay-run",
+        expect.anything(),
+      );
+      expect(usePlanLimitDialogStore.getState().limit).toMatchObject({
+        kind: "evalIterations",
+        organizationId: "org-1",
+        allowed: 100,
+      });
+      expect(toast.error).not.toHaveBeenCalled();
+    });
+
+    it("opens the wall when a cap rejects one target and the rest launch", async () => {
+      // Partial fan-out failures only toast — they never throw — so this
+      // branch has to reach the wall itself.
+      mockAuthFetch.mockImplementation(
+        async (path: string, init: { body: string }) => {
+          if (path !== "/api/mcp/evals/run") {
+            return createFetchResponse({ success: true });
+          }
+          const body = JSON.parse(init.body);
+          return body.namedHostId === "host-claude"
+            ? createEvalIterationCapResponse()
+            : createFetchResponse({ success: true });
+        },
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          organizationId: "org-1",
+          connectedServerNames: new Set(["server-a", "server-b"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-partial",
+          name: "Multi-host suite",
+          environment: { servers: ["server-a", "server-b"] },
+          hostAttachments: [
+            {
+              namedHostId: "host-mcpjam",
+              hostName: "MCPJam",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-a"],
+            },
+            {
+              namedHostId: "host-claude",
+              hostName: "Claude",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-b"],
+            },
+          ],
+        } as any);
+      });
+
+      expect(usePlanLimitDialogStore.getState().limit).toMatchObject({
+        kind: "evalIterations",
+        organizationId: "org-1",
+      });
+      // The count toast survives: it says how many DID launch, which the wall
+      // does not.
+      const errorToasts = vi
+        .mocked(toast.error)
+        .mock.calls.map((call) => String(call[0]))
+        .join(" | ");
+      expect(errorToasts).toContain("1 of 2");
+      // "Starting 2 runs…" fired before anything was accepted, so it can't
+      // stay up next to a wall saying one was refused.
+      expect(toast.dismiss).toHaveBeenCalledWith("toast-id");
+    });
+
+    it("finds a cap carried by a later plan when every plan fails", async () => {
+      // Ordered so the cap is neither `failures[0]` nor the drift 409 the
+      // all-failed branch used to prefer.
+      mockAuthFetch.mockImplementation(
+        async (path: string, init: { body: string }) => {
+          if (path !== "/api/mcp/evals/run") {
+            return createFetchResponse({ success: true });
+          }
+          const body = JSON.parse(init.body);
+          return body.namedHostId === "host-claude"
+            ? createEvalIterationCapResponse()
+            : createFetchResponse({ message: "Upstream exploded" }, 500);
+        },
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          organizationId: "org-1",
+          connectedServerNames: new Set(["server-a", "server-b"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-all-capped",
+          name: "Multi-host suite",
+          environment: { servers: ["server-a", "server-b"] },
+          hostAttachments: [
+            {
+              namedHostId: "host-mcpjam",
+              hostName: "MCPJam",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-a"],
+            },
+            {
+              namedHostId: "host-claude",
+              hostName: "Claude",
+              enabledOptionalServerIds: [],
+              resolvedServerNames: ["server-b"],
+            },
+          ],
+        } as any);
+      });
+
+      expect(usePlanLimitDialogStore.getState().limit).toMatchObject({
+        kind: "evalIterations",
+        organizationId: "org-1",
+      });
+      expect(toast.error).not.toHaveBeenCalled();
+    });
+
+    it("keeps the fallback toast when there is no organization to upgrade", async () => {
+      mockAuthFetch.mockResolvedValue(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRerun({
+          _id: "suite-123",
+          name: "Test Suite",
+          description: "A test suite",
+          environment: { servers: ["server-1"] },
+        } as any);
+      });
+
+      expect(usePlanLimitDialogStore.getState().isOpen).toBe(false);
+      expect(toast.error).toHaveBeenCalled();
+      expect(toast.dismiss).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("handleRunTestCase", () => {
+    describe("environment suites", () => {
+      const envSuite = {
+        _id: "suite-env",
+        name: "Env suite",
+        description: "",
+        // Legacy fields an environment suite does not read.
+        environment: { servers: ["legacy-server"] },
+        environmentIds: ["env-a", "env-b"],
+      } as any;
+      const envCase = {
+        _id: "case-env",
+        title: "Refund",
+        query: "Refund it",
+        models: [{ provider: "anthropic", model: "claude-legacy" }],
+        expectedToolCalls: [],
+      } as any;
+      const environments = [
+        {
+          environmentId: "env-a",
+          projectId: "project-1",
+          hostId: "host-1",
+          serverAttachmentId: "group-1",
+          revision: 1,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        {
+          environmentId: "env-b",
+          projectId: "project-1",
+          hostId: "host-1",
+          modelId: "openai/gpt-5",
+          serverAttachmentId: "group-1",
+          revision: 4,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+      ];
+
+      function mockEnvironmentBackend(
+        caps = { environmentQuickRuns: true, environmentDerivation: true },
+      ) {
+        mockConvexQuery.mockImplementation(
+          async (name: string, args: { environmentId?: string } = {}) => {
+            if (name === "projectEnvironments:listEnvironments") {
+              return environments;
+            }
+            if (name === "hosts:listHosts") {
+              return [{ hostId: "host-1", modelId: "openai/gpt-5-mini" }];
+            }
+            if (name === "projectEnvironments:getCapabilities") return caps;
+            if (name === "projectEnvironments:resolveEnvironmentForLaunch") {
+              return launchServers[args.environmentId ?? ""] ?? null;
+            }
+            return null;
+          },
+        );
+      }
+
+      // What each environment's eval resolution connects.
+      const launchServers: Record<string, unknown> = {
+        "env-a": { servers: [{ serverId: "srv-1", name: "billing" }] },
+        "env-b": {
+          servers: [
+            { serverId: "srv-1", name: "billing" },
+            { serverId: "srv-2", name: "crm" },
+          ],
+        },
+      };
+
+      function readiness(
+        overrides: Partial<{
+          readyServerNames: string[];
+          missingServerNames: string[];
+          failedServerNames: string[];
+          reauthServerNames: string[];
+        }> = {},
+      ) {
+        return {
+          readyServerNames: [],
+          missingServerNames: [],
+          failedServerNames: [],
+          reauthServerNames: [],
+          ...overrides,
+        };
+      }
+
+      function sentBodies() {
+        return mockAuthFetch.mock.calls.map(
+          (call) => JSON.parse((call[1] as { body: string }).body) as any,
+        );
+      }
+
+      it("runs the case on every environment of the suite, with no legacy servers or models", async () => {
+        mockEnvironmentBackend();
+        mockAuthFetch.mockResolvedValue(
+          createFetchResponse({ success: true, iteration: { _id: "iter" } }),
+        );
+        const ensureServersReady = vi
+          .fn()
+          .mockResolvedValue(
+            readiness({ readyServerNames: ["billing", "crm"] }),
+          );
+        const { result } = renderHook(() =>
+          useEvalHandlers({
+            ...defaultProps,
+            connectedServerNames: new Set(),
+            ensureServersReady,
+          }),
+        );
+        await act(async () => {
+          await result.current.handleRunTestCase(envSuite, envCase);
+        });
+        // Local mode: the environments' servers (never the suite's legacy
+        // list) are connected once, before anything runs.
+        expect(ensureServersReady).toHaveBeenCalledOnce();
+        expect(ensureServersReady).toHaveBeenCalledWith(["billing", "crm"]);
+        expect(mockConvexQuery).toHaveBeenCalledWith(
+          "projectEnvironments:resolveEnvironmentForLaunch",
+          {
+            projectId: "project-1",
+            environmentId: "env-a",
+            serverSource: "environment_only",
+          },
+        );
+        expect(ensureServersReady.mock.invocationCallOrder[0]!).toBeLessThan(
+          mockAuthFetch.mock.invocationCallOrder[0]!,
+        );
+        const bodies = sentBodies();
+        expect(bodies.map((body) => body.environmentId).sort()).toEqual([
+          "env-a",
+          "env-b",
+        ]);
+        for (const body of bodies) {
+          expect(body.serverIds).toEqual([]);
+          expect(body.model).toBeUndefined();
+          expect(body.provider).toBeUndefined();
+          expect(body.namedHostId).toBeUndefined();
+          expect(body.idempotencyKey).toMatch(/^quick-run:/);
+        }
+        expect(mockConvexMutation).not.toHaveBeenCalled();
+      });
+
+      it("derives an environment for a picked model none of them runs, before running", async () => {
+        mockEnvironmentBackend();
+        mockConvexMutation.mockResolvedValue([
+          { environment: { environmentId: "env-derived" } },
+        ]);
+        mockAuthFetch.mockResolvedValue(
+          createFetchResponse({ success: true, iteration: { _id: "iter" } }),
+        );
+        const { result } = renderHook(() => useEvalHandlers(defaultProps));
+        await act(async () => {
+          await result.current.handleRunTestCase(envSuite, envCase, {
+            selectedModel: "anthropic/claude-sonnet-4",
+          });
+        });
+        expect(mockConvexMutation).toHaveBeenCalledWith(
+          "projectEnvironments:deriveEnvironments",
+          {
+            projectId: "project-1",
+            derivations: [
+              {
+                sourceEnvironmentId: "env-a",
+                expectedRevision: 1,
+                overrides: {
+                  hostId: "host-1",
+                  modelId: "claude-sonnet-4",
+                  serverAttachmentId: "group-1",
+                },
+              },
+            ],
+          },
+        );
+        expect(sentBodies().map((body) => body.environmentId)).toEqual([
+          "env-derived",
+        ]);
+      });
+
+      it("reuses the environment that inherits the picked model from its client", async () => {
+        mockEnvironmentBackend();
+        mockAuthFetch.mockResolvedValue(
+          createFetchResponse({ success: true, iteration: { _id: "iter" } }),
+        );
+        const { result } = renderHook(() => useEvalHandlers(defaultProps));
+        await act(async () => {
+          // An editor value is `provider/<catalog id>`; the hosted catalog id
+          // is itself prefixed.
+          await result.current.handleRunTestCase(envSuite, envCase, {
+            selectedModel: "openai/openai/gpt-5-mini",
+          });
+        });
+        expect(mockConvexMutation).not.toHaveBeenCalled();
+        expect(sentBodies().map((body) => body.environmentId)).toEqual([
+          "env-a",
+        ]);
+      });
+
+      it("refuses, running nothing, on a deployment without environment quick runs", async () => {
+        mockEnvironmentBackend({
+          environmentQuickRuns: false,
+          environmentDerivation: false,
+        });
+        const { result } = renderHook(() => useEvalHandlers(defaultProps));
+        await act(async () => {
+          await result.current.handleRunTestCase(envSuite, envCase);
+        });
+        expect(mockAuthFetch).not.toHaveBeenCalled();
+        expect(toast.error).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /can't run a single case of an environment suite/,
+          ),
+        );
+      });
+
+      it("runs nothing locally when an environment server fails to connect", async () => {
+        mockEnvironmentBackend();
+        const ensureServersReady = vi.fn().mockResolvedValue(
+          readiness({
+            readyServerNames: ["billing"],
+            failedServerNames: ["crm"],
+          }),
+        );
+        const { result } = renderHook(() =>
+          useEvalHandlers({ ...defaultProps, ensureServersReady }),
+        );
+        let runResult: unknown;
+        await act(async () => {
+          runResult = await result.current.handleRunTestCase(envSuite, envCase);
+        });
+        expect(runResult).toBeNull();
+        expect(mockAuthFetch).not.toHaveBeenCalled();
+        expect(toast.error).toHaveBeenCalledWith(
+          "We couldn't connect to crm. Try again to run this test case.",
+        );
+      });
+
+      it("leaves a server the local pool does not know to the run route", async () => {
+        mockEnvironmentBackend();
+        mockAuthFetch.mockResolvedValue(
+          createFetchResponse({ success: true, iteration: { _id: "iter" } }),
+        );
+        // A plugin-contributed server is not in the browser's catalog; saying
+        // it is "no longer in this project" would be false.
+        const ensureServersReady = vi.fn().mockResolvedValue(
+          readiness({
+            readyServerNames: ["billing"],
+            missingServerNames: ["crm"],
+          }),
+        );
+        const { result } = renderHook(() =>
+          useEvalHandlers({ ...defaultProps, ensureServersReady }),
+        );
+        await act(async () => {
+          await result.current.handleRunTestCase(envSuite, envCase);
+        });
+        expect(ensureServersReady).toHaveBeenCalledOnce();
+        expect(sentBodies()).toHaveLength(2);
+      });
+
+      it("connects nothing in the browser in hosted mode", async () => {
+        mockIsHostedMode.mockReturnValue(true);
+        setApiContext({ projectId: "project-1", isAuthenticated: true });
+        mockEnvironmentBackend();
+        mockAuthFetch.mockResolvedValue(
+          createFetchResponse({ success: true, iteration: { _id: "iter" } }),
+        );
+        const ensureServersReady = vi.fn();
+        const { result } = renderHook(() =>
+          useEvalHandlers({ ...defaultProps, ensureServersReady }),
+        );
+        await act(async () => {
+          await result.current.handleRunTestCase(envSuite, envCase);
+        });
+        expect(ensureServersReady).not.toHaveBeenCalled();
+        expect(mockConvexQuery).not.toHaveBeenCalledWith(
+          "projectEnvironments:resolveEnvironmentForLaunch",
+          expect.anything(),
+        );
+        expect(mockAuthFetch.mock.calls.map((call) => call[0])).toEqual([
+          "/api/web/evals/run-test-case",
+          "/api/web/evals/run-test-case",
+        ]);
+      });
+    });
+
+    it("declines widget probes with an accurate message instead of the model guard", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      let runResult: unknown;
+      await act(async () => {
+        runResult = await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Probe suite",
+            description: "Suite with a probe",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-probe-1",
+            title: "Render check",
+            models: [],
+            // Model-free render check: a single `toolCall` step (no `prompt`
+            // step) makes `isModelFree(steps)` true.
+            steps: [
+              {
+                id: "call-1",
+                kind: "toolCall",
+                serverId: "srv-1",
+                serverName: "server-1",
+                toolName: "show_map",
+                arguments: {},
+              },
+            ],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(runResult).toBeNull();
+      expect(toast.info).toHaveBeenCalledWith(
+        "Render checks run with the full suite or on its schedule.",
+      );
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(mockAuthFetch).not.toHaveBeenCalled();
+    });
+
+    it("auto-connects suite servers before running a test case", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            description: "A test suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"]);
+      expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("scopes a single test-case run to the selected host attachment", async () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(["server-b"]),
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Host-scoped suite",
+            description: "A suite with multiple hosts",
+            environment: { servers: ["server-a", "server-b"] },
+            hostAttachments: [
+              {
+                namedHostId: "host-mcpjam",
+                hostName: "MCPJam",
+                enabledOptionalServerIds: [],
+                resolvedServerNames: ["server-a"],
+              },
+              {
+                namedHostId: "host-claude",
+                hostName: "Claude",
+                enabledOptionalServerIds: [],
+                resolvedServerNames: ["server-b"],
+              },
+            ],
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+          { namedHostId: "host-claude" },
+        );
+      });
+
+      const runCall = mockAuthFetch.mock.calls.find(
+        (call) => call[0] === "/api/mcp/evals/run-test-case",
+      );
+      expect(runCall).toBeDefined();
+      const body = JSON.parse(runCall![1].body as string);
+      expect(body.serverIds).toEqual(["server-b"]);
+      expect(body.namedHostId).toBe("host-claude");
+    });
+
+    it("normalizes hosted suite server ids before running a test case", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+      setApiContext({
+        projectId: "project-1",
+        isAuthenticated: true,
+        serverIdsByName: { "server-1": "srv-1" },
+      });
+
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Hosted id-backed suite",
+            description: "A hosted suite with stored ids",
+            environment: { servers: ["srv-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"]);
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody).toMatchObject({
+        projectId: "project-1",
+        serverIds: ["srv-1"],
+        serverNames: ["server-1"],
+      });
+    });
+
+    it("runs every configured model when no explicit model is selected", async () => {
+      mockAuthFetch
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            success: true,
+            iteration: { _id: "iter-openai" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            success: true,
+            iteration: { _id: "iter-anthropic" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            success: true,
+            iteration: { _id: "iter-google" },
+          }),
+        );
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      let response: Awaited<
+        ReturnType<typeof result.current.handleRunTestCase>
+      >;
+      await act(async () => {
+        response = await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            description: "A test suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Multi-model case",
+            query: "Test query",
+            models: [
+              { provider: "openai", model: "gpt-4o" },
+              { provider: "anthropic", model: "claude-3-5-sonnet" },
+              { provider: "google", model: "gemini-2.5-pro" },
+            ],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledTimes(3);
+      const requestBodies = mockAuthFetch.mock.calls.map((call) =>
+        JSON.parse(call[1].body as string),
+      );
+
+      expect(requestBodies).toEqual([
+        expect.objectContaining({
+          testCaseId: "case-123",
+          provider: "openai",
+          model: "gpt-4o",
+          skipLastMessageRunUpdate: true,
+        }),
+        expect.objectContaining({
+          testCaseId: "case-123",
+          provider: "anthropic",
+          model: "claude-3-5-sonnet",
+          skipLastMessageRunUpdate: true,
+        }),
+        expect.objectContaining({
+          testCaseId: "case-123",
+          provider: "google",
+          model: "gemini-2.5-pro",
+          skipLastMessageRunUpdate: true,
+        }),
+      ]);
+      expect(toast.success).toHaveBeenCalledWith(
+        "Test completed across 3 models!",
+      );
+      expect(response).toMatchObject({
+        iteration: { _id: "iter-openai" },
+        runs: [
+          { iteration: { _id: "iter-openai" } },
+          { iteration: { _id: "iter-anthropic" } },
+          { iteration: { _id: "iter-google" } },
+        ],
+      });
+    });
+
+    it("keeps the single-model path when a model is explicitly selected", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            description: "A test suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Multi-model case",
+            query: "Test query",
+            models: [
+              { provider: "openai", model: "gpt-4o" },
+              { provider: "anthropic", model: "claude-3-5-sonnet" },
+              { provider: "google", model: "gemini-2.5-pro" },
+            ],
+            expectedToolCalls: [],
+          } as any,
+          {
+            selectedModel: "anthropic/claude-3-5-sonnet",
+          },
+        );
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+
+      expect(requestBody).toMatchObject({
+        testCaseId: "case-123",
+        provider: "anthropic",
+        model: "claude-3-5-sonnet",
+      });
+      expect(requestBody.skipLastMessageRunUpdate).toBeUndefined();
+      expect(toast.success).toHaveBeenCalledWith(
+        "Test completed successfully!",
+      );
+    });
+
+    it("threads iterationOverride into testCaseOverrides.runs", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+          { iterationOverride: 5 },
+        );
+      });
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody.testCaseOverrides).toEqual({ runs: 5 });
+    });
+
+    it("omits testCaseOverrides when no iterationOverride is supplied", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      const requestBody = JSON.parse(mockAuthFetch.mock.calls[0][1].body);
+      expect(requestBody.testCaseOverrides).toBeUndefined();
+    });
+
+    it("opens the upgrade wall when /run-test-case is rejected on the eval-iteration cap", async () => {
+      // The per-model rejection is caught inside the fan-out, so it never
+      // reaches the outer catch — the collected failures have to open the
+      // wall themselves.
+      mockAuthFetch.mockResolvedValue(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({ ...defaultProps, organizationId: "org-1" }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(usePlanLimitDialogStore.getState().limit).toMatchObject({
+        kind: "evalIterations",
+        organizationId: "org-1",
+        used: 100,
+        allowed: 100,
+        windowKind: "month",
+      });
+      expect(toast.error).not.toHaveBeenCalled();
+    });
+
+    it("still toasts the cap rejection when there is no organization to upgrade", async () => {
+      mockAuthFetch.mockResolvedValue(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Single-model case",
+            query: "Test query",
+            models: [{ provider: "openai", model: "gpt-4o" }],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(usePlanLimitDialogStore.getState().isOpen).toBe(false);
+      expect(toast.error).toHaveBeenCalled();
+    });
+
+    it("keeps the partial-failure count toast when only some models hit the cap", async () => {
+      mockAuthFetch
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            success: true,
+            iteration: { _id: "iter-openai" },
+          }),
+        )
+        .mockResolvedValueOnce(createEvalIterationCapResponse());
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({ ...defaultProps, organizationId: "org-1" }),
+      );
+
+      await act(async () => {
+        await result.current.handleRunTestCase(
+          {
+            _id: "suite-123",
+            name: "Test Suite",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "case-123",
+            title: "Multi-model case",
+            query: "Test query",
+            models: [
+              { provider: "openai", model: "gpt-4o" },
+              { provider: "anthropic", model: "claude-3-5-sonnet" },
+            ],
+            expectedToolCalls: [],
+          } as any,
+        );
+      });
+
+      expect(usePlanLimitDialogStore.getState().isOpen).toBe(true);
+      // The wall doesn't say how many models did land; that toast still does.
+      expect(toast.error).toHaveBeenCalledWith(
+        "1/2 models completed successfully.",
+      );
+    });
+  });
+
+  describe("handleReplayRun", () => {
+    it("does not send modelApiKeys for MCPJam-provided replay models", async () => {
+      const { isMCPJamProvidedModel } = await import("@/shared/types");
+      vi.mocked(isMCPJamProvidedModel).mockImplementation(
+        (modelId: string) => modelId === "openai/gpt-4o-mini",
+      );
+
+      mockIsHostedMode.mockReturnValue(false);
+      mockConvexQuery.mockResolvedValue([
+        {
+          _id: "test-case-1",
+          title: "Replay Test",
+          query: "Get my Asana user profile",
+          runs: 1,
+          models: [{ model: "openai/gpt-4o-mini", provider: "openrouter" }],
+          expectedToolCalls: [],
+        },
+      ]);
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-local",
+          runId: "run-local-replay",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          selectedSuiteEntry: {
+            latestRun: {
+              _id: "run-source-local",
+              hasServerReplayConfig: true,
+            },
+            recentRuns: [],
+          } as any,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleReplayRun(
+          {
+            _id: "suite-local",
+            name: "Local Replay Suite",
+            description: "A locally replayed suite",
+            source: "sdk",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "run-source-local",
+            hasServerReplayConfig: true,
+          } as any,
+        );
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      expect(requestBody.modelApiKeys).toBeUndefined();
+    });
+
+    it("posts to the local replay endpoint outside hosted mode", async () => {
+      mockIsHostedMode.mockReturnValue(false);
+
+      const selectedSuiteEntry = {
+        latestRun: {
+          _id: "run-latest",
+          hasServerReplayConfig: true,
+        },
+        recentRuns: [],
+      };
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-local",
+          runId: "run-local-replay",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          selectedSuiteEntry: selectedSuiteEntry as any,
+        }),
+      );
+
+      const mockSuite = {
+        _id: "suite-local",
+        name: "Local Replay Suite",
+        description: "A locally replayed suite",
+        source: "sdk",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleReplayRun(
+          mockSuite as any,
+          {
+            _id: "run-source-local",
+            hasServerReplayConfig: true,
+          } as any,
+        );
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/mcp/evals/replay-run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+
+    it("posts to the hosted replay endpoint for a specific run", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+
+      const selectedSuiteEntry = {
+        latestRun: {
+          _id: "run-latest",
+          hasServerReplayConfig: true,
+        },
+        recentRuns: [
+          {
+            _id: "run-replayable",
+            hasServerReplayConfig: true,
+            passCriteria: { minimumPassRate: 88 },
+          },
+        ],
+      };
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-456",
+          runId: "run-new",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          selectedSuiteEntry: selectedSuiteEntry as any,
+        }),
+      );
+
+      const mockSuite = {
+        _id: "suite-456",
+        name: "Replay Suite",
+        description: "A replayable CI suite",
+        source: "sdk",
+        environment: { servers: ["server-1"] },
+        defaultPassCriteria: { minimumPassRate: 75 },
+      };
+
+      await act(async () => {
+        await result.current.handleReplayRun(
+          mockSuite as any,
+          {
+            _id: "run-replayable",
+            hasServerReplayConfig: true,
+            passCriteria: { minimumPassRate: 88 },
+          } as any,
+        );
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        "/api/web/evals/replay-run",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody).toMatchObject({
+        runId: "run-replayable",
+        passCriteria: { minimumPassRate: 88 },
+      });
+      expect(requestBody.convexAuthToken).toBeUndefined();
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evals/runs/suite/suite-456/runs/run-new?insights=1",
+      );
+    });
+  });
+
+  describe("handleGenerateTests", () => {
+    describe("environment suites", () => {
+      function mockEnvironmentServers() {
+        mockConvexQuery.mockImplementation(async (name: string) =>
+          name === "projectEnvironments:resolveEnvironmentForLaunch"
+            ? {
+                servers: [
+                  { serverId: "srv-1", name: "billing" },
+                  { serverId: "srv-2", name: "crm" },
+                ],
+              }
+            : [],
+        );
+      }
+
+      function readiness(
+        overrides: Partial<{
+          readyServerNames: string[];
+          missingServerNames: string[];
+          failedServerNames: string[];
+          reauthServerNames: string[];
+        }> = {},
+      ) {
+        return {
+          readyServerNames: [],
+          missingServerNames: [],
+          failedServerNames: [],
+          reauthServerNames: [],
+          ...overrides,
+        };
+      }
+
+      it("connects the environment's servers locally before generating", async () => {
+        mockEnvironmentServers();
+        mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+        const ensureServersReady = vi
+          .fn()
+          .mockResolvedValue(
+            readiness({ readyServerNames: ["billing", "crm"] }),
+          );
+        const { result } = renderHook(() =>
+          useEvalHandlers({
+            ...defaultProps,
+            connectedServerNames: new Set(),
+            ensureServersReady,
+          }),
+        );
+        await act(async () => {
+          await result.current.handleGenerateTests("suite-env", [], {
+            environmentId: "env-a",
+          });
+        });
+        expect(mockConvexQuery).toHaveBeenCalledWith(
+          "projectEnvironments:resolveEnvironmentForLaunch",
+          {
+            projectId: "project-1",
+            environmentId: "env-a",
+            serverSource: "environment_only",
+          },
+        );
+        expect(ensureServersReady).toHaveBeenCalledOnce();
+        expect(ensureServersReady).toHaveBeenCalledWith(["billing", "crm"], {
+          allowInteractiveOAuthFlow: true,
+        });
+        expect(ensureServersReady.mock.invocationCallOrder[0]!).toBeLessThan(
+          mockAuthFetch.mock.invocationCallOrder[0]!,
+        );
+        const [path, init] = mockAuthFetch.mock.calls[0]!;
+        expect(path).toBe("/api/mcp/evals/generate-tests");
+        expect(JSON.parse(init.body).environmentId).toBe("env-a");
+      });
+
+      it("generates nothing locally when an environment server fails to connect", async () => {
+        mockEnvironmentServers();
+        const ensureServersReady = vi.fn().mockResolvedValue(
+          readiness({
+            readyServerNames: ["billing"],
+            failedServerNames: ["crm"],
+          }),
+        );
+        const { result } = renderHook(() =>
+          useEvalHandlers({ ...defaultProps, ensureServersReady }),
+        );
+        await act(async () => {
+          await result.current.handleGenerateTests("suite-env", [], {
+            environmentId: "env-a",
+          });
+        });
+        expect(mockAuthFetch).not.toHaveBeenCalled();
+        expect(toast.error).toHaveBeenCalledWith(
+          "We couldn't connect to crm. Try again to generate test cases.",
+        );
+        // Review-first authoring surfaces the same refusal as a throw.
+        await expect(
+          result.current.handleGenerateTests("suite-env", [], {
+            environmentId: "env-a",
+            stageCase: vi.fn(),
+          }),
+        ).rejects.toThrow(
+          "We couldn't connect to crm. Try again to generate test cases.",
+        );
+        expect(mockAuthFetch).not.toHaveBeenCalled();
+      });
+
+      it("connects nothing in the browser in hosted mode", async () => {
+        mockIsHostedMode.mockReturnValue(true);
+        setApiContext({ projectId: "project-1", isAuthenticated: true });
+        mockEnvironmentServers();
+        mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+        const ensureServersReady = vi.fn();
+        const { result } = renderHook(() =>
+          useEvalHandlers({ ...defaultProps, ensureServersReady }),
+        );
+        await act(async () => {
+          await result.current.handleGenerateTests("suite-env", [], {
+            environmentId: "env-a",
+          });
+        });
+        expect(ensureServersReady).not.toHaveBeenCalled();
+        expect(mockConvexQuery).not.toHaveBeenCalledWith(
+          "projectEnvironments:resolveEnvironmentForLaunch",
+          expect.anything(),
+        );
+        expect(mockAuthFetch.mock.calls[0]![0]).toBe(
+          "/api/web/evals/generate-tests",
+        );
+      });
+    });
+
+    it("uses authFetch for /api/mcp/evals/generate-tests endpoint", async () => {
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          tests: [
+            {
+              title: "Generated Test",
+              query: "Test query",
+              expectedToolCalls: [],
+            },
+          ],
+        }),
+      );
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      // Verify authFetch was called with the correct endpoint
+      expect(mockAuthFetch).toHaveBeenCalledWith(
+        API_ENDPOINTS.EVALS_GENERATE_TESTS,
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+
+    it("passes serverIds and convexAuthToken in request body", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1", "server-2"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(["server-1"]),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", [
+          "server-1",
+          "server-2",
+        ]);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      expect(requestBody).toMatchObject({
+        serverIds: ["server-1", "server-2"],
+        convexAuthToken: "mock-access-token",
+      });
+    });
+
+    it("does not use regular fetch for /api/mcp/evals/generate-tests", async () => {
+      const originalFetch = global.fetch;
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValue(createFetchResponse({ tests: [] }));
+      global.fetch = fetchSpy;
+
+      // Re-mock authFetch to ensure it's the one being called
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      // Verify regular fetch was NOT called with the generate-tests endpoint
+      const fetchCalls = fetchSpy.mock.calls.filter(
+        (call) =>
+          typeof call[0] === "string" &&
+          call[0].includes("/api/mcp/evals/generate-tests"),
+      );
+      expect(fetchCalls).toHaveLength(0);
+
+      // Verify authFetch WAS called
+      expect(mockAuthFetch).toHaveBeenCalled();
+
+      global.fetch = originalFetch;
+    });
+
+    it("creates test cases from generated tests", async () => {
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          tests: [
+            {
+              title: "Generated Test 1",
+              query: "Query 1",
+              expectedToolCalls: ["tool1"],
+            },
+            {
+              title: "Generated Test 2",
+              query: "Query 2",
+              expectedToolCalls: ["tool2"],
+            },
+          ],
+        }),
+      );
+
+      mockMutations.createTestCaseMutation.mockResolvedValue(
+        "new-test-case-id",
+      );
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      // Verify test cases were created
+      expect(mockMutations.createTestCaseMutation).toHaveBeenCalledTimes(2);
+    });
+
+    it("handles API errors gracefully", async () => {
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({ error: "API Error" }, 500),
+      );
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      // Should not throw
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      // Verify no test cases were created on error
+      expect(mockMutations.createTestCaseMutation).not.toHaveBeenCalled();
+    });
+
+    it("calls ensureServersReady before generating when suite servers are not yet connected", async () => {
+      const ensureServersReady = vi.fn().mockResolvedValue({
+        readyServerNames: ["server-1"],
+        missingServerNames: [],
+        failedServerNames: [],
+        reauthServerNames: [],
+      });
+
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          connectedServerNames: new Set(),
+          ensureServersReady,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      expect(ensureServersReady).toHaveBeenCalledWith(["server-1"], { allowInteractiveOAuthFlow: true });
+      expect(mockAuthFetch).toHaveBeenCalled();
+    });
+
+    it("runs newly generated cases when runNewCasesAfterGenerate and suite are provided", async () => {
+      let listCall = 0;
+      mockConvexQuery.mockImplementation(async () => {
+        listCall += 1;
+        if (listCall === 1) {
+          return [];
+        }
+        return [
+          {
+            _id: "new-case-1",
+            title: "Generated",
+            query: "Q",
+            runs: 1,
+            models: [{ model: "gpt-4", provider: "openai" }],
+            expectedToolCalls: [],
+          },
+        ];
+      });
+
+      mockAuthFetch
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            tests: [
+              {
+                title: "Generated",
+                query: "Q",
+                expectedToolCalls: [],
+              },
+            ],
+          }),
+        )
+        .mockResolvedValueOnce(
+          createFetchResponse({
+            success: true,
+            iteration: { _id: "iter-1" },
+          }),
+        );
+
+      mockMutations.createTestCaseMutation.mockResolvedValue("new-case-1");
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"], {
+          runNewCasesAfterGenerate: true,
+          suite: {
+            _id: "suite-123",
+            name: "Suite",
+            description: "D",
+            environment: { servers: ["server-1"] },
+          } as any,
+        });
+      });
+
+      expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+      const runBody = JSON.parse(
+        mockAuthFetch.mock.calls[1]![1]!.body as string,
+      );
+      expect(runBody.testCaseId).toBe("new-case-1");
+    });
+  });
+
+  describe("auth token inclusion", () => {
+    it("includes convexAuthToken in local handleRerun request", async () => {
+      mockGetAccessToken.mockResolvedValue("specific-access-token");
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      const mockSuite = {
+        _id: "suite-123",
+        name: "Test Suite",
+        description: "A test suite",
+        environment: { servers: ["server-1"] },
+      };
+
+      await act(async () => {
+        await result.current.handleRerun(mockSuite as any);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      expect(requestBody.convexAuthToken).toBe("specific-access-token");
+    });
+
+    it("includes convexAuthToken in local handleGenerateTests request", async () => {
+      mockGetAccessToken.mockResolvedValue("another-access-token");
+      mockAuthFetch.mockResolvedValue(createFetchResponse({ tests: [] }));
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+
+      expect(requestBody.convexAuthToken).toBe("another-access-token");
+    });
+
+    it("omits convexAuthToken in hosted handleReplayRun requests", async () => {
+      mockIsHostedMode.mockReturnValue(true);
+      mockGetAccessToken.mockResolvedValue("hosted-access-token");
+
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({
+          success: true,
+          suiteId: "suite-456",
+          runId: "run-new",
+        }),
+      );
+
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          selectedSuiteEntry: {
+            latestRun: {
+              _id: "run-replayable",
+              hasServerReplayConfig: true,
+            },
+            recentRuns: [],
+          } as any,
+        }),
+      );
+
+      await act(async () => {
+        await result.current.handleReplayRun(
+          {
+            _id: "suite-456",
+            name: "Replay Suite",
+            description: "A replayable CI suite",
+            source: "sdk",
+            environment: { servers: ["server-1"] },
+          } as any,
+          {
+            _id: "run-replayable",
+            hasServerReplayConfig: true,
+          } as any,
+        );
+      });
+
+      const callArgs = mockAuthFetch.mock.calls[0];
+      const requestBody = JSON.parse(callArgs[1].body);
+      expect(requestBody.convexAuthToken).toBeUndefined();
+    });
+  });
+
+  describe("state management", () => {
+    it("sets isGeneratingTests to true during generation", async () => {
+      const deferred = createDeferred<Response>();
+      mockAuthFetch.mockReturnValue(deferred.promise);
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      expect(result.current.isGeneratingTests).toBe(false);
+
+      act(() => {
+        result.current.handleGenerateTests("suite-123", ["server-1"]);
+      });
+
+      await waitFor(() => {
+        expect(result.current.isGeneratingTests).toBe(true);
+      });
+
+      // Resolve the promise
+      await act(async () => {
+        deferred.resolve(createFetchResponse({ tests: [] }));
+      });
+
+      await waitFor(() => {
+        expect(result.current.isGeneratingTests).toBe(false);
+      });
+    });
+
+    it("sets rerunningSuiteId during rerun", async () => {
+      const deferred = createDeferred<Response>();
+      mockAuthFetch.mockReturnValue(deferred.promise);
+
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      const mockSuite = {
+        _id: "suite-789",
+        name: "Test Suite",
+        description: "A test suite",
+        environment: { servers: ["server-1"] },
+      };
+
+      expect(result.current.rerunningSuiteId).toBe(null);
+
+      act(() => {
+        result.current.handleRerun(mockSuite as any);
+      });
+
+      await waitFor(() => {
+        expect(result.current.rerunningSuiteId).toBe("suite-789");
+      });
+
+      // Resolve the promise
+      await act(async () => {
+        deferred.resolve(createFetchResponse({ success: true }));
+      });
+
+      await waitFor(() => {
+        expect(result.current.rerunningSuiteId).toBe(null);
+      });
+    });
+  });
+
+  describe("handleCreateTestCase", () => {
+    it("opens a draft case on /evals by default", () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      act(() => {
+        result.current.handleCreateTestCase("suite-1");
+      });
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evaluate/suite/suite-1/test/draft%3Aprompt/edit",
+      );
+    });
+
+    it("stays on /evaluate when the Evaluate (New) tab owns navigation", () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          evalsNavigationContext: "evaluate",
+        }),
+      );
+
+      act(() => {
+        result.current.handleCreateTestCase("suite-1");
+      });
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evaluate/suite/suite-1/test/draft%3Aprompt/edit",
+      );
+    });
+  });
+
+  describe("handleDescribeTestCase", () => {
+    it("opens the describe workspace on the Evaluate surface", () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({
+          ...defaultProps,
+          evalsNavigationContext: "evaluate",
+        }),
+      );
+
+      act(() => {
+        result.current.handleDescribeTestCase("suite-1");
+      });
+
+      expect(mockNavigateApp).toHaveBeenCalledWith(
+        "/evaluate/suite/suite-1/test/draft%3Adescribe/edit",
+      );
+    });
+  });
+
+  describe("handleCancelRun", () => {
+    /** The cancel path the platform route serves, for one run id. */
+    const cancelPath = (id: string) =>
+      `/api/v1/projects/project-1/eval-runs/${id}/cancel`;
+
+    // Paths only: this suite runs under a jsdom origin, so the client's
+    // absolute URL would pin the test to localhost.
+    const cancelCalls = () =>
+      mockAuthFetch.mock.calls
+        .map(([target]) => new URL(String(target), "https://app.test").pathname)
+        .filter((path) => path.endsWith("/cancel"));
+
+    it("cancels every id it is given, not just the first", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun(["run-1", "run-2"]);
+      });
+
+      expect(cancelCalls()).toEqual([cancelPath("run-1"), cancelPath("run-2")]);
+      expect(toast.success).toHaveBeenCalledWith("Run cancelled successfully");
+    });
+
+    it("takes a bare id, the shape the suite cards still pass", async () => {
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun("run-1");
+      });
+
+      expect(cancelCalls()).toEqual([cancelPath("run-1")]);
+    });
+
+    it("still reports success when a sibling had already settled", async () => {
+      // The launch's other pairing finished between render and click, so the
+      // route refuses it. The run the person meant to stop did stop.
+      mockAuthFetch.mockResolvedValueOnce(
+        createFetchResponse({ id: "run-1", status: "cancelled" }),
+      );
+      mockAuthFetch.mockResolvedValueOnce(
+        createFetchResponse(
+          {
+            code: "VALIDATION_ERROR",
+            message: "Cannot cancel a run that already completed",
+          },
+          400,
+        ),
+      );
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun(["run-1", "run-2"]);
+      });
+
+      expect(toast.success).toHaveBeenCalledWith("Run cancelled successfully");
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(toast.warning).not.toHaveBeenCalled();
+    });
+
+    it("says how many are still running when one genuinely could not stop", async () => {
+      // NOT the settled-sibling case: this one is still burning spend, and
+      // "cancelled successfully" would send the user away believing otherwise.
+      mockAuthFetch.mockResolvedValueOnce(
+        createFetchResponse({ id: "run-1", status: "cancelled" }),
+      );
+      mockAuthFetch.mockResolvedValueOnce(
+        createFetchResponse({ code: "INTERNAL", message: "boom" }, 500),
+      );
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun(["run-1", "run-2"]);
+      });
+
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.warning).toHaveBeenCalledWith(
+        "Stopped 1 of 2 runs. 1 could not be stopped.",
+      );
+    });
+
+    it("reports the failure when nothing could be cancelled", async () => {
+      mockAuthFetch.mockResolvedValue(
+        createFetchResponse({ code: "INTERNAL", message: "boom" }, 500),
+      );
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun("run-1");
+      });
+
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.error).toHaveBeenCalled();
+    });
+
+    it("keeps the Convex mutation for a guest, who the route refuses outright", async () => {
+      // The v1 guest allowlist rejects this path at the boundary, so going
+      // through it would turn "sign in to use this" into a bare 401.
+      const { result } = renderHook(() =>
+        useEvalHandlers({ ...defaultProps, isDirectGuest: true }),
+      );
+
+      await act(async () => {
+        await result.current.handleCancelRun("run-1");
+      });
+
+      expect(mockMutations.cancelRunMutation).toHaveBeenCalledWith({
+        runId: "run-1",
+      });
+      expect(cancelCalls()).toEqual([]);
+    });
+
+    it("keeps the Convex mutation when the surface has no project", async () => {
+      const { result } = renderHook(() =>
+        useEvalHandlers({ ...defaultProps, projectId: null }),
+      );
+
+      await act(async () => {
+        await result.current.handleCancelRun("run-1");
+      });
+
+      expect(mockMutations.cancelRunMutation).toHaveBeenCalledWith({
+        runId: "run-1",
+      });
+      expect(cancelCalls()).toEqual([]);
+    });
+
+    it("falls back to Convex on a deployment that has no cancel route", async () => {
+      // A BARE 404 — no envelope — is a router that never heard of the path.
+      // An older build must keep cancelling, not report a dead end.
+      mockAuthFetch.mockResolvedValue(new Response("nope", { status: 404 }));
+      const { result } = renderHook(() => useEvalHandlers(defaultProps));
+
+      await act(async () => {
+        await result.current.handleCancelRun("run-1");
+      });
+
+      expect(mockMutations.cancelRunMutation).toHaveBeenCalledWith({
+        runId: "run-1",
+      });
+      expect(toast.success).toHaveBeenCalledWith("Run cancelled successfully");
+    });
+  });
+});
+
+describe("formatEnsureServersReadyError", () => {
+  const base: {
+    readyServerNames: string[];
+    missingServerNames: string[];
+    failedServerNames: string[];
+    reauthServerNames: string[];
+  } = {
+    readyServerNames: [],
+    missingServerNames: [],
+    failedServerNames: [],
+    reauthServerNames: [],
+  };
+
+  it("does not list server refs for missing servers (avoids id-like strings in toasts)", () => {
+    const msg = formatEnsureServersReadyError(
+      {
+        ...base,
+        missingServerNames: [
+          "k1234567890123456789012345",
+          "k9876543210987654321098765",
+        ],
+      },
+      "run this test case",
+      [],
+    );
+    expect(msg).toBe(
+      "Unable to run this test case. This test depends on 2 MCP servers that are no longer in this project.",
+    );
+    expect(msg).not.toMatch(/k123/);
+  });
+
+  it("uses single missing-server test copy", () => {
+    expect(
+      formatEnsureServersReadyError(
+        { ...base, missingServerNames: ["k1234567890123456789012345"] },
+        "run this test case",
+        [],
+      ),
+    ).toBe(
+      "Unable to run this test case. This test depends on an MCP server that is no longer in this project.",
+    );
+  });
+
+  it("uses single missing-server suite copy", () => {
+    expect(
+      formatEnsureServersReadyError(
+        { ...base, missingServerNames: ["k1234567890123456789012345"] },
+        "run this suite",
+        [],
+      ),
+    ).toBe(
+      "Unable to run this suite. This suite depends on an MCP server that is no longer in this project.",
+    );
+  });
+
+  it("uses generic reauth when every ref is unresolvable (no a removed server label)", () => {
+    expect(
+      formatEnsureServersReadyError(
+        {
+          ...base,
+          reauthServerNames: ["mn79gdfjnftd2esny26j8n4w0s83hc8n"],
+        },
+        "run this test case",
+        [],
+      ),
+    ).toBe("Re-authenticate, then try to run this test case.");
+  });
+
+  it("uses generic failed-server copy when every ref is unresolvable", () => {
+    expect(
+      formatEnsureServersReadyError(
+        {
+          ...base,
+          failedServerNames: ["mn79gdfjnftd2esny26j8n4w0s83hc8n"],
+        },
+        "run this suite",
+        [],
+      ),
+    ).toBe(
+      "We couldn't connect to a required server. Try again to run this suite.",
+    );
+  });
+});

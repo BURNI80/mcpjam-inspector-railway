@@ -1,0 +1,498 @@
+import { computeIterationResult } from "./pass-criteria";
+import {
+  computeIterationSummary,
+  iterationLatencyP50,
+  iterationLatencyP95,
+  percentile,
+  sumIterationCost,
+} from "./helpers";
+import type { CaseRunBatch } from "./runs/group-case-iterations";
+import type { EvalIteration, EvalSuiteRun } from "./types";
+import { poolLatency, type RunMetrics, type RunMetricsByRun } from "./run-metrics";
+
+/** One run's aggregated metrics, in chronological order across the series. */
+export interface MetricStripPoint {
+  passRate: number;
+  passed: number;
+  total: number;
+  failed: number;
+  latencyP50: number | null;
+  latencyP95: number | null;
+  /** Average tokens per iteration (test execution) within this run/batch. */
+  tokens: number;
+  /**
+   * Total MCPJam-billed cost across this run/batch, or `null` when nothing in
+   * it was priced. Never 0 for an unpriced run — see `formatCostOrDash`.
+   */
+  costUsd: number | null;
+  /**
+   * How many of `total` iterations contributed to `costUsd`. A partial sum
+   * plotted as a whole one is how a half-priced run reads as a cheap one, so
+   * the strip needs the coverage to know when to withhold the point.
+   */
+  costedIterations: number;
+  /**
+   * True when a customer's own runner supplied part of `costUsd`.
+   *
+   * Carried alongside the amount because the headline cannot say it: the
+   * number is real either way, but "MCPJam measured this" and "your runner
+   * told us this" are different claims, and the per-iteration rows already
+   * mark the difference.
+   */
+  hasRunnerReportedCost: boolean;
+  /** Total tool calls across all iterations in this run/batch. */
+  toolCalls: number;
+}
+
+export interface MetricStripData {
+  latest: MetricStripPoint;
+  series: MetricStripPoint[];
+  delta: number | null;
+  showTrend: boolean;
+  /** Tooltip / sparkline x-axis labels; defaults to Run 1, Run 2, … */
+  runLabels?: string[];
+}
+
+/** One run in a matrix cell trend series (maps to MetricStripPoint). */
+export type CellMetricTrendInput = {
+  runLabel: string;
+  result: "passed" | "failed" | "pending" | "partial";
+  /** Iteration counts within the run; falls back to result-derived 0/1 counts. */
+  passed?: number;
+  failed?: number;
+  total?: number;
+  latencyMs: number | null;
+  latencyP95Ms?: number | null;
+  tokens: number | null;
+  toolCalls?: number | null;
+};
+
+function passRateFromCellResult(
+  result: CellMetricTrendInput["result"],
+): number {
+  if (result === "passed") return 100;
+  if (result === "partial") return 50;
+  return 0;
+}
+
+function metricPointFromCellTrend(
+  point: CellMetricTrendInput,
+): MetricStripPoint {
+  const hasCounts = point.total != null && point.total > 0;
+  const passed = hasCounts
+    ? point.passed ?? 0
+    : point.result === "passed"
+    ? 1
+    : 0;
+  const failed = hasCounts
+    ? point.failed ?? 0
+    : point.result === "failed"
+    ? 1
+    : 0;
+  const total = hasCounts ? point.total ?? 1 : 1;
+  return {
+    passRate: hasCounts
+      ? Math.round((passed / total) * 100)
+      : passRateFromCellResult(point.result),
+    passed,
+    total,
+    failed,
+    latencyP50: point.latencyMs,
+    latencyP95: point.latencyP95Ms ?? point.latencyMs,
+    tokens: point.tokens ?? 0,
+    toolCalls: point.toolCalls ?? 0,
+    // This projection is built from a pre-aggregated CELL, which carries no
+    // per-iteration usage — so cost is genuinely unknown here rather than
+    // zero, and the strip withholds the point.
+    costUsd: null,
+    costedIterations: 0,
+    hasRunnerReportedCost: false,
+  };
+}
+
+function latencyPercentilesAcrossRuns(trendSeries: CellMetricTrendInput[]): {
+  latencyP50: number | null;
+  latencyP95: number | null;
+} {
+  const p50Samples = trendSeries
+    .map((point) => point.latencyMs)
+    .filter((value): value is number => value != null);
+  const p95Samples = trendSeries
+    .map((point) => point.latencyP95Ms ?? point.latencyMs)
+    .filter((value): value is number => value != null);
+
+  return {
+    latencyP50: percentile(p50Samples, 0.5),
+    latencyP95: percentile(p95Samples, 0.95),
+  };
+}
+
+/**
+ * Fold per-cell run history into the same strip model the suite header uses.
+ * Headline pass counts are cumulative across all runs in the series so the
+ * All-runs dashboard reports total iterations, not just the latest run's.
+ */
+export function buildCellMetricStripData(
+  trendSeries: CellMetricTrendInput[],
+): MetricStripData | null {
+  if (trendSeries.length === 0) return null;
+
+  const series = trendSeries.map(metricPointFromCellTrend);
+  const base = finalizeMetricStripData(series);
+  if (!base) return null;
+
+  const { latencyP50, latencyP95 } = latencyPercentilesAcrossRuns(trendSeries);
+
+  let cumulativePassed = 0;
+  let cumulativeFailed = 0;
+  let cumulativeTotal = 0;
+  for (const point of series) {
+    cumulativePassed += point.passed;
+    cumulativeFailed += point.failed;
+    cumulativeTotal += point.total;
+  }
+
+  return {
+    ...base,
+    latest: {
+      ...base.latest,
+      passed: cumulativePassed,
+      failed: cumulativeFailed,
+      total: cumulativeTotal,
+      passRate:
+        cumulativeTotal > 0
+          ? Math.round((cumulativePassed / cumulativeTotal) * 100)
+          : base.latest.passRate,
+      latencyP50,
+      latencyP95,
+    },
+    runLabels: trendSeries.map((point) => `Run ${point.runLabel}`),
+  };
+}
+
+/** Render sparklines once there is a second point to compare against. */
+export const MIN_TREND_POINTS = 2;
+
+export function formatCompactNumber(value: number): string {
+  if (value >= 1_000_000)
+    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (value >= 1_000)
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  if (!Number.isInteger(value)) {
+    return value.toFixed(1).replace(/\.0$/, "");
+  }
+  return String(value);
+}
+
+export function formatDurationMs(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(ms >= 10_000 ? 1 : 2)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
+function iterationToolCallCount(iteration: EvalIteration): number {
+  return iteration.actualToolCalls?.length ?? 0;
+}
+
+function runToolCallTotal(iterations: EvalIteration[]): number {
+  return iterations.reduce(
+    (sum, iteration) => sum + iterationToolCallCount(iteration),
+    0,
+  );
+}
+
+function averageTokensPerIteration(iterations: EvalIteration[]): number {
+  if (iterations.length === 0) return 0;
+  const total = iterations.reduce((sum, it) => sum + (it.tokensUsed || 0), 0);
+  return total / iterations.length;
+}
+
+function batchPassCounts(iterations: EvalIteration[]): {
+  passed: number;
+  failed: number;
+  total: number;
+} {
+  const total = iterations.length;
+  let passed = 0;
+  let failed = 0;
+  for (const iteration of iterations) {
+    const result = computeIterationResult(iteration);
+    if (result === "passed") passed += 1;
+    else if (result === "failed") failed += 1;
+  }
+  return { passed, failed, total };
+}
+
+function pointFromIterations(
+  iterations: EvalIteration[],
+  summary?: { total: number; passed: number; failed: number },
+): MetricStripPoint {
+  const counts = summary ?? batchPassCounts(iterations);
+  const { passed, failed, total } = counts;
+  return {
+    passRate: total > 0 ? Math.round((passed / total) * 100) : 0,
+    passed,
+    total,
+    failed,
+    latencyP50: iterationLatencyP50(iterations),
+    latencyP95: iterationLatencyP95(iterations),
+    tokens: averageTokensPerIteration(iterations),
+    toolCalls: runToolCallTotal(iterations),
+    ...(() => {
+      const { totalUsd, costedIterations, hasRunnerReported } =
+        sumIterationCost(iterations);
+      return {
+        costUsd: totalUsd,
+        costedIterations,
+        hasRunnerReportedCost: hasRunnerReported,
+      };
+    })(),
+  };
+}
+
+function finalizeMetricStripData(
+  series: MetricStripPoint[],
+): MetricStripData | null {
+  if (series.length === 0) return null;
+
+  const latest = series[series.length - 1];
+  const prev = series.length >= 2 ? series[series.length - 2] : null;
+
+  return {
+    latest,
+    series,
+    delta: prev ? latest.passRate - prev.passRate : null,
+    showTrend: series.length >= MIN_TREND_POINTS,
+  };
+}
+
+/**
+ * A run the platform declined to decide (verdict policy 2 `inconclusive`) has
+ * no place in a pass-rate series or aggregate. Its counts are exactly the
+ * evidence the backend judged insufficient, so plotting them would draw a
+ * regression — or a recovery — out of measurements that were never trusted.
+ */
+function measuredRuns(runs: EvalSuiteRun[]): EvalSuiteRun[] {
+  return runs.filter((run) => run.result !== "inconclusive");
+}
+
+export function buildSuiteMetricStripData(
+  allRuns: EvalSuiteRun[],
+  allIterations: EvalIteration[],
+  labelRun?: (run: EvalSuiteRun) => string,
+): MetricStripData | null {
+  const runs = measuredRuns(allRuns);
+  if (runs.length === 0) return null;
+
+  const itsByRun = new Map<string, EvalIteration[]>();
+  for (const it of allIterations) {
+    if (!it.suiteRunId) continue;
+    const arr = itsByRun.get(it.suiteRunId);
+    if (arr) arr.push(it);
+    else itsByRun.set(it.suiteRunId, [it]);
+  }
+
+  const chronological = [...runs].sort((a, b) => a.createdAt - b.createdAt);
+  const series: MetricStripPoint[] = [];
+  const runLabels: string[] = [];
+  for (const run of chronological) {
+    const its = itsByRun.get(run._id);
+    if (!its || its.length === 0) continue;
+    const runName = labelRun
+      ? labelRun(run)
+      : run.runNumber
+      ? `#${run.runNumber}`
+      : `Run ${run._id.slice(0, 8)}`;
+    runLabels.push(`${runName} · ${new Date(run.createdAt).toLocaleString()}`);
+    const summary = computeIterationSummary(its);
+    const total = run.summary?.total ?? summary.runs;
+    const passed = run.summary?.passed ?? summary.passed;
+    const failed = run.summary?.failed ?? summary.failed;
+    series.push(
+      pointFromIterations(its, {
+        total,
+        passed,
+        failed,
+      }),
+    );
+  }
+
+  const data = finalizeMetricStripData(series);
+  return data ? { ...data, runLabels } : null;
+}
+
+/**
+ * Fold a set of runs into a SINGLE aggregated point (no trend). Used when the
+ * header is scoped to one run group: a group is a single launch across N hosts,
+ * so it reads as one point-in-time aggregate, not an N-point per-host "trend".
+ */
+export function buildAggregateMetricStripData(
+  allRuns: EvalSuiteRun[],
+  allIterations: EvalIteration[],
+): MetricStripData | null {
+  const runs = measuredRuns(allRuns);
+  if (runs.length === 0) return null;
+
+  const runIds = new Set(runs.map((r) => r._id));
+  const iterations = allIterations.filter(
+    (it) => it.suiteRunId && runIds.has(it.suiteRunId),
+  );
+  if (iterations.length === 0) return null;
+
+  // Prefer the stored per-run summaries (authoritative pass/fail), summed across
+  // the group; fall back to counting iterations when a run lacks a summary.
+  let total = 0;
+  let passed = 0;
+  let failed = 0;
+  let hasSummary = true;
+  for (const run of runs) {
+    if (run.summary) {
+      total += run.summary.total;
+      passed += run.summary.passed;
+      failed += run.summary.failed;
+    } else {
+      hasSummary = false;
+    }
+  }
+
+  const point = pointFromIterations(
+    iterations,
+    hasSummary ? { total, passed, failed } : undefined,
+  );
+  return finalizeMetricStripData([point]);
+}
+
+/**
+ * `pointFromIterations` over a run's stored metrics instead of its rows.
+ * Same fields, same meanings: `tokens` is the per-iteration average and
+ * `toolCalls` counts a missing list as zero.
+ */
+function pointFromMetrics(
+  list: readonly RunMetrics[],
+  counts?: { total: number; passed: number; failed: number },
+): MetricStripPoint {
+  let iterationCount = 0;
+  let passedCount = 0;
+  let failedCount = 0;
+  let tokens = 0;
+  let toolCalls = 0;
+  let costUsd: number | null = null;
+  let costedIterations = 0;
+  let hasRunnerReportedCost = false;
+  for (const metrics of list) {
+    iterationCount += metrics.iterationCount;
+    passedCount += metrics.results.passed;
+    failedCount += metrics.results.failed;
+    tokens += metrics.tokensTotal ?? 0;
+    toolCalls += metrics.toolCallsTotal ?? 0;
+    if (metrics.costUsd !== undefined) {
+      costUsd = (costUsd ?? 0) + metrics.costUsd;
+    }
+    costedIterations += metrics.costedIterations;
+    if (metrics.hasRunnerReportedCost) hasRunnerReportedCost = true;
+  }
+  const { passed, failed, total } = counts ?? {
+    passed: passedCount,
+    failed: failedCount,
+    total: iterationCount,
+  };
+  const { latencyP50, latencyP95 } = poolLatency(list);
+  return {
+    passRate: total > 0 ? Math.round((passed / total) * 100) : 0,
+    passed,
+    total,
+    failed,
+    latencyP50,
+    latencyP95,
+    tokens: iterationCount > 0 ? tokens / iterationCount : 0,
+    toolCalls,
+    costUsd,
+    costedIterations,
+    hasRunnerReportedCost,
+  };
+}
+
+/** `buildSuiteMetricStripData`, read from per-run metrics. */
+export function buildSuiteMetricStripDataFromMetrics(
+  allRuns: EvalSuiteRun[],
+  metricsByRun: RunMetricsByRun,
+  labelRun?: (run: EvalSuiteRun) => string,
+): MetricStripData | null {
+  const runs = measuredRuns(allRuns);
+  if (runs.length === 0) return null;
+
+  const chronological = [...runs].sort((a, b) => a.createdAt - b.createdAt);
+  const series: MetricStripPoint[] = [];
+  const runLabels: string[] = [];
+  for (const run of chronological) {
+    const metrics = metricsByRun.get(run._id);
+    if (!metrics || metrics.iterationCount === 0) continue;
+    const runName = labelRun
+      ? labelRun(run)
+      : run.runNumber
+      ? `#${run.runNumber}`
+      : `Run ${run._id.slice(0, 8)}`;
+    runLabels.push(`${runName} · ${new Date(run.createdAt).toLocaleString()}`);
+    series.push(
+      pointFromMetrics([metrics], {
+        total: run.summary?.total ?? metrics.iterationCount,
+        passed: run.summary?.passed ?? metrics.results.passed,
+        failed:
+          run.summary?.failed ??
+          metrics.results.failed + metrics.results.timedOut,
+      }),
+    );
+  }
+
+  const data = finalizeMetricStripData(series);
+  return data ? { ...data, runLabels } : null;
+}
+
+/** `buildAggregateMetricStripData`, read from per-run metrics. */
+export function buildAggregateMetricStripDataFromMetrics(
+  allRuns: EvalSuiteRun[],
+  metricsByRun: RunMetricsByRun,
+): MetricStripData | null {
+  const runs = measuredRuns(allRuns);
+  if (runs.length === 0) return null;
+
+  const list = runs
+    .map((run) => metricsByRun.get(run._id))
+    .filter(
+      (metrics): metrics is RunMetrics =>
+        metrics != null && metrics.iterationCount > 0,
+    );
+  if (list.length === 0) return null;
+
+  let total = 0;
+  let passed = 0;
+  let failed = 0;
+  let hasSummary = true;
+  for (const run of runs) {
+    if (run.summary) {
+      total += run.summary.total;
+      passed += run.summary.passed;
+      failed += run.summary.failed;
+    } else {
+      hasSummary = false;
+    }
+  }
+
+  const point = pointFromMetrics(
+    list,
+    hasSummary ? { total, passed, failed } : undefined,
+  );
+  return finalizeMetricStripData([point]);
+}
+
+/** Fold case run batches into the same metric series the suite strip uses. */
+export function buildCaseMetricStripData(
+  batches: CaseRunBatch[],
+): MetricStripData | null {
+  if (batches.length === 0) return null;
+
+  const chronological = [...batches].reverse();
+  const series = chronological.map((batch) =>
+    pointFromIterations(batch.iterations),
+  );
+  return finalizeMetricStripData(series);
+}

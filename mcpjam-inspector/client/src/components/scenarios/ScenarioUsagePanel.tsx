@@ -1,0 +1,486 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MessageSquare } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@mcpjam/design-system/select";
+import type { ScenarioSettings } from "@/hooks/useScenarios";
+import {
+  compareThreadsForUsageList,
+  threadFeedbackBucket,
+  threadMatchesFilterState,
+  EMPTY_USAGE_FILTER,
+} from "@/hooks/scenario-usage-filters";
+import { useUsageInsights } from "@/hooks/useUsageInsights";
+import { withHideSynthetic } from "@/components/scenarios/user-testing-traffic";
+import {
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+} from "@/components/ui/resizable";
+import {
+  SessionListChrome,
+  ShareUsageThreadList,
+} from "@/components/connection/share-usage/ShareUsageThreadList";
+import { sessionCountLabel } from "@/components/connection/share-usage/session-list-format";
+import { ShareUsageThreadDetail } from "@/components/connection/share-usage/ShareUsageThreadDetail";
+import {
+  buildEvaluatePath,
+  buildUserTestingScenarioPath,
+  navigateApp,
+} from "@/lib/app-navigation";
+import { getShareableAppOrigin } from "@/lib/scenario-session";
+import { usePromoteCapability } from "@/hooks/usePromoteCapability";
+import { ErrorBoundary } from "@/components/ui/error-boundary";
+import { ScenarioSessionsMetricStrip } from "@/components/scenarios/scenario-sessions-metric-strip";
+import {
+  SENTIMENT_ORDER,
+  SENTIMENT_TITLE,
+} from "@/components/scenarios/findings/scenario-findings-derivation";
+import type { SessionSentiment } from "@/hooks/scenario-usage-filters";
+
+interface ScenarioUsagePanelProps {
+  scenario: ScenarioSettings;
+  /**
+   * Thread to preselect on mount (from a `/user-testing/:id?session=` deep
+   * link). Falls back to the newest thread if it no longer exists in the list.
+   */
+  initialThreadId?: string | null;
+}
+
+/**
+ * The Sessions browser for one User Testing scenario: the thread list, the
+ * thread detail, and the metric strip above them.
+ *
+ * Insights are NOT here. They were, behind a `section` prop, which meant the
+ * scenario page mounted this component twice — once per tab — with each
+ * instance subscribing to the query the other did not need. Insights now mount
+ * `InsightsWorkbench` directly, which is also what Swarms does, so the two
+ * surfaces share one body instead of two divergent copies of it.
+ */
+/**
+ * The scenario's traffic policy: the force-applied hide-synthetic chip that
+ * every User Testing number is computed over. Insights own the rich chip UI on
+ * their own mount, so this panel carries no flow controller — just this policy
+ * plus the one rating filter below.
+ */
+const SESSIONS_TRAFFIC_FILTER = withHideSynthetic(EMPTY_USAGE_FILTER);
+
+/**
+ * Rating filter options.
+ *
+ * Each bucket describes the session's WORST turn, matching the backend's
+ * single aggregation policy — "Low" means at least one turn was rated 1–2,
+ * not that the average was low.
+ */
+type RatingFilterValue = "all" | "low" | "neutral" | "high" | "none";
+
+type RatingFilterOption = { value: RatingFilterValue; label: string };
+
+/**
+ * The options, in menu order, for the widget this study asks testers to use.
+ *
+ * Thumbs reuse the SAME buckets rather than a filter of their own: the backend
+ * scores a thumbs-down as 1 (negative) and a thumbs-up as 5 (positive), so
+ * "Thumbs down" is `low` and "Thumbs up" is `high`. What changes is only what
+ * the menu may offer — a thumbs study cannot produce a neutral turn, and
+ * star-count labels on it describe a scale its testers never saw.
+ */
+const RATING_FILTER_OPTIONS: Record<
+  "stars" | "thumbs",
+  readonly RatingFilterOption[]
+> = {
+  stars: [
+    { value: "all", label: "All ratings" },
+    { value: "low", label: "Low (≤2)" },
+    { value: "neutral", label: "Neutral (3)" },
+    { value: "high", label: "High (≥4)" },
+    { value: "none", label: "No feedback" },
+  ],
+  thumbs: [
+    { value: "all", label: "All ratings" },
+    { value: "high", label: "Thumbs up" },
+    { value: "low", label: "Thumbs down" },
+    { value: "none", label: "No feedback" },
+  ],
+};
+
+/**
+ * The Personas filter: a User Testing persona is the session's SENTIMENT, the
+ * same closed five-value verdict Findings builds its persona tabs from, under
+ * the same titles and in the same worst-first order — so "Frustrated users"
+ * here is exactly the tab of that name there. An unanalyzed session has no
+ * sentiment and so matches no persona; it shows under "All personas" only.
+ */
+type PersonaFilterValue = "all" | SessionSentiment;
+
+/**
+ * The filter pills' trigger. `data-[size=default]:h-7` and not just `h-7`: the
+ * design-system trigger sets its height through that same variant, which
+ * out-ranks a bare `h-7` and rendered the pill at 36px — filling the bar edge
+ * to edge instead of sitting inside it as the frame draws.
+ */
+const FILTER_TRIGGER_CLASS =
+  "h-7 data-[size=default]:h-7 w-auto min-w-0 gap-1.5 px-2.5 py-0 text-xs";
+
+/**
+ * Fold the rating selection into a base filter.
+ *
+ * `none` is a PRESET (`no_feedback`), not a bucket chip: "nobody rated this"
+ * is the absence of a record, and the preset is the shared expression of that
+ * on both sides of the wire. The other three are `feedbackBucket` chips.
+ *
+ * Applied to two different bases: the traffic policy
+ * (`SESSIONS_TRAFFIC_FILTER`) for the query and the client-side match, and
+ * `EMPTY_USAGE_FILTER` for the list's empty-state copy — the list must see
+ * the USER'S selection (so "Low (≤2)" with no matches says "no sessions match
+ * the current filters", not "No conversations yet") but not the force-applied
+ * hide-synthetic policy chip, which would claim a filter the panel never
+ * showed.
+ */
+function buildRatingFilter(
+  rating: RatingFilterValue,
+  base: typeof SESSIONS_TRAFFIC_FILTER,
+) {
+  if (rating === "all") return base;
+  if (rating === "none") {
+    return { ...base, preset: "no_feedback" as const };
+  }
+  const value =
+    rating === "low"
+      ? "negative"
+      : rating === "neutral"
+        ? "neutral"
+        : "positive";
+  return {
+    ...base,
+    chips: [
+      ...base.chips,
+      { kind: "dimension" as const, key: "feedbackBucket" as const, value },
+    ],
+  };
+}
+
+/** Add the persona pick to a filter, as a `sentiment` dimension chip. */
+function withPersonaFilter<T extends typeof SESSIONS_TRAFFIC_FILTER>(
+  persona: PersonaFilterValue,
+  filter: T,
+): T {
+  if (persona === "all") return filter;
+  return {
+    ...filter,
+    chips: [
+      ...filter.chips,
+      { kind: "dimension" as const, key: "sentiment" as const, value: persona },
+    ],
+  };
+}
+
+export function ScenarioUsagePanel({
+  scenario,
+  initialThreadId,
+}: ScenarioUsagePanelProps) {
+  // Scope selection to the current scenario so switching scenarios can't briefly
+  // render a detail pane for a thread belonging to the previous scenario.
+  const [selection, setSelection] = useState<{
+    scenarioId: string;
+    threadId: string | null;
+  }>({ scenarioId: scenario.scenarioId, threadId: initialThreadId ?? null });
+
+  // Promotion copies a tester's words into a durable member-owned artifact,
+  // so it is member-gated server-side. Resolve the same tier here — the
+  // User Testing route is deliberately visible to project guests, unlike
+  // Swarms, so the affordance (not the surface) is what gates.
+  const { canPromote } = usePromoteCapability({
+    projectId: scenario.projectId ?? null,
+  });
+
+  const selectedThreadId =
+    selection.scenarioId === scenario.scenarioId ? selection.threadId : null;
+  const setSelectedThreadId = useCallback(
+    (threadId: string | null) =>
+      setSelection({ scenarioId: scenario.scenarioId, threadId }),
+    [scenario.scenarioId],
+  );
+
+  // Absent ⇒ stars, matching the backend normalizer and the Settings toggle.
+  const ratingStyle =
+    scenario.chatUi?.surfaces?.perTurnFeedback?.style === "thumbs"
+      ? "thumbs"
+      : "stars";
+  /**
+   * Whether this study holds 3-star sessions. A study can switch from stars
+   * to thumbs after sessions exist, and those keep their neutral rating —
+   * which the thumbs menu alone would leave with no way to filter for.
+   * Sticky once seen (per study): the list below is filtered by the very
+   * menu this feeds, so re-deriving it would drop the option the moment
+   * another bucket is picked. Read from the loaded page, so a neutral
+   * session older than that page does not by itself surface the option.
+   */
+  const [neutralHistory, setNeutralHistory] = useState<{
+    scenarioId: string;
+    seen: boolean;
+  }>({ scenarioId: scenario.scenarioId, seen: false });
+  const hasNeutralHistory =
+    neutralHistory.scenarioId === scenario.scenarioId && neutralHistory.seen;
+  const ratingOptions = useMemo(() => {
+    const base = RATING_FILTER_OPTIONS[ratingStyle];
+    if (ratingStyle !== "thumbs" || !hasNeutralHistory) return base;
+    // Before "No feedback", which stays last in both menus.
+    return [
+      ...base.slice(0, -1),
+      { value: "neutral" as const, label: "Neutral (3 stars)" },
+      ...base.slice(-1),
+    ];
+  }, [ratingStyle, hasNeutralHistory]);
+  /**
+   * Where "Promote to test case" lands from User Testing: the SUITE, with its
+   * case list, rather than the new case's editor that the other promote
+   * surfaces open. Deliberately User Testing only — Swarms, chat history and
+   * the per-turn action keep the shared destination.
+   */
+  const landOnPromotedSuite = useCallback(
+    ({ suiteId }: { suiteId: string }) => {
+      navigateApp(buildEvaluatePath({ type: "suite-overview", suiteId }));
+    },
+    [],
+  );
+
+  const [ratingChoice, setRatingFilter] = useState<RatingFilterValue>("all");
+  // A choice the current style does not offer (the style changed under an
+  // open filter — "Neutral" on a study now rated by thumbs) reads as "all"
+  // rather than filtering by a bucket the menu can no longer show or clear.
+  const ratingFilter = ratingOptions.some((o) => o.value === ratingChoice)
+    ? ratingChoice
+    : "all";
+  const [personaFilter, setPersonaFilter] = useState<PersonaFilterValue>("all");
+  const sessionsFilter = useMemo(
+    () =>
+      withPersonaFilter(
+        personaFilter,
+        buildRatingFilter(ratingFilter, SESSIONS_TRAFFIC_FILTER),
+      ),
+    [ratingFilter, personaFilter],
+  );
+  // The user-visible half of the filter, for the list's empty-state copy.
+  const ratingOnlyFilter = useMemo(
+    () =>
+      withPersonaFilter(
+        personaFilter,
+        buildRatingFilter(ratingFilter, EMPTY_USAGE_FILTER),
+      ),
+    [ratingFilter, personaFilter],
+  );
+
+  const { threads } = useUsageInsights({
+    sourceType: "scenario",
+    sourceId: scenario.scenarioId,
+    filters: sessionsFilter,
+    // Sessions only: the breakdown backs Insights, which is a different mount
+    // now, so subscribing to it here would scan for a view nobody is looking
+    // at.
+    threadsEnabled: true,
+    breakdownEnabled: false,
+  });
+
+  // Belt over the server's braces. The query already applied `sessionsFilter`
+  // inside its index walk (which is what makes the filter reach past the
+  // 100-row page); re-checking here catches a live update that arrives after
+  // the page was built — a session whose rating changes under an open filter.
+  useEffect(() => {
+    if (hasNeutralHistory) return;
+    if (!threads?.some((t) => threadFeedbackBucket(t) === "neutral")) return;
+    setNeutralHistory({ scenarioId: scenario.scenarioId, seen: true });
+  }, [threads, hasNeutralHistory, scenario.scenarioId]);
+
+  const sortedThreads = useMemo(() => {
+    if (!threads) return undefined;
+    return threads
+      .filter((t) => threadMatchesFilterState(t, sessionsFilter))
+      .sort(compareThreadsForUsageList);
+  }, [threads, sessionsFilter]);
+
+  // Reset thread selection only on scenario *switches*. Guarded by comparing
+  // against the previous scenarioId so StrictMode's dev replay does not wipe a
+  // deep-linked initialThreadId. Flow filter/selection reset is owned by
+  // useInsightsFlowController via cohortKey.
+  const prevScenarioIdRef = useRef(scenario.scenarioId);
+  useEffect(() => {
+    if (prevScenarioIdRef.current === scenario.scenarioId) return;
+    prevScenarioIdRef.current = scenario.scenarioId;
+    setSelection({
+      scenarioId: scenario.scenarioId,
+      threadId: initialThreadId ?? null,
+    });
+  }, [scenario.scenarioId, initialThreadId]);
+
+  useEffect(() => {
+    // Don't treat loading (undefined) as empty — that would collapse the
+    // detail pane on every refetch and then re-snap to sortedThreads[0]
+    // when data arrived.
+    if (sortedThreads === undefined) return;
+    if (sortedThreads.length === 0) {
+      setSelectedThreadId(null);
+      return;
+    }
+    setSelection((current) => {
+      if (current.scenarioId !== scenario.scenarioId) {
+        return {
+          scenarioId: scenario.scenarioId,
+          threadId: sortedThreads[0]?._id ?? null,
+        };
+      }
+      if (
+        current.threadId &&
+        sortedThreads.some((t) => t._id === current.threadId)
+      ) {
+        return current;
+      }
+      return {
+        scenarioId: scenario.scenarioId,
+        threadId: sortedThreads[0]?._id ?? null,
+      };
+    });
+  }, [sortedThreads, scenario.scenarioId, setSelectedThreadId]);
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Ships dark: the strip renders nothing until the backend aggregate
+          exists and the scenario has sessions, so its spacing lives INSIDE
+          the strip rather than in a wrapper that would reserve an empty band
+          during the dark window. `useQuery` against an undeployed query
+          throws, hence the boundary. */}
+      <ErrorBoundary fallback={null}>
+        <ScenarioSessionsMetricStrip scenarioId={scenario.scenarioId} />
+      </ErrorBoundary>
+
+      <div className="min-h-0 flex-1">
+        <ResizablePanelGroup direction="horizontal">
+          <ResizablePanel defaultSize={30} minSize={20} maxSize={50}>
+            <div className="flex h-full flex-col overflow-hidden">
+              <SessionListChrome
+                countLabel={sessionCountLabel(sortedThreads?.length ?? 0, {
+                  loading: sortedThreads === undefined,
+                })}
+              >
+                <Select
+                  value={personaFilter}
+                  onValueChange={(value) =>
+                    setPersonaFilter(value as PersonaFilterValue)
+                  }
+                >
+                  <SelectTrigger
+                    data-testid="scenario-sessions-persona-filter"
+                    className={FILTER_TRIGGER_CLASS}
+                    aria-label="Filter sessions by persona"
+                  >
+                    {/* The frame names the FILTER while nothing is picked,
+                        and the pick once something is. */}
+                    <SelectValue>
+                      {personaFilter === "all"
+                        ? "Personas"
+                        : SENTIMENT_TITLE[personaFilter]}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All personas</SelectItem>
+                    {SENTIMENT_ORDER.map((sentiment) => (
+                      <SelectItem key={sentiment} value={sentiment}>
+                        {SENTIMENT_TITLE[sentiment]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={ratingFilter}
+                  onValueChange={(value) =>
+                    setRatingFilter(value as RatingFilterValue)
+                  }
+                >
+                  <SelectTrigger
+                    data-testid="scenario-sessions-rating-filter"
+                    className={FILTER_TRIGGER_CLASS}
+                    aria-label="Filter sessions by rating"
+                  >
+                    <SelectValue>
+                      {ratingFilter === "all"
+                        ? "Ratings"
+                        : ratingOptions.find((o) => o.value === ratingFilter)
+                            ?.label}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {ratingOptions.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </SessionListChrome>
+              <div className="min-h-0 flex-1 overflow-hidden">
+                {/* `filterState` reaches an already-filtered list, so it only
+                    feeds the empty-state copy. It carries the rating selection
+                    (so an active filter with no matches reads as such) but NOT
+                    the force-applied hide-synthetic policy chip, which would
+                    tell a scenario with no visitor traffic that "no sessions
+                    match the current filters". */}
+                <ShareUsageThreadList
+                  threads={sortedThreads}
+                  selectedThreadId={selectedThreadId}
+                  onSelectThread={setSelectedThreadId}
+                  filterState={ratingOnlyFilter}
+                />
+              </div>
+            </div>
+          </ResizablePanel>
+          <ResizableHandle withHandle />
+          <ResizablePanel defaultSize={70}>
+            <div className="h-full overflow-hidden">
+              {selectedThreadId ? (
+                <ShareUsageThreadDetail
+                  threadId={selectedThreadId}
+                  sessionLink={`${getShareableAppOrigin()}${buildUserTestingScenarioPath(
+                    scenario.scenarioId,
+                    { tab: "sessions", session: selectedThreadId },
+                  )}`}
+                  promote={
+                    scenario.projectId
+                      ? {
+                          projectId: scenario.projectId,
+                          canPromote,
+                          onImported: landOnPromotedSuite,
+                        }
+                      : undefined
+                  }
+                  // Reported here: scrolling a tester's session felt like
+                  // something was missing, because a hard edge cuts a message
+                  // mid-line and says nothing about whether that was the end.
+                  // Covers Chat and Raw — both panes scroll, and the complaint
+                  // is about the edge, not about what is behind it. Opt-in, so
+                  // the four other surfaces this detail serves are unchanged
+                  // until their owners ask for the same.
+                  fadeScrollEdges
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center px-6">
+                  <div className="text-center">
+                    <MessageSquare className="mx-auto mb-2 h-8 w-8 text-muted-foreground/50" />
+                    <p className="text-sm text-muted-foreground">
+                      {sortedThreads && sortedThreads.length === 0
+                        ? "No sessions yet"
+                        : "Select a conversation to view"}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    </div>
+  );
+}
