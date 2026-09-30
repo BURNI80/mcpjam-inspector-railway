@@ -42,6 +42,11 @@ no dependency was modified.
 *   `assets/` — four screenshots from the upstream documentation, used by the
     README. Screenshots are the property of their authors; they are reused from
     the upstream repository under its Apache 2.0 license and are not modified.
+*   `assets/deploy-live-home.png` — a capture of this template's own Railway
+    deployment (the project's demo instance), taken with a headless browser
+    after signing in through the generated access link. The `#token=` fragment
+    is not in the image: the app strips it and the capture shows the signed-in
+    UI.
 *   Removed, because they are not needed to build or run the image and are not
     part of the product: `.github/workflows/` (upstream CI, which requires
     MCPJam's own secrets), `.github/scripts/`, `.github/rulesets/`,

@@ -26,6 +26,11 @@ without installing Node.js, Docker or a tunnel on your machine.
 
 _Screenshots from the [MCPJam documentation](https://docs.mcpjam.com)._
 
+This one is not a screenshot of the docs — it is the Railway deployment of this
+template, signed in and rendered:
+
+![MCPJam Inspector running on Railway](assets/deploy-live-home.png)
+
 ---
 
 ## H1: Deploy and Host MCPJam Inspector with Railway
