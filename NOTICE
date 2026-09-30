@@ -33,6 +33,8 @@ no dependency was modified.
     documentation screenshots and GitHub automation from the build context.
 *   `README.md` — replaced. The deployment guide for this repository. The
     upstream README is preserved verbatim as `UPSTREAM_README.md`.
+*   `AGENTS.md` — replaced with instructions for agents working on *this*
+    packaging. Upstream's is preserved verbatim as `UPSTREAM_AGENTS.md`.
 *   `NOTICE`, `UPSTREAM_COMMIT` — added (attribution and pin).
 *   `assets/` — four screenshots from the upstream documentation, used by the
     README. Screenshots are the property of their authors; they are reused from
@@ -44,7 +46,8 @@ no dependency was modified.
     `.github/FUNDING.yml`, `docs/` (kept only the four screenshots above),
     `examples/`, `notes/`, `ops/`, `actions/`, `skills/`, `design-explorations/`,
     `preview-router/`, `.release-plan/`, `.spike-codex-appserver/`,
-    `.changeset/`, `NOTES-item-2.md`, `NOTES-item-3.md`.
+    `.changeset/`, `NOTES-item-2.md`, `NOTES-item-3.md`, `mcpjam-inspector/.env.local`,
+    `slack-app/.slack/`.
 
 Apache 2.0 compliance
 ---------------------

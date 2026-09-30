@@ -1,44 +1,75 @@
-# AGENTS.md
+# AGENTS.md — instructions for coding agents in this repository
 
-Repository-wide instructions for AI coding agents. Package-specific rules live
-alongside their code — see `mcpjam-inspector/AGENTS.md` for the inspector app.
+## What this repository is
 
-## Design
+`mcpjam-inspector-railway` is a **deployment packaging**, not a fork under
+active development. It vendors the [MCPJam Inspector](https://github.com/MCPJam/inspector)
+source tree at one pinned commit (recorded in `UPSTREAM_COMMIT`) so that the
+Railway template builds a reproducible artifact, using upstream's own
+`mcpjam-inspector/Dockerfile` and `railway.json` unmodified.
 
-**Read [`DESIGN.md`](./DESIGN.md) before any UI or styling work.** It describes the
-MCPJam design system — color roles, typography, layout, elevation, shapes, and the
-component primitives — in the open DESIGN.md format, so it is equally readable by
-agents working outside this repository.
+Upstream's own agent instructions are preserved verbatim as
+`UPSTREAM_AGENTS.md`. They document the vendored codebase and are the right
+reference when you need to understand *that* code — but they are upstream's
+brief to contributors to their monorepo, not standing orders here.
 
-- `design-system/src/tokens.css` is the single source of truth for the palette.
-- `DESIGN.md`'s YAML front matter is **generated** from it. So are the fenced blocks
-  in `docs/style.css` and `chat-ui/src/styles.css`, and the derived color fields in
-  `docs/docs.json`. Never hand-edit a generated region.
-- Change a color by editing `tokens.css`, then run `npm run design:sync`.
-- `npm run design:check` (drift) and `npm run design:lint` (spec) both gate CI.
-- Never write a literal hex or `oklch()` value into a component or a stylesheet
-  — use the role tokens. Role values live in `design-system/src/tokens.css` and
-  nowhere else.
-- The one exception is a package-local accent palette deliberately outside the
-  role system (chat-ui's `--trace-waterfall-*`). Adding another is a real
-  decision, not a shortcut around the rule: it will not track the theme, and
-  nothing will check it.
+## The rule that matters
 
-## The browserd daemon bundle
+**Do not modify vendored application code, `mcpjam-inspector/Dockerfile`,
+`railway.json`, `package.json`, `package-lock.json` or any workspace's
+`package.json`.** A change there silently forks the product this template exists
+to deploy, and the README's "changes no application code" claim stops being true.
 
-`mcpjam-inspector/server/services/browserd/dist/` is CHECKED IN: the daemon runs
-on a sandbox that has only those bytes and no build step, so a daemon edit that
-is not re-bundled ships the previous daemon.
+`NOTICE` lists the exact set of differences from upstream. If you add one,
+update `NOTICE` in the same commit. If you remove one, remove it from `NOTICE`
+and say so in the commit message.
 
-After touching anything under `server/services/browserd/daemon/` — or anything
-it imports, which now includes `protocol.ts` and the WebMCP launch flags — run:
+## What *is* ours to change
 
+*   `README.md` — the deployment guide, and the text published as the template's
+    overview in the Railway Marketplace.
+*   `.dockerignore` — safe only to exclude paths no Dockerfile stage copies. See
+    the comments in the file; it explains the one exclusion that looks harmless
+    and is not.
+*   `NOTICE`, `UPSTREAM_COMMIT`, `assets/`.
+
+## Bumping to a new upstream commit
+
+1.  In a scratch clone of `MCPJam/inspector`, check out the target commit and
+    compare it with the pin in `UPSTREAM_COMMIT`.
+2.  Re-vendor the tracked tree, keeping this repository's files and deletions:
+
+    ```bash
+    git -C /path/to/inspector archive <sha> | tar -x -C /path/to/this/repo
+    ```
+
+    Re-apply the deletions listed in `NOTICE` afterwards.
+3.  Rewrite `UPSTREAM_COMMIT`.
+4.  Check whether upstream added a new workspace to the root `package.json` or a
+    new `COPY` to `mcpjam-inspector/Dockerfile`. If it did, `.dockerignore` needs
+    review again — that is the step that silently breaks builds.
+5.  Commit, push, and watch the Railway build log to the end. A green
+    deployment is the only verification this packaging has.
+
+## Verifying a change
+
+There is no test suite here and there should not be one — the vendored
+application has its own, upstream. Verification is a Railway deployment:
+
+```bash
+railway redeploy --service "MCPJam Inspector"
+railway logs --service "MCPJam Inspector" --build
+curl -sS https://<service>.up.railway.app/health
 ```
-npm run bundle:browserd -w @mcpjam/inspector
-```
 
-and commit both files in `dist/`. `pretest` runs
-`node scripts/bundle-browserd.mjs --check`, which rebuilds in memory, writes
-nothing, and fails with the remediation if the checked-in bundle is stale;
-`server/services/browserd/__tests__/bundle-freshness.test.ts` asserts the same
-property from inside the suite.
+The build compiles a large TypeScript monorepo and installs Chromium, so budget
+15–30 minutes for a cold build. A redeploy of an unchanged commit reuses the
+cached layers.
+
+## Deploying the template
+
+The live template is managed from the Railway project "MCPJam Inspector"
+(service `MCPJam Inspector`). Publishing is a dashboard action; see
+`README.md` for the variable contract the template depends on. **Changing a
+variable that the template sets requires updating the template too**, or the
+published template keeps deploying the old contract.

@@ -1,27 +1,32 @@
 # Build context trimming for the mcpjam-inspector/Dockerfile image.
 #
-# Everything this file excludes is NOT copied by any stage of
-# mcpjam-inspector/Dockerfile, so removing it from the context cannot change
-# the built image. The excluded paths are the bulk of the tree: ~32 MB of
-# documentation screenshots, the GitHub automation, and internal notes.
+# Everything excluded here is NOT copied by any stage of
+# mcpjam-inspector/Dockerfile, so it cannot change the built image — it only
+# trims the payload Railway uploads. The excluded paths are the bulk of the
+# tree: ~32 MB of documentation screenshots plus the GitHub automation.
 #
-# Do NOT add any of these without checking the Dockerfile's COPY list first:
-# the build reads package.json/package-lock.json for all 13 workspaces, plus
-# the full source of evaluators, sdk, cli, design-system, chat-ui,
-# widget-react, mcpjam-inspector, soundcheck, mcp, slack-app, surface-core and
-# discord-app (vitest contributes only its package.json).
+# Do NOT add a `dist/` rule here. Unlike a normal package, this repository has
+# a build artifact that is COMMITTED on purpose:
+# mcpjam-inspector/server/services/browserd/dist/ is the prebuilt browserd
+# daemon, which the image runs from the sandbox without ever building it.
+# `server/services/browserd/__tests__/bundle-freshness.test.ts` and
+# `npm run bundle:browserd` exist to keep it in sync. Excluding it produces an
+# image whose browser tooling cannot start, and the failure looks unrelated.
+#
+# Likewise, keep the root package.json, package-lock.json and the package.json
+# of all 13 workspaces: `npm ci --legacy-peer-deps` resolves the whole tree
+# from that single lockfile, and `npm run build -w <pkg>` needs its neighbours
+# present.
 
 .git
 .github
 docs
 notes
 
-# Workspace build output — every one of these is produced inside the image.
+# Nothing in this repository commits dependencies, but a local `npm install`
+# would otherwise upload a full node_modules tree as build context.
 node_modules
 **/node_modules
-**/dist
-**/out
-**/.vite
 
 .DS_Store
 *.log
