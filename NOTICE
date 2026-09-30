@@ -36,6 +36,9 @@ no dependency was modified.
 *   `AGENTS.md` — replaced with instructions for agents working on *this*
     packaging. Upstream's is preserved verbatim as `UPSTREAM_AGENTS.md`.
 *   `NOTICE`, `UPSTREAM_COMMIT` — added (attribution and pin).
+*   `TEMPLATE.md` — added. The Marketplace overview for
+    https://railway.com/deploy/mcpjam-inspector, a shorter version of the README
+    because Railway caps a template overview at 10,000 characters.
 *   `assets/` — four screenshots from the upstream documentation, used by the
     README. Screenshots are the property of their authors; they are reused from
     the upstream repository under its Apache 2.0 license and are not modified.

@@ -28,6 +28,12 @@ and say so in the commit message.
 
 *   `README.md` — the deployment guide, and the text published as the template's
     overview in the Railway Marketplace.
+*   `TEMPLATE.md` — the Marketplace overview itself. Railway caps it at 10,000
+    characters and strips `<...>` (it reads them as HTML), so it uses
+    `UPPERCASE-PLACEHOLDERs` and explicit `[text](url)` links. Re-publish with
+    `railway templates update 768be898-4b4c-473f-97cc-bb8306e55da0
+    --category "AI/ML" --description "..." --readme-file TEMPLATE.md` after any
+    change; the published copy is a snapshot, not a symlink to the file.
 *   `.dockerignore` — safe only to exclude paths no Dockerfile stage copies. See
     the comments in the file; it explains the one exclusion that looks harmless
     and is not.

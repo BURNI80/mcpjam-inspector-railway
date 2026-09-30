@@ -1,6 +1,6 @@
 # MCPJam Inspector on Railway
 
-[![Deploy on Railway](https://img.shields.io/badge/Deploy%20on%20Railway-000000?style=for-the-badge)](TEMPLATE_DEPLOY_URL)
+[![Deploy on Railway](https://img.shields.io/badge/Deploy%20on%20Railway-000000?style=for-the-badge)](https://railway.com/deploy/mcpjam-inspector)
 
 **Test, debug and evaluate any MCP server from a browser — hosted by Railway.**
 
@@ -9,6 +9,11 @@ server developers. This template builds it from source and runs it behind a
 public HTTPS URL, so you get the full Inspector — tools, resources, prompts,
 OAuth debugger, ChatGPT-apps / MCP-apps widget emulator and the LLM playground —
 without installing Node.js, Docker or a tunnel on your machine.
+
+> **Live deployment of this template:**
+> <https://mcpjam-inspector-production.up.railway.app> — running the same service
+> with the variables listed below. It is token-gated like every deployment of this
+> template, so it asks for an access link.
 
 <!-- markdownlint-disable MD033 -->
 | | |
@@ -32,9 +37,9 @@ bound to port 6274 and published over Railway's HTTPS edge. Access is gated by
 the Inspector's own session token, which Railway generates for you, so the
 result is a private, shareable inspector URL you can open from any browser.
 
-**Estimated cost: ~US$4–6/month for an always-on deployment** (see
-[Cost](#cost)). The image is built once, on Railway, from the pinned source in
-this repository.
+**Estimated cost: ~US$5–6/month for an always-on deployment** (measured — see
+[Cost](#h2-cost)). The image is built once, on Railway, from the pinned source in
+this repository, in under five minutes.
 
 ## H2: About Hosting MCPJam Inspector
 
@@ -133,9 +138,11 @@ and *sharing*.
 
 ## H2: Post-deployment steps
 
-The build is long — it compiles a large monorepo and downloads Chromium — so
-expect **15–30 minutes** for the first deployment. Later redeploys reuse the
-cached build layers and take a few minutes.
+The build compiles a large TypeScript monorepo and downloads Chromium, so it is
+not instant — but on Railway's current builders it is measured at **under 5
+minutes** end to end (≈3 min build, including the ~80 s image export, plus a few
+seconds to first healthy container). Redeploys of an unchanged commit reuse the
+cached layers.
 
 1.  **Open the service's deploy log and copy the access link.**
 
@@ -195,13 +202,14 @@ The template ships with these already set. Change any of them in the service's
 
 | Variable | Value in this template | What it does |
 |---|---|---|
-| `MCPJAM_SESSION_TOKEN` | `${{secret(32, "…-_")}}` | **The credential.** 24+ URL-safe chars, required. The access link is `<url>/#token=<value>`. Generate one per deployment, rotate it whenever it leaks. |
+| `MCPJAM_SESSION_TOKEN` | `${{secret(32, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")}}` | **The credential.** 24+ URL-safe chars, required. The access link is `<url>/#token=<value>`. Generated per deployment, rotate it whenever it leaks. |
 | `MCPJAM_ALLOWED_HOSTS` | `${{RAILWAY_PUBLIC_DOMAIN}}` | Host allowlist. It opens both the token gate and the browser **Origin** check, so a browser talking to your public URL is not rejected as a cross-site caller. Add a comma-separated list if you add more domains. |
 | `ALLOWED_ORIGINS` | `https://${{RAILWAY_PUBLIC_DOMAIN}}` | Exact browser origins allowed to call the API. The host check above is host-based; this one is scheme-and-port exact, so it is the tighter of the two. |
 | `MCPJAM_INSPECTOR_FRONTEND_URL` | `https://${{RAILWAY_PUBLIC_DOMAIN}}` | The address the app prints and the one it builds callback URLs from. Without it the launcher would advertise `http://127.0.0.1:6274`. |
 | `PORT` | `6274` | The Inspector's fixed port. Railway injects `PORT`; pinning it here keeps Railway's health check and the app on the same port. |
 | `MCPJAM_LOCAL_COMPUTER_ENABLED` | `false` | Disables the terminal tool. **Leave disabled on a public deployment** — a shell is a shell whoever signed in. |
 | `MCPJAM_LOCAL_BROWSER_ENABLED` | `false` | Disables the "control your browser" tool. Same reasoning. |
+| `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` | `600` | How long Railway waits for `/health` before failing the deployment. Raised from the 300 s default because the first container start initialises the Inspector's services before it serves. |
 
 Optional, only if you use the corresponding feature:
 
@@ -218,6 +226,16 @@ Optional, only if you use the corresponding feature:
 your domain automatically. If you add a custom domain, update the two
 allowlist variables by hand.
 
+> **The deploy form shows some of these as inputs.** Railway lists the four
+> variables whose values are literal — `PORT`, `MCPJAM_LOCAL_COMPUTER_ENABLED`,
+> `MCPJAM_LOCAL_BROWSER_ENABLED` and `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` — as
+> fields to confirm on the deploy screen. Accept the template's values.
+>
+> **Do not blank the two `false` flags.** They are read as
+> `process.env.MCPJAM_LOCAL_COMPUTER_ENABLED !== "false"`, so an empty value is
+> not "off" — it *enables* the shell tool. Leaving them blank is the one way to
+> get a public terminal on a public URL.
+
 ## H2: Cost
 
 Railway is usage-based: you pay for the vCPU-seconds, GB-seconds, volume GB and
@@ -225,17 +243,32 @@ egress you actually consume, and the limits you set are **caps, not
 reservations**. A cap of 2 GB does not bill 2 GB — it bills what the process
 uses.
 
-Measured on this template, idle (open Inspector, no MCP server connected):
+Measured on a live deployment of this template (Inspector open, no MCP server
+connected), against Railway's published rates of **US$10 per GB-month of memory**,
+**US$20 per vCPU-month of CPU** and **US$0.05 per GB of egress**:
 
-COST_TABLE_PLACEHOLDER
+| Resource | Measured | Billed |
+|---|---|---|
+| Memory | **0.46 GB** resident at idle (0.63 GB peak during startup) | ≈ **US$4.60 / month** if left running 24/7 |
+| CPU | **0.02 %** of one vCPU idle; rises while a tool call streams | ≈ US$0 idle, typically well under US$1 |
+| Egress | a few MB per session | < US$0.01 |
+| Plan | — | from US$5 / month |
+
+**≈ US$5–6 per month** for an always-on deployment. Browser testing traffic
+(connecting to the servers you inspect) is the only cost that scales with use.
 
 Set your own ceiling so a runaway loop cannot become a surprise bill: service →
-**Settings** → *Usage Limits*, or the `RAILWAY_RESOURCE_LIMITS`-style controls
-in the dashboard. The cheapest configuration is **App Sleeping** (Settings →
-*Sleep Application*): the service idles at near-zero cost and wakes on the next
-request, taking a few seconds. The access link keeps working across sleeps,
-because the token is pinned in a variable rather than generated per boot — but
-in-memory state (connected servers, logs, playground conversations) is lost.
+**Settings** → *Usage Limits*. The limits this template ships with (2 vCPU /
+4 GB) are **ceilings, not reservations**: Railway bills the memory and CPU the
+process actually consumes, so a generous cap costs nothing until it is used, and
+it is what keeps Chromium-heavy sessions from being OOM-killed.
+
+The cheapest configuration is **App Sleeping** (Settings → *Sleep Application*):
+the service idles at near-zero cost and wakes on the next request, taking a few
+seconds. The access link keeps working across sleeps, because the token is
+pinned in a variable rather than generated per boot — but in-memory state
+(connected servers, logs, playground conversations) is lost, so do not sleep a
+deployment whose sessions you are in the middle of using.
 
 ## H2: Security — read this before sharing the URL
 
@@ -342,9 +375,14 @@ pinned commit and changes no application code, no Dockerfile and no dependency
 — see [`NOTICE`](NOTICE) for the full list of differences and
 [`UPSTREAM_COMMIT`](UPSTREAM_COMMIT) for the pin.
 
+*   **Template:** <https://railway.com/deploy/mcpjam-inspector>
+*   **Marketplace overview:** [`TEMPLATE.md`](TEMPLATE.md) — the compressed
+    version Railway renders on the template page (its 10,000-character cap is why
+    the full guide lives here).
 *   Upstream: <https://www.mcpjam.com> · <https://docs.mcpjam.com> ·
     <https://app.mcpjam.com>
 *   Upstream README (verbatim): [`UPSTREAM_README.md`](UPSTREAM_README.md)
+*   Upstream AGENTS.md (verbatim): [`UPSTREAM_AGENTS.md`](UPSTREAM_AGENTS.md)
 *   License: Apache License 2.0, © MCPJam — [`LICENSE`](LICENSE)
 *   Not endorsed by, affiliated with, or supported by MCPJam. Issues with the
     Inspector itself belong [upstream](https://github.com/MCPJam/inspector/issues);
